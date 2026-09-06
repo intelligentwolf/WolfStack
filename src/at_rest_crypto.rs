@@ -164,7 +164,7 @@ pub fn encrypt(plaintext: &[u8], purpose: &[u8]) -> Result<String, String> {
 /// 32-byte key. Shared by `encrypt` (cached-key path) and
 /// `encrypt_with_secret` (explicit-key rotation path) so both produce
 /// byte-compatible output and there's a single AES-GCM call site.
-fn seal_with_key_bytes(plaintext: &[u8], key_bytes: &[u8]) -> Result<String, String> {
+pub(crate) fn seal_with_key_bytes(plaintext: &[u8], key_bytes: &[u8]) -> Result<String, String> {
     use ring::aead;
     use ring::rand::{SystemRandom, SecureRandom};
     use base64::Engine;
@@ -192,7 +192,7 @@ fn seal_with_key_bytes(plaintext: &[u8], key_bytes: &[u8]) -> Result<String, Str
 /// Open a `v2:` stored value using a pre-derived 32-byte key. Returns
 /// `None` if the value isn't v2 or the AES tag doesn't verify. Shared
 /// by `decrypt_v2` and `decrypt_v2_with_secret`.
-fn open_with_key_bytes(stored: &str, key_bytes: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn open_with_key_bytes(stored: &str, key_bytes: &[u8]) -> Option<Vec<u8>> {
     use ring::aead;
     use base64::Engine;
     if !is_v2_format(stored) { return None; }
