@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.23.5: cross-cluster transfer tokens are compared in constant time** _(2026-09-06 — [`4f6e2dd9`](https://github.com/intelligentwolf/WolfStack/commit/4f6e2dd91887c64fc5014ed23030b22202c49d23))_
 - **v25.23.4: the backup picker no longer hides containers a scheduled run would archive** _(2026-09-03 — [`cf27548a`](https://github.com/intelligentwolf/WolfStack/commit/cf27548a04d11fcca8e29198ad7072645bd042a9))_
 - **v25.23.3: a container's backup lock survives its own backup, and "back up all" only backs up guests this node owns** _(2026-09-03 — [`2367221e`](https://github.com/intelligentwolf/WolfStack/commit/2367221ef0d2a78cb7ad9f295cc49d49a3ff7260))_
 - **v25.23.2: the status page and the monitor card no longer disagree about uptime** _(2026-09-02 — [`136fcc3a`](https://github.com/intelligentwolf/WolfStack/commit/136fcc3aece9c7ca0d63f2a91f97a349175c8aa5))_
