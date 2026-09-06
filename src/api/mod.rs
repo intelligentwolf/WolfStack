@@ -13218,11 +13218,19 @@ pub async fn generate_transfer_token(
     }))
 }
 
-/// Validate and consume a transfer token
+/// Validate and consume a transfer token.
+///
+/// Each candidate is compared with `validate_cluster_secret`, the
+/// full-walk constant-time comparison, not `==`: a plain string
+/// equality returns at the first mismatching byte, so response timing
+/// would reveal how many leading bytes of a guess were correct
+/// (CWE-208). The transfer token is one of three independently
+/// sufficient credentials on the import endpoints, so it deserves the
+/// same treatment as the cluster secret.
 pub(crate) fn validate_transfer_token(token: &str) -> bool {
     if let Ok(mut tokens) = TRANSFER_TOKENS.lock() {
         tokens.retain(|t| t.expires > std::time::Instant::now()); // purge expired
-        if let Some(pos) = tokens.iter().position(|t| t.token == token) {
+        if let Some(pos) = tokens.iter().position(|t| crate::auth::validate_cluster_secret(token, &t.token)) {
             tokens.remove(pos); // consume
             return true;
         }
@@ -13236,7 +13244,8 @@ pub(crate) fn validate_transfer_token(token: &str) -> bool {
 pub(crate) fn peek_transfer_token(token: &str) -> bool {
     if let Ok(mut tokens) = TRANSFER_TOKENS.lock() {
         tokens.retain(|t| t.expires > std::time::Instant::now()); // purge expired
-        return tokens.iter().any(|t| t.token == token);
+        // Constant-time per candidate — see validate_transfer_token.
+        return tokens.iter().any(|t| crate::auth::validate_cluster_secret(token, &t.token));
     }
     false
 }
@@ -49868,5 +49877,54 @@ mod mount_check_request_tests {
         assert!(parsed.targets[0].exclude_mounts.is_empty());
         let empty: MountCheckRequest = serde_json::from_str("{}").unwrap();
         assert!(empty.targets.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transfer_token_tests {
+    use super::*;
+
+    fn seed(token: &str) {
+        let mut tokens = TRANSFER_TOKENS.lock().unwrap();
+        tokens.push(TransferToken {
+            token: token.to_string(),
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        });
+    }
+
+    /// The comparison went through `validate_cluster_secret`, so this
+    /// pins the functional contract that must survive that change:
+    /// exact match only, near-misses and prefixes rejected, peek does
+    /// not spend the token, validate spends it exactly once.
+    #[test]
+    fn transfer_token_exact_match_and_single_use() {
+        let good = "wst_tt_exact_0123456789abcdef0123456789abcdef";
+        seed(good);
+
+        assert!(!peek_transfer_token("wst_tt_exact_0123456789abcdef0123456789abcdeF"), "last byte differs");
+        assert!(!peek_transfer_token("wst_tt_exact_0123456789abcdef0123456789abcde"), "prefix of the token");
+        assert!(!peek_transfer_token(&format!("{}x", good)), "token plus a byte");
+        assert!(!peek_transfer_token(""), "empty guess");
+        assert!(!validate_transfer_token(""), "empty guess must not consume anything");
+
+        assert!(peek_transfer_token(good));
+        assert!(peek_transfer_token(good), "peek must not consume");
+        assert!(validate_transfer_token(good));
+        assert!(!validate_transfer_token(good), "consumed on first validate");
+        assert!(!peek_transfer_token(good));
+    }
+
+    #[test]
+    fn transfer_token_expired_is_rejected() {
+        let stale = "wst_tt_stale_0123456789abcdef0123456789abcdef";
+        {
+            let mut tokens = TRANSFER_TOKENS.lock().unwrap();
+            tokens.push(TransferToken {
+                token: stale.to_string(),
+                expires: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            });
+        }
+        assert!(!peek_transfer_token(stale));
+        assert!(!validate_transfer_token(stale));
     }
 }
