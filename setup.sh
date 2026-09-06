@@ -3196,7 +3196,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/wolfstack --bind $WS_BIND${AGENT_FLAG}
-WorkingDirectory=/opt/wolfstack
+# A missing /opt/wolfstack must not fail the service with 200/CHDIR before
+# WolfStack runs a single line (a unit copied to a host that never ran this
+# installer): "-" makes a missing working directory non-fatal, and the
+# ExecStartPre creates it so ExecStart chdirs into a real directory.
+ExecStartPre=/bin/mkdir -p /opt/wolfstack
+WorkingDirectory=-/opt/wolfstack
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535

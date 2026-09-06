@@ -66734,6 +66734,7 @@ async function loadComposeStacks() {
                         ${iconBtn(`composeAction('${nm}', 'pull')`, 'updates', 'Pull images', { tip: 'Pull the latest images (reports which were updated). Click Up afterwards to apply them.' })}
                         ${iconBtn(`openComposeEditor('${nm}')`, 'edit', 'Edit')}
                         ${iconBtn(`showComposeLogs('${nm}')`, 'logs', 'Logs')}
+                        ${iconBtn(`showComposeDeploy('${nm}')`, 'share-2', 'Deploy to node', { tip: 'Copy this stack and the secrets it references to another WolfStack node and bring it up there' })}
                         ${iconBtn(`deleteComposeStack('${nm}')`, 'trash', 'Delete', { danger: true })}
                     </div>
                 </td>
@@ -66982,6 +66983,174 @@ async function validateComposeYaml() {
     }
 }
 
+// ─── Deploy a stack to another node (Colt 2026-09-06) ───
+let composeDeployStack = null;
+
+function showComposeDeploy(name) {
+    composeDeployStack = name;
+    const sel = document.getElementById('compose-deploy-node');
+    const err = document.getElementById('compose-deploy-error');
+    err.style.display = 'none';
+    // Every WolfStack node except the one this stack lives on. Offline
+    // nodes stay visible but cannot be picked — the deploy would only fail
+    // later with a less useful message.
+    const targets = getAllWolfStackNodes().filter(n => n.id !== currentNodeId);
+    sel.innerHTML = targets.length
+        ? targets.map(n => `<option value="${escapeAttr(n.id)}"${n.online === false ? ' disabled' : ''}>${escapeHtml(n.hostname || n.address || n.id)}${n.online === false ? ' (offline)' : ''}</option>`).join('')
+        : '<option value="">No other WolfStack node in this cluster</option>';
+    document.getElementById('compose-deploy-secrets').checked = true;
+    document.getElementById('compose-deploy-start').checked = true;
+    document.getElementById('compose-deploy-overwrite').checked = false;
+    document.getElementById('compose-deploy-title').textContent = `Deploy "${name}" to another node`;
+    document.getElementById('compose-deploy-modal').classList.add('active');
+    sel.focus();
+}
+
+async function composeDeployRun() {
+    const name = composeDeployStack;
+    const nodeId = document.getElementById('compose-deploy-node').value;
+    const err = document.getElementById('compose-deploy-error');
+    const btn = document.getElementById('compose-deploy-run');
+    if (!nodeId) { err.textContent = 'Pick a target node.'; err.style.display = 'block'; return; }
+    const body = {
+        node_id: nodeId,
+        include_secrets: document.getElementById('compose-deploy-secrets').checked,
+        start: document.getElementById('compose-deploy-start').checked,
+        overwrite: document.getElementById('compose-deploy-overwrite').checked,
+    };
+    err.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = body.start ? 'Deploying… (image pulls can take minutes)' : 'Copying…';
+    try {
+        const resp = await fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/deploy`), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            err.textContent = data.error || `Deploy failed (HTTP ${resp.status})`;
+            err.style.display = 'block';
+            return;
+        }
+        document.getElementById('compose-deploy-modal').classList.remove('active');
+        const unset = Array.isArray(data.unset_variables) ? data.unset_variables : [];
+        const skipped = Array.isArray(data.skipped_files) ? data.skipped_files : [];
+        const lines = [
+            `<p>${escapeHtml(data.message || 'Deployed')}</p>`,
+            `<ul style="margin:8px 0 0 18px; padding:0;">`,
+            `<li>${escapeHtml(String(data.files_sent ?? 0))} file(s) copied to ${escapeHtml(data.target || 'the target')}</li>`,
+            `<li>Secrets sent: ${data.secrets_sent && data.secrets_sent.length ? escapeHtml(data.secrets_sent.join(', ')) : 'none referenced'}</li>`,
+            skipped.length ? `<li>Not copied: ${escapeHtml(skipped.join('; '))}</li>` : '',
+            unset.length ? `<li style="color:var(--danger-color, #ef4444);">Resolved to an empty string on the target: ${escapeHtml(unset.map(v => '${' + v + '}').join(', '))} — add them to that node's Secrets Manager and press Up there.</li>` : '',
+            `</ul>`,
+        ].join('');
+        showModal(lines, `Deployed "${name}"`);
+        showToast(data.message || `Deployed "${name}"`, unset.length ? 'warning' : 'success', unset.length ? 0 : 6000);
+    } catch (e) {
+        err.textContent = `Deploy failed: ${e.message}`;
+        err.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Deploy';
+    }
+}
+
+// ─── Secrets export / import ───
+function showSecretsExport() {
+    document.getElementById('secrets-export-pass').value = '';
+    document.getElementById('secrets-export-pass2').value = '';
+    document.getElementById('secrets-export-error').style.display = 'none';
+    document.getElementById('secrets-export-modal').classList.add('active');
+    document.getElementById('secrets-export-pass').focus();
+}
+
+async function secretsExportRun() {
+    const pass = document.getElementById('secrets-export-pass').value;
+    const pass2 = document.getElementById('secrets-export-pass2').value;
+    const err = document.getElementById('secrets-export-error');
+    const fail = (m) => { err.textContent = m; err.style.display = 'block'; };
+    if (pass.length < 12) return fail('The passphrase must be at least 12 characters.');
+    if (pass !== pass2) return fail('The two passphrases do not match.');
+    err.style.display = 'none';
+    try {
+        const resp = await fetch(apiUrl('/api/secrets/export'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passphrase: pass }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            return fail(data.error || `Export failed (HTTP ${resp.status})`);
+        }
+        const text = await resp.text();
+        // The proxy path may drop Content-Disposition; name the file from the bundle itself.
+        let filename = 'wolfstack-secrets.json';
+        try {
+            const b = JSON.parse(text);
+            const stamp = (b.exported_at || '').replace(/[:T]/g, '-').slice(0, 19);
+            filename = `wolfstack-secrets-${b.exported_from || 'node'}-${stamp || 'export'}.json`;
+        } catch (_) { /* keep the default name */ }
+        const blob = new Blob([text], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        document.getElementById('secrets-export-modal').classList.remove('active');
+        showToast(`Secrets exported to ${filename}`, 'success');
+    } catch (e) {
+        fail(`Export failed: ${e.message}`);
+    }
+}
+
+let secretsImportBundle = null;
+
+async function secretsImportFile(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    try {
+        const bundle = JSON.parse(await file.text());
+        if (!bundle || bundle.format !== 'wolfstack-secrets-v1') {
+            showToast(`"${file.name}" is not a WolfStack secrets export`, 'error', 0);
+            return;
+        }
+        secretsImportBundle = bundle;
+        document.getElementById('secrets-import-summary').textContent =
+            `${file.name}: ${bundle.count} secret(s) exported from ${bundle.exported_from || 'unknown'} at ${bundle.exported_at || 'unknown'}. Enter the passphrase it was exported with.`;
+        document.getElementById('secrets-import-pass').value = '';
+        document.getElementById('secrets-import-overwrite').checked = false;
+        document.getElementById('secrets-import-error').style.display = 'none';
+        document.getElementById('secrets-import-modal').classList.add('active');
+        document.getElementById('secrets-import-pass').focus();
+    } catch (e) {
+        showToast(`Could not read "${file.name}": ${e.message}`, 'error', 0);
+    }
+}
+
+async function secretsImportRun() {
+    const err = document.getElementById('secrets-import-error');
+    const fail = (m) => { err.textContent = m; err.style.display = 'block'; };
+    const pass = document.getElementById('secrets-import-pass').value;
+    if (!secretsImportBundle) return fail('Choose an export file first.');
+    if (!pass) return fail('Enter the passphrase.');
+    err.style.display = 'none';
+    try {
+        const resp = await fetch(apiUrl('/api/secrets/import'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ passphrase: pass, bundle: secretsImportBundle, overwrite: document.getElementById('secrets-import-overwrite').checked }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) return fail(data.error || `Import failed (HTTP ${resp.status})`);
+        document.getElementById('secrets-import-modal').classList.remove('active');
+        secretsImportBundle = null;
+        // Skipped keys are a decision the operator may want to revisit, so
+        // that outcome stays on screen.
+        showToast(data.message || 'Secrets imported', data.skipped && data.skipped.length ? 'warning' : 'success', data.skipped && data.skipped.length ? 0 : 6000);
+        loadSecrets();
+    } catch (e) {
+        fail(`Import failed: ${e.message}`);
+    }
+}
+
 async function composeAction(name, action) {
     const actionLabels = { up: 'Starting', down: 'Stopping', pull: 'Pulling images for', restart: 'Restarting' };
     showToast(`${actionLabels[action] || action} "${name}"...`, 'info');
@@ -66999,8 +67168,15 @@ async function composeAction(name, action) {
                 detail = 'New image applied to: ' + data.started.join(', ');
             }
             const msg = data.message || `${action} complete`;
-            // Keep the detailed result on screen longer so it can actually be read.
-            showToast(detail ? `${msg} — ${detail}` : msg, 'success', detail ? 8000 : 4000);
+            if (action === 'up' && Array.isArray(data.unset_variables) && data.unset_variables.length) {
+                // Compose substituted a blank string for these ${KEY}
+                // references (not in this host's Secrets Manager or .env):
+                // the stack is up but degraded. Stays until dismissed.
+                showToast(detail ? `${msg} — ${detail}` : msg, 'warning', 0);
+            } else {
+                // Keep the detailed result on screen longer so it can actually be read.
+                showToast(detail ? `${msg} — ${detail}` : msg, 'success', detail ? 8000 : 4000);
+            }
         } else {
             showToast(data.error || `${action} failed`, 'error', 0);
         }

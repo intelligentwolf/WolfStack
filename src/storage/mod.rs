@@ -465,6 +465,61 @@ fn remove_mount_shutdown_dropin(mount_point: &str) {
     }
 }
 
+/// Collapse duplicate and trailing slashes so `/mnt/a//b/` and `/mnt/a/b`
+/// compare equal. Relative paths are returned unchanged (they are rejected
+/// elsewhere); "/" stays "/".
+fn normalize_mount_point(p: &str) -> String {
+    let p = p.trim();
+    if !p.starts_with('/') { return p.to_string(); }
+    let mut norm = String::from("/");
+    for seg in p.split('/').filter(|s| !s.is_empty()) {
+        if norm.len() > 1 { norm.push('/'); }
+        norm.push_str(seg);
+    }
+    norm
+}
+
+/// Mount points currently active strictly BENEATH `mount_point`, read from a
+/// `/proc/self/mountinfo` snapshot. Field 5 (1-based) of each line is the
+/// mount point, with spaces escaped as `\040` (proc(5)). Pure so the parse is
+/// unit-testable against captured lines; the caller reads the file.
+fn mounts_beneath(mountinfo: &str, mount_point: &str) -> Vec<String> {
+    let base = normalize_mount_point(mount_point);
+    let prefix = if base == "/" { "/".to_string() } else { format!("{}/", base) };
+    let mut out: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(4))
+        .map(|mp| mp.replace("\\040", " "))
+        .filter(|mp| mp.starts_with(&prefix) && mp.len() > prefix.len())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Group mount points into levels by path depth, shallowest first, so a
+/// parent (`/mnt/nas`) is always mounted before anything inside it
+/// (`/mnt/nas/backups`). Entries within one level are independent and may be
+/// mounted in parallel; levels must be mounted in order. Pure — takes the
+/// (id, name, mount_point) triples auto_mount_all already builds.
+fn mount_depth_levels(mut entries: Vec<(String, String, String)>) -> Vec<Vec<(String, String, String)>> {
+    fn depth(p: &str) -> usize {
+        normalize_mount_point(p).split('/').filter(|s| !s.is_empty()).count()
+    }
+    entries.sort_by_key(|(_, _, mp)| depth(mp));
+    let mut levels: Vec<Vec<(String, String, String)>> = Vec::new();
+    let mut current_depth: Option<usize> = None;
+    for e in entries {
+        let d = depth(&e.2);
+        if current_depth != Some(d) {
+            levels.push(Vec::new());
+            current_depth = Some(d);
+        }
+        levels.last_mut().unwrap().push(e);
+    }
+    levels
+}
+
 /// True if `mount_point` is unsafe to mount a filesystem over — a critical
 /// system directory (or a path at/under one). Mounting over these hides the
 /// running system's own files even though the disk is intact: a mount over
@@ -477,12 +532,7 @@ fn is_unsafe_mount_target(mount_point: &str) -> bool {
     let p = mount_point.trim();
     if p.is_empty() || !p.starts_with('/') { return true; }
     if p.split('/').any(|seg| seg == "..") { return true; }
-    // Normalise: collapse duplicate/trailing slashes.
-    let mut norm = String::from("/");
-    for seg in p.split('/').filter(|s| !s.is_empty()) {
-        if norm.len() > 1 { norm.push('/'); }
-        norm.push_str(seg);
-    }
+    let norm = normalize_mount_point(p);
     if norm == "/" { return true; }
     // Whole OS trees that must never host a storage mount — rejected at the
     // directory itself AND any path under it (mounting over /usr/bin hides
@@ -528,6 +578,27 @@ pub fn mount_storage(id: &str) -> Result<String, String> {
         config.mounts[idx].status = "mounted".to_string();
         save_config(&config)?;
         return Ok("Already mounted".to_string());
+    }
+
+    // Refuse to mount OVER an active mount. Mounting a parent after one of
+    // its children is already mounted hides the child: path resolution walks
+    // through the new parent and lands in a same-named plain directory on the
+    // parent's filesystem — a genuinely different directory that nothing in
+    // the UI distinguishes from the intended one. Colt 2026-09-06: the backup
+    // path /mnt/unas-backups/wolf resolved to a stale directory on the standby
+    // host and to the live one on the primary, purely by mount order.
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let hidden = mounts_beneath(&mountinfo, &mp);
+    if !hidden.is_empty() {
+        let msg = format!(
+            "refusing to mount '{}': it would hide the mount(s) already active beneath it ({}). \
+             Unmount those first, then mount this entry and re-mount them inside it.",
+            mp, hidden.join(", ")
+        );
+        config.mounts[idx].status = "error".to_string();
+        config.mounts[idx].error_message = Some(msg.clone());
+        let _ = save_config(&config);
+        return Err(msg);
     }
     
     // Create mount point directory
@@ -3085,22 +3156,31 @@ pub fn auto_mount_all() {
     let config = load_config();
     let auto_mounts: Vec<_> = config.mounts.iter()
         .filter(|m| m.auto_mount && m.enabled)
-        .map(|m| (m.id.clone(), m.name.clone()))
+        .map(|m| (m.id.clone(), m.name.clone(), m.mount_point.clone()))
         .collect();
 
     std::thread::spawn(move || {
-        let handles: Vec<std::thread::JoinHandle<()>> = auto_mounts
-            .into_iter()
-            .map(|(id, name)| std::thread::spawn(move || {
-                match mount_storage(&id) {
-                    Ok(_msg) => {}
-                    Err(e) => error!("  ✗ Failed to auto-mount {}: {}", name, e),
-                }
-            }))
-            .collect();
-        let total = handles.len();
-        for h in handles {
-            let _ = h.join();
+        // Parents before children. Every entry used to race in parallel, so
+        // a child (/mnt/nas/sub) could land before its parent (/mnt/nas) and
+        // then be hidden when the parent mounted over it — on the same config
+        // the winner differed from boot to boot and host to host (Colt
+        // 2026-09-06). Each depth level still mounts in parallel; the next
+        // level starts only once the shallower one has settled.
+        let mut total = 0usize;
+        for level in mount_depth_levels(auto_mounts) {
+            let handles: Vec<std::thread::JoinHandle<()>> = level
+                .into_iter()
+                .map(|(id, name, _mp)| std::thread::spawn(move || {
+                    match mount_storage(&id) {
+                        Ok(_msg) => {}
+                        Err(e) => error!("  ✗ Failed to auto-mount {}: {}", name, e),
+                    }
+                }))
+                .collect();
+            total += handles.len();
+            for h in handles {
+                let _ = h.join();
+            }
         }
         let _ = std::fs::create_dir_all("/run/wolfstack");
         if let Err(e) = std::fs::write(
@@ -4452,6 +4532,66 @@ mod mounts_target_tests {
         // A bounded wait — an absent/broken wolfstack must not hang boot
         // ordering forever (dependants should also use nofail).
         assert!(MOUNTS_WAIT_UNIT.contains("TimeoutStartSec="));
+    }
+}
+
+#[cfg(test)]
+mod mount_order_tests {
+    use super::*;
+
+    fn e(id: &str, mp: &str) -> (String, String, String) {
+        (id.to_string(), id.to_string(), mp.to_string())
+    }
+
+    #[test]
+    fn levels_put_parents_before_children() {
+        // Deliberately listed child-first, the order that lost the race.
+        let levels = mount_depth_levels(vec![
+            e("wolf", "/mnt/unas-backups/wolf"),
+            e("unas", "/mnt/unas-backups"),
+            e("media", "/mnt/media/"),
+            e("deep", "/mnt//unas-backups/wolf/x"),
+        ]);
+        let ids: Vec<Vec<&str>> = levels.iter()
+            .map(|l| l.iter().map(|(id, _, _)| id.as_str()).collect())
+            .collect();
+        assert_eq!(ids, vec![vec!["unas", "media"], vec!["wolf"], vec!["deep"]]);
+    }
+
+    #[test]
+    fn levels_handle_empty_and_single() {
+        assert!(mount_depth_levels(Vec::new()).is_empty());
+        assert_eq!(mount_depth_levels(vec![e("a", "/mnt/a")]).len(), 1);
+    }
+
+    // Real /proc/self/mountinfo lines (proc(5): field 5 is the mount point,
+    // spaces escaped as \040).
+    const MOUNTINFO: &str = "\
+26 32 0:24 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+126 33 0:60 / /mnt/unas-backups/wolf rw,relatime shared:70 - nfs4 nas:/Backups/Servers/WolfStack rw,vers=4.2
+155 33 0:61 / /mnt/unas-backups rw,relatime shared:71 - nfs4 nas:/Backups rw,vers=4.2
+160 33 0:62 / /mnt/unas-backups\\040two rw,relatime shared:72 - nfs4 nas:/Two rw
+";
+
+    #[test]
+    fn mounts_beneath_finds_only_strict_descendants() {
+        assert_eq!(mounts_beneath(MOUNTINFO, "/mnt/unas-backups"), vec!["/mnt/unas-backups/wolf"]);
+        // Trailing slash and doubled slashes normalise to the same path.
+        assert_eq!(mounts_beneath(MOUNTINFO, "/mnt//unas-backups/"), vec!["/mnt/unas-backups/wolf"]);
+        // The path itself is not "beneath" itself; a sibling with a shared
+        // prefix ("…-backups two") is not a descendant either.
+        assert!(mounts_beneath(MOUNTINFO, "/mnt/unas-backups/wolf").is_empty());
+        assert!(mounts_beneath(MOUNTINFO, "/mnt/unas").is_empty());
+        assert!(mounts_beneath(MOUNTINFO, "/mnt/fresh").is_empty());
+    }
+
+    #[test]
+    fn mounts_beneath_unescapes_and_handles_root() {
+        assert_eq!(mounts_beneath(MOUNTINFO, "/mnt"), vec![
+            "/mnt/unas-backups", "/mnt/unas-backups two", "/mnt/unas-backups/wolf",
+        ]);
+        let all = mounts_beneath(MOUNTINFO, "/");
+        assert!(all.contains(&"/proc".to_string()) && all.len() == 4);
     }
 }
 

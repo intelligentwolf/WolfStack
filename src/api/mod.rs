@@ -39913,7 +39913,7 @@ fn compose_image_id_map(dir: &std::path::Path, compose_file: &std::path::Path)
 /// We pull `FOO` out of each such line (quotes may be backslash-escaped by the
 /// logger, so we strip a trailing quote/backslash before reading the
 /// identifier). De-duplicated, order preserved (wabil 2026-06-26).
-fn parse_undefined_compose_vars(stderr: &str) -> Vec<String> {
+pub(crate) fn parse_undefined_compose_vars(stderr: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in stderr.lines() {
         let Some(idx) = line.find("variable is not set") else { continue };
@@ -39928,6 +39928,73 @@ fn parse_undefined_compose_vars(stderr: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Log, once Docker is reachable, every compose stack under the compose root
+/// that has NO containers on this host — not stopped ones, none at all. Those
+/// are stacks that were never brought up here (a standby that received the
+/// compose directory, a restored node), and nothing will start them: WolfStack
+/// does not run `compose up` at daemon start and Docker's restart policy only
+/// restarts containers that exist. Without this line "the daemon is running"
+/// looks healthy while half the workload is absent (Colt 2026-09-06).
+///
+/// Blocking and bounded: waits up to five minutes for `docker info` (Docker
+/// is ordered after wolfstack-mounts.target, so at boot it starts AFTER this
+/// daemon), then one `compose ps -aq` per stack. Silent when Docker is not
+/// installed or never comes up — that is not this check's story to tell.
+pub fn warn_stacks_never_started() {
+    if which_docker().is_none() { return; }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let up = std::process::Command::new("docker").arg("info").output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if up { break; }
+        if std::time::Instant::now() >= deadline {
+            tracing::debug!("compose: Docker not reachable after 5 min — skipping the never-started stack check");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+    let root = compose_root_dir();
+    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    let mut never_started: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        let compose_file = compose_file_in(&path);
+        if !compose_file.exists() { continue; }
+        let Ok(mut cmd) = crate::containers::compose_cmd() else { return };
+        let out = cmd
+            .args(["-f", &compose_file.to_string_lossy(), "ps", "-aq"])
+            .envs(compose_secrets_env())
+            .current_dir(&path)
+            .output();
+        // A failing `ps` (bad YAML, daemon hiccup) is not "no containers" —
+        // only a clean, empty answer counts.
+        if let Ok(o) = out
+            && o.status.success()
+            && String::from_utf8_lossy(&o.stdout).trim().is_empty()
+        {
+            never_started.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    if never_started.is_empty() { return; }
+    never_started.sort();
+    tracing::warn!(
+        "compose: {} stack(s) under {} have no containers on this host — never brought up here: {}. \
+         WolfStack does not auto-start stacks (Docker's restart policy only restarts containers that exist); \
+         start them from the Compose page or with `docker compose up -d` in each directory. Stacks that \
+         reference ${{KEY}} secrets need those keys in this host's Secrets Manager first.",
+        never_started.len(), root, never_started.join(", ")
+    );
+}
+
+fn which_docker() -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("docker"))
+            .find(|p| p.is_file())
+    })
 }
 
 /// Per-container final action parsed from `docker compose up -d` output, keeping
@@ -40195,56 +40262,90 @@ async fn compose_up(
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
 
-    let output = match crate::containers::compose_cmd() {
-        Ok(mut c) => c
-            .args(["-f", &compose_file.to_string_lossy(), "up", "-d", "--remove-orphans"])
-            .envs(compose_secrets_env())
-            .current_dir(&dir)
-            .output(),
-        Err(e) => Err(std::io::Error::other(e)),
+    let out = match web::block(move || run_compose_up(&dir)).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     };
-
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let combined = format!("{}{}", stdout, stderr);
-            if out.status.success() {
-                // Report which containers came up fresh (Created/Recreated/
-                // Started — i.e. a pulled image was applied) vs left running
-                // unchanged, so the operator sees what `up` actually did
-                // (wabil 2026-06-26).
-                let actions = parse_compose_container_actions(&combined);
-                let started: Vec<&str> = actions.iter()
-                    .filter(|(_, a)| a != "Running")
-                    .map(|(c, _)| c.as_str()).collect();
-                let unchanged = actions.iter().filter(|(_, a)| a == "Running").count();
-                let message = if actions.is_empty() {
-                    "Stack started".to_string()
-                } else if started.is_empty() {
-                    format!("Stack up to date — {} container{} already running",
-                        unchanged, if unchanged == 1 { "" } else { "s" })
-                } else {
-                    format!("Started {} container{} with the latest image{}",
-                        started.len(), if started.len() == 1 { "" } else { "s" },
-                        if unchanged > 0 { format!("; {} unchanged", unchanged) } else { String::new() })
-                };
-                let actions_json: Vec<serde_json::Value> = actions.iter()
-                    .map(|(c, a)| serde_json::json!({ "container": c, "action": a }))
-                    .collect();
-                HttpResponse::Ok().json(serde_json::json!({
-                    "message": message,
-                    "output": combined,
-                    "actions": actions_json,
-                    "started": started,
-                    "unchanged": unchanged,
-                }))
-            } else {
-                HttpResponse::BadRequest().json(serde_json::json!({ "error": stderr, "output": stdout }))
-            }
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    if out.success {
+        HttpResponse::Ok().json(compose_up_report(&out))
+    } else {
+        HttpResponse::BadRequest().json(serde_json::json!({ "error": out.stderr, "output": out.stdout }))
     }
+}
+
+/// What `docker compose up -d` left behind, for the report below.
+struct ComposeUpOutcome {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// `docker compose up -d --remove-orphans` in `dir`, with the Secrets
+/// Manager injected as process env. Blocking — call from `web::block`.
+/// Shared by the Compose page and a stack received from a peer, so the two
+/// can never run `up` differently.
+fn run_compose_up(dir: &std::path::Path) -> Result<ComposeUpOutcome, String> {
+    let compose_file = compose_file_in(dir);
+    let mut c = crate::containers::compose_cmd()?;
+    let out = c
+        .args(["-f", &compose_file.to_string_lossy(), "up", "-d", "--remove-orphans"])
+        .envs(compose_secrets_env())
+        .current_dir(dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(ComposeUpOutcome {
+        success: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    })
+}
+
+/// The success-side `up` report: which containers came up fresh
+/// (Created/Recreated/Started — a pulled image was applied) vs were left
+/// running unchanged (wabil 2026-06-26), and which `${KEY}`s compose could
+/// not resolve. Compose only WARNS about those, then starts the stack with
+/// blank values — a silently degraded deployment, so it is reported
+/// alongside the success and the UI keeps it on screen until dismissed.
+fn compose_up_report(out: &ComposeUpOutcome) -> serde_json::Value {
+    let combined = format!("{}{}", out.stdout, out.stderr);
+    let actions = parse_compose_container_actions(&combined);
+    let started: Vec<&str> = actions.iter()
+        .filter(|(_, a)| a != "Running")
+        .map(|(c, _)| c.as_str()).collect();
+    let unchanged = actions.iter().filter(|(_, a)| a == "Running").count();
+    let message = if actions.is_empty() {
+        "Stack started".to_string()
+    } else if started.is_empty() {
+        format!("Stack up to date — {} container{} already running",
+            unchanged, if unchanged == 1 { "" } else { "s" })
+    } else {
+        format!("Started {} container{} with the latest image{}",
+            started.len(), if started.len() == 1 { "" } else { "s" },
+            if unchanged > 0 { format!("; {} unchanged", unchanged) } else { String::new() })
+    };
+    let actions_json: Vec<serde_json::Value> = actions.iter()
+        .map(|(c, a)| serde_json::json!({ "container": c, "action": a }))
+        .collect();
+    let unset_variables = parse_undefined_compose_vars(&combined);
+    let message = if unset_variables.is_empty() {
+        message
+    } else {
+        format!(
+            "{}. WARNING: {} resolved to an empty string — not in this host's \
+             Secrets Manager or .env, so the stack is running with blank values",
+            message,
+            unset_variables.iter().map(|v| format!("${{{}}}", v)).collect::<Vec<_>>().join(", ")
+        )
+    };
+    serde_json::json!({
+        "message": message,
+        "output": combined,
+        "actions": actions_json,
+        "started": started,
+        "unchanged": unchanged,
+        "unset_variables": unset_variables,
+    })
 }
 
 /// POST /api/compose/stacks/{name}/down — docker compose down
@@ -40730,6 +40831,366 @@ async fn secrets_delete(
     match save_secrets(&secrets) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "message": "Secret deleted" })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+// ─── Secrets export / import, stack deploy to a peer (Colt 2026-09-06) ───
+
+#[derive(Deserialize)]
+struct SecretsExportRequest {
+    passphrase: String,
+}
+
+/// POST /api/secrets/export — the whole Secrets Manager store as a
+/// passphrase-sealed file (Argon2id → AES-256-GCM, see `stack_transfer`).
+/// The config-export bundle deliberately excludes secrets because it is a
+/// hand-to-support artifact; this is the supported way to carry them to a
+/// standby or a rebuilt node.
+async fn secrets_export(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SecretsExportRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let passphrase = body.into_inner().passphrase;
+    let sealed = web::block(move || {
+        let secrets = load_secrets();
+        let plain = serde_json::to_vec(&secrets).map_err(|e| e.to_string())?;
+        let host = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        crate::stack_transfer::seal_bundle(&plain, &passphrase, &host, secrets.len())
+    }).await;
+    match sealed {
+        Ok(Ok(bundle)) => {
+            tracing::info!("secrets: exported {} entries as a passphrase-sealed bundle", bundle.count);
+            let filename = format!(
+                "wolfstack-secrets-{}-{}.json",
+                bundle.exported_from, chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            );
+            HttpResponse::Ok()
+                .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+                .json(bundle)
+        }
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct SecretsImportRequest {
+    passphrase: String,
+    bundle: crate::stack_transfer::SecretsBundle,
+    /// Replace the value of a key that already exists here. Off by default:
+    /// an import must not silently clobber a secret this host already runs
+    /// with.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Default, Serialize)]
+struct SecretsMergeOutcome {
+    added: Vec<String>,
+    updated: Vec<String>,
+    unchanged: Vec<String>,
+    /// Existing keys left alone because `overwrite` was off.
+    skipped: Vec<String>,
+}
+
+/// Merge `incoming` into `existing`. Pure so the four outcomes are testable.
+fn merge_secrets(existing: &mut Vec<SecretEntry>, incoming: Vec<SecretEntry>, overwrite: bool) -> SecretsMergeOutcome {
+    let now = now_iso();
+    let mut out = SecretsMergeOutcome::default();
+    for inc in incoming {
+        let key = inc.key.trim().to_string();
+        if key.is_empty() { continue; }
+        let value = inc.value.trim().to_string();
+        match existing.iter_mut().find(|s| s.key == key) {
+            Some(cur) => {
+                if cur.value == value && cur.description == inc.description {
+                    out.unchanged.push(key);
+                } else if overwrite {
+                    cur.value = value;
+                    cur.description = inc.description;
+                    cur.updated = now.clone();
+                    out.updated.push(key);
+                } else {
+                    out.skipped.push(key);
+                }
+            }
+            None => {
+                existing.push(SecretEntry {
+                    key: key.clone(),
+                    value,
+                    description: inc.description,
+                    created: if inc.created.is_empty() { now.clone() } else { inc.created },
+                    updated: now.clone(),
+                });
+                out.added.push(key);
+            }
+        }
+    }
+    out
+}
+
+/// POST /api/secrets/import — open a bundle from `secrets_export` and merge it
+/// into this host's store.
+async fn secrets_import(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SecretsImportRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let b = body.into_inner();
+    let merged = web::block(move || -> Result<SecretsMergeOutcome, String> {
+        let plain = crate::stack_transfer::open_bundle(&b.bundle, &b.passphrase)?;
+        let incoming: Vec<SecretEntry> = serde_json::from_slice(&plain)
+            .map_err(|e| format!("bundle contents unreadable: {}", e))?;
+        let mut secrets = load_secrets();
+        let outcome = merge_secrets(&mut secrets, incoming, b.overwrite);
+        save_secrets(&secrets)?;
+        Ok(outcome)
+    }).await;
+    match merged {
+        Ok(Ok(o)) => {
+            tracing::info!(
+                "secrets: imported bundle — {} added, {} updated, {} unchanged, {} skipped",
+                o.added.len(), o.updated.len(), o.unchanged.len(), o.skipped.len()
+            );
+            let message = format!(
+                "Imported: {} added, {} updated, {} already identical{}",
+                o.added.len(), o.updated.len(), o.unchanged.len(),
+                if o.skipped.is_empty() { String::new() } else {
+                    format!(", {} existing key(s) left unchanged (overwrite was off): {}",
+                        o.skipped.len(), o.skipped.join(", "))
+                }
+            );
+            HttpResponse::Ok().json(serde_json::json!({
+                "message": message,
+                "added": o.added, "updated": o.updated,
+                "unchanged": o.unchanged, "skipped": o.skipped,
+            }))
+        }
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct ComposeDeployRequest {
+    node_id: String,
+    /// Ship the Secrets Manager entries the compose file references.
+    #[serde(default = "default_true")]
+    include_secrets: bool,
+    /// Run `up -d` on the peer once the files are in place.
+    #[serde(default = "default_true")]
+    start: bool,
+    /// Replace a stack of the same name already on the peer.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Peer-to-peer payload for `/api/compose/receive`.
+#[derive(Serialize, Deserialize)]
+struct ComposeReceivePayload {
+    name: String,
+    files: Vec<crate::stack_transfer::StackFile>,
+    secrets: Vec<SecretEntry>,
+    start: bool,
+    overwrite: bool,
+}
+
+/// POST /api/compose/stacks/{name}/deploy — copy this stack (its directory,
+/// bounded, plus the secrets it references) to another WolfStack node and
+/// optionally bring it up there. The half of a host failover no Proxmox
+/// feature reaches, because Proxmox does not know these containers exist.
+async fn compose_deploy(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<ComposeDeployRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = compose_file_in(&dir);
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+    let b = body.into_inner();
+    let Some(node) = state.cluster.get_node(&b.node_id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Target node not found" }));
+    };
+    if node.is_self {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "The stack is already on this node — pick another target" }));
+    }
+    if node.node_type != "wolfstack" {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Only WolfStack nodes can receive a stack (a Proxmox node has no compose manager)"
+        }));
+    }
+    if !node.online {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("{} is offline", node.hostname) }));
+    }
+
+    let include_secrets = b.include_secrets;
+    let stack_name = name.clone();
+    let built = web::block(move || -> Result<(ComposeReceivePayload, Vec<String>), String> {
+        let (files, skipped) = crate::stack_transfer::collect_stack_files(&dir)?;
+        let secrets = if include_secrets {
+            let yaml = std::fs::read_to_string(&compose_file).map_err(|e| e.to_string())?;
+            let refs = crate::stack_transfer::referenced_compose_vars(&yaml);
+            load_secrets().into_iter()
+                .filter(|s| refs.iter().any(|r| r == &s.key) && is_injectable_secret_key(&s.key))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok((ComposeReceivePayload { name: stack_name, files, secrets, start: b.start, overwrite: b.overwrite }, skipped))
+    }).await;
+    let (payload, skipped_files) = match built {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    };
+    let secrets_sent: Vec<String> = payload.secrets.iter().map(|s| s.key.clone()).collect();
+    let file_count = payload.files.len();
+
+    // `up` on the peer may pull images: allow it the same fifteen minutes an
+    // operator would wait at a terminal. The first URL that answers at all
+    // is the answer — a 409 from the peer is a result, not a reason to try
+    // the fallback port.
+    let client = (*API_HTTP_CLIENT).clone();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+    let mut peer_reply: Option<(u16, serde_json::Value)> = None;
+    for url in build_node_urls(&node.address, node.port, "/api/compose/receive") {
+        let res = client.post(&url)
+            .timeout(std::time::Duration::from_secs(900))
+            .peer_auth(&secret)
+            .header("X-WolfStack-Node-Id", &self_id)
+            .json(&payload)
+            .send().await;
+        if let Ok(resp) = res {
+            let status = resp.status().as_u16();
+            let body = resp.json::<serde_json::Value>().await
+                .unwrap_or_else(|e| serde_json::json!({ "error": format!("unreadable reply from peer: {}", e) }));
+            peer_reply = Some((status, body));
+            break;
+        }
+    }
+    let Some((status, mut reply)) = peer_reply else {
+        return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("{} did not answer on any of its API ports", node.hostname)
+        }));
+    };
+    if let Some(obj) = reply.as_object_mut() {
+        obj.insert("target".into(), serde_json::Value::String(node.hostname.clone()));
+        obj.insert("files_sent".into(), serde_json::json!(file_count));
+        obj.insert("secrets_sent".into(), serde_json::json!(secrets_sent));
+        obj.insert("skipped_files".into(), serde_json::json!(skipped_files));
+    }
+    tracing::info!(
+        "compose: deployed stack '{}' to {} ({} files, {} secrets, peer status {})",
+        name, node.hostname, file_count, secrets_sent.len(), status
+    );
+    match actix_web::http::StatusCode::from_u16(status) {
+        Ok(code) => HttpResponse::build(code).json(reply),
+        Err(_) => HttpResponse::BadGateway().json(reply),
+    }
+}
+
+/// Write a received stack under the compose root, merge its secrets, and
+/// optionally bring it up. Blocking — runs inside `web::block`.
+fn apply_received_stack(p: ComposeReceivePayload) -> Result<serde_json::Value, String> {
+    use std::os::unix::fs::PermissionsExt;
+    use base64::Engine;
+    if !is_safe_compose_name(&p.name) {
+        return Err(format!("invalid stack name {:?}", p.name));
+    }
+    for f in &p.files {
+        crate::stack_transfer::validate_relative_path(&f.path)?;
+    }
+    let compose_names = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
+    if !p.files.iter().any(|f| compose_names.contains(&f.path.as_str())) {
+        return Err("payload carries no compose file at the stack root".into());
+    }
+    let dir = compose_project_dir(&p.name);
+    if compose_file_in(&dir).exists() && !p.overwrite {
+        return Err(format!(
+            "stack '{}' already exists on this node — deploy again with overwrite to replace its files",
+            p.name
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+    for f in &p.files {
+        let target = dir.join(&f.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+        }
+        let data = base64::engine::general_purpose::STANDARD.decode(&f.content)
+            .map_err(|_| format!("{}: content is not valid base64", f.path))?;
+        std::fs::write(&target, &data).map_err(|e| format!("write {}: {}", f.path, e))?;
+        // `.env` may carry credentials: never wider than owner-only here,
+        // whatever mode it had on the source.
+        let mode = if f.path == ".env" { 0o600 } else { f.mode & 0o777 };
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+    }
+    // The deploy's whole point is that the stack works here, so a secret the
+    // source ships replaces a stale one of the same name.
+    let mut secrets = load_secrets();
+    let merged = merge_secrets(&mut secrets, p.secrets, true);
+    if !merged.added.is_empty() || !merged.updated.is_empty() {
+        save_secrets(&secrets)?;
+    }
+    let mut report = if p.start {
+        let out = run_compose_up(&dir)?;
+        if !out.success {
+            return Err(format!("files written, but `docker compose up` failed: {}", out.stderr.trim()));
+        }
+        compose_up_report(&out)
+    } else {
+        serde_json::json!({ "message": "Stack files written; not started" })
+    };
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert("files_written".into(), serde_json::json!(p.files.len()));
+        obj.insert("secrets_added".into(), serde_json::json!(merged.added));
+        obj.insert("secrets_updated".into(), serde_json::json!(merged.updated));
+        obj.insert("started".into(), serde_json::json!(p.start));
+    }
+    Ok(report)
+}
+
+/// POST /api/compose/receive — peer-to-peer target of `compose_deploy`.
+async fn compose_receive(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ComposeReceivePayload>,
+) -> HttpResponse {
+    if let Err(e) = require_cluster_secret(&req, &state) { return e; }
+    let sender = req.headers().get("X-WolfStack-Node-Id")
+        .and_then(|v| v.to_str().ok()).unwrap_or("peer").to_string();
+    let p = body.into_inner();
+    let name = p.name.clone();
+    let (files, secrets) = (p.files.len(), p.secrets.len());
+    match web::block(move || apply_received_stack(p)).await {
+        Ok(Ok(report)) => {
+            tracing::info!(
+                "compose: received stack '{}' from node {} ({} files, {} secrets)",
+                name, sender, files, secrets
+            );
+            HttpResponse::Ok().json(report)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("compose: refused stack '{}' from node {}: {}", name, sender, e);
+            if e.contains("already exists") {
+                HttpResponse::Conflict().json(serde_json::json!({ "error": e }))
+            } else {
+                HttpResponse::BadRequest().json(serde_json::json!({ "error": e }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
@@ -47809,6 +48270,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/compose/stacks/{name}/restart", web::post().to(compose_restart))
         .route("/api/compose/stacks/{name}/logs", web::get().to(compose_logs))
         .route("/api/compose/stacks/{name}/validate", web::post().to(compose_validate))
+        .route("/api/compose/stacks/{name}/deploy", web::post().to(compose_deploy))
+        .route("/api/compose/receive", web::post().to(compose_receive))
         // Secrets Manager
         // Plugins
         .route("/api/plugins", web::get().to(plugins_list))
@@ -47909,6 +48372,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/secrets", web::post().to(secrets_save))
         .route("/api/secrets/{key}", web::get().to(secrets_get))
         .route("/api/secrets/{key}", web::delete().to(secrets_delete))
+        .route("/api/secrets/export", web::post().to(secrets_export))
+        .route("/api/secrets/import", web::post().to(secrets_import))
         // Wolfram — memory compression daemon
         .route("/api/wolfram/status", web::get().to(wolfram_status))
         .route("/api/wolfram/install", web::post().to(wolfram_install))
@@ -49010,6 +49475,33 @@ time="..." level=warning msg="The \"MY_UNDEFINED_VAR\" variable is not set. Defa
         // Network/Volume lines and transitional-only noise produce no rows.
         assert!(parse_compose_container_actions(" Network app_default Created\n Container z-1  Starting\n")
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod secrets_merge_tests {
+    use super::{merge_secrets, SecretEntry};
+
+    fn e(k: &str, v: &str) -> SecretEntry {
+        SecretEntry { key: k.into(), value: v.into(), description: String::new(), created: String::new(), updated: String::new() }
+    }
+
+    #[test]
+    fn merge_reports_each_outcome_and_respects_overwrite() {
+        let mut store = vec![e("DB_PASSWORD", "old"), e("SAME", "x")];
+        let out = merge_secrets(&mut store, vec![e("DB_PASSWORD", "new"), e("SAME", "x"), e(" NEW_KEY ", " v\n"), e("", "ignored")], false);
+        assert_eq!(out.skipped, vec!["DB_PASSWORD"]);
+        assert_eq!(out.unchanged, vec!["SAME"]);
+        assert_eq!(out.added, vec!["NEW_KEY"]);
+        assert!(out.updated.is_empty());
+        assert_eq!(store.iter().find(|s| s.key == "DB_PASSWORD").unwrap().value, "old");
+        let added = store.iter().find(|s| s.key == "NEW_KEY").unwrap();
+        assert_eq!(added.value, "v", "value is trimmed like secrets_save trims");
+        assert!(!added.created.is_empty() && !added.updated.is_empty());
+
+        let out = merge_secrets(&mut store, vec![e("DB_PASSWORD", "new")], true);
+        assert_eq!(out.updated, vec!["DB_PASSWORD"]);
+        assert_eq!(store.iter().find(|s| s.key == "DB_PASSWORD").unwrap().value, "new");
     }
 }
 

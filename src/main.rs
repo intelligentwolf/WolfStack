@@ -13,6 +13,7 @@
 
 use crate::node_identity::PeerAuth;
 mod api;
+mod stack_transfer;
 mod agent;
 mod diagnostics;
 mod ai;
@@ -990,6 +991,13 @@ async fn main() -> std::io::Result<()> {
         networking::apply_all_wireguard_bridges();
         kubernetes::apply_all_wolfnet_routes();
         plugins::start_all_backends();
+        // WolfStack does not bring compose stacks up at daemon start — Docker's
+        // restart policy resurrects containers that exist. On a host where a
+        // stack's containers have never been created (a standby that only
+        // received the compose directory) nothing resurrects them and "the
+        // daemon is running" would be a misleading health signal (Colt
+        // 2026-09-06). Say which stacks are in that state, once Docker is up.
+        api::warn_stacks_never_started();
     });
 
     // HTTPS-by-default: if the operator has NOT opted out (--no-tls),
@@ -1315,11 +1323,12 @@ async fn main() -> std::io::Result<()> {
         // 546 per-IP rules, no ipset). migrate_legacy_block_rules() below then
         // folds those legacy rules into the set.
         crate::auth::ensure_ipset_installed();
-        // Self-heal the systemd unit so a WolfStack restart/upgrade no longer
-        // kills daemonized QEMU VMs and other children (PapaSchlumpf 2026-06).
-        // setup.sh patches the unit on install/upgrade; this covers hosts that
-        // swap the binary without re-running setup.sh.
-        ensure_killmode_process();
+        // Self-heal the systemd unit: KillMode=process so a WolfStack
+        // restart/upgrade no longer kills daemonized QEMU VMs (PapaSchlumpf
+        // 2026-06), and a missing /opt/wolfstack no longer fails the service
+        // with 200/CHDIR (Colt 2026-09-06). setup.sh writes both on install;
+        // this covers hosts that swap the binary without re-running setup.sh.
+        ensure_unit_self_heal();
         for ip in crate::auth::set_protected_node_ips(app_state.cluster.wolfstack_node_ips()) {
             crate::auth::kernel_unblock_ip(&ip);
         }
@@ -4671,13 +4680,25 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
         });
 
         // Determine web directory
-        let web_dir = find_web_dir();
+        let located_web_dir = locate_web_dir();
+        let web_dir = located_web_dir.clone().unwrap_or_else(|| WEB_DIR_CANDIDATES[0].to_string());
         // `agent_mode` already bound above (near the background-task gates).
         if agent_mode {
             info!("  ⚙ Agent-only mode — management SPA disabled, cluster API only");
             info!("    Manage this node from the master server's UI (Add Node).");
-        } else {
+        } else if located_web_dir.is_some() {
             info!("  Serving web UI from: {}", web_dir);
+        } else {
+            // A daemon that answers every API call while every UI page 500s
+            // is a confusing pair of signals (Colt 2026-09-06: binary + unit
+            // copied to a standby host without the web tree). Say exactly
+            // what is missing and where it was looked for.
+            tracing::error!(
+                "  ✗ Web UI directory not found — looked for index.html in {} — the API \
+                 works but every UI page will fail. Re-run setup.sh, or copy the web/ \
+                 tree from an installed node to /opt/wolfstack/web and restart.",
+                WEB_DIR_CANDIDATES.join(", ")
+            );
         }
         info!("");
 
@@ -5108,75 +5129,112 @@ fn node_api_url(node: &crate::agent::Node, path: &str) -> String {
     }
 }
 
-/// Self-heal the systemd unit so a WolfStack restart/upgrade leaves running
-/// guests alone. WolfStack daemonizes native QEMU VMs (`qemu -daemonize`) and
-/// spawns other long-lived children; units created before mid-2026 carry no
-/// `KillMode=` line and therefore inherit systemd's `control-group` default, so
-/// `systemctl restart wolfstack` (every in-app upgrade ends in one) SIGTERMs
-/// those guests too — PapaSchlumpf 2026-06: a Home Assistant VM was killed by an
-/// upgrade on a raw/native host and never came back (autostart only fires on a
-/// real machine boot, not a WolfStack restart). setup.sh patches the unit on the
-/// install path; this covers binary-swap upgrades that never re-run setup.sh.
+/// Self-heal the systemd unit. Two directives, both add-only (Golden Rule:
+/// nothing else about the unit changes), both idempotent:
 ///
-/// Idempotent: only rewrites + reloads when `KillMode=` is genuinely absent, so
-/// steady-state restarts do nothing. Best-effort — any failure is logged and
-/// swallowed; it must never block startup. Honours the Golden Rule: it only
-/// narrows what a WolfStack restart kills, changing nothing else about the unit.
-fn ensure_killmode_process() {
+/// * `KillMode=process` — WolfStack daemonizes native QEMU VMs
+///   (`qemu -daemonize`) and spawns other long-lived children; units created
+///   before mid-2026 carry no `KillMode=` line and inherit systemd's
+///   `control-group` default, so `systemctl restart wolfstack` (every in-app
+///   upgrade ends in one) SIGTERMed those guests too — PapaSchlumpf 2026-06: a
+///   Home Assistant VM killed by an upgrade on a raw/native host.
+/// * A missing working directory must not stop the daemon. The unit sets
+///   `WorkingDirectory=/opt/wolfstack`; on a host where that directory does not
+///   exist (binary + unit copied to a standby without running setup.sh)
+///   systemd fails the service with `200/CHDIR` before WolfStack runs a single
+///   line, and the visible symptom is a `wolfstack-mounts-wait` timeout that
+///   reads like a storage fault (Colt 2026-09-06). The `-` prefix makes a
+///   missing directory non-fatal (systemd.exec(5), WorkingDirectory=) and an
+///   `ExecStartPre=/bin/mkdir -p` creates it, so ExecStart then chdirs into a
+///   real directory.
+///
+/// setup.sh writes both on fresh installs; this covers binary-swap upgrades
+/// and copied units that never re-run setup.sh. Best-effort — any failure is
+/// logged and swallowed; it must never block startup.
+fn ensure_unit_self_heal() {
     let unit = std::path::Path::new("/etc/systemd/system/wolfstack.service");
     let content = match std::fs::read_to_string(unit) {
         Ok(c) => c,
         // No unit (container/dev run, or a non-systemd install) → nothing to heal.
         Err(_) => return,
     };
-    // Already has an explicit KillMode= directive — respect whatever the
-    // operator/installer set and stay silent.
-    if content
-        .lines()
-        .any(|l| l.trim_start().starts_with("KillMode="))
-    {
-        return;
-    }
-    // Insert KillMode=process immediately after the [Service] section header so
-    // it lands in the right section regardless of the unit's exact layout.
-    let mut out = String::with_capacity(content.len() + 32);
-    let mut inserted = false;
-    for line in content.lines() {
-        out.push_str(line);
-        out.push('\n');
-        if !inserted && line.trim() == "[Service]" {
-            out.push_str("KillMode=process\n");
-            inserted = true;
-        }
-    }
-    if !inserted {
-        // No [Service] section we recognise — don't guess; leave it untouched.
-        return;
-    }
+    let Some((out, applied)) = heal_unit_content(&content) else { return };
     if let Err(e) = std::fs::write(unit, out) {
         tracing::warn!(
-            "startup: could not add KillMode=process to wolfstack.service ({}); a \
-             WolfStack restart may still stop daemonized VMs until the unit is patched",
-            e
+            "startup: could not update wolfstack.service ({}): {}",
+            applied.join(", "), e
         );
         return;
     }
-    // The file now has KillMode=process, but systemd still has the OLD unit
-    // loaded until daemon-reload. Only claim success if the reload actually
-    // applied — otherwise the directive won't take effect until the next boot.
+    // The file is patched, but systemd still has the OLD unit loaded until
+    // daemon-reload. Only claim success if the reload actually applied —
+    // otherwise the directives take effect on the next boot.
     match std::process::Command::new("systemctl")
         .arg("daemon-reload")
         .output()
     {
         Ok(o) if o.status.success() => tracing::info!(
-            "startup: added KillMode=process to wolfstack.service — WolfStack \
-             restarts/upgrades now leave running VMs and containers alone"
+            "startup: updated wolfstack.service ({})", applied.join(", ")
         ),
         _ => tracing::warn!(
-            "startup: wrote KillMode=process to wolfstack.service but `systemctl \
-             daemon-reload` did not succeed; it takes effect on the next reload/boot"
+            "startup: wrote {} to wolfstack.service but `systemctl daemon-reload` \
+             did not succeed; it takes effect on the next reload/boot",
+            applied.join(", ")
         ),
     }
+}
+
+/// Pure unit-file transform behind `ensure_unit_self_heal`. Returns the new
+/// content and a description of each directive applied, or `None` when the
+/// unit already has everything (steady state) or has no `[Service]` section we
+/// recognise (don't guess — leave it untouched).
+fn heal_unit_content(content: &str) -> Option<(String, Vec<&'static str>)> {
+    let has_killmode = content
+        .lines()
+        .any(|l| l.trim_start().starts_with("KillMode="));
+    // WorkingDirectory= value, if the unit sets one without the "-" prefix.
+    let workdir: Option<String> = content
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("WorkingDirectory="))
+        .map(str::trim)
+        .find(|v| !v.is_empty() && !v.starts_with('-') && v.starts_with('/'))
+        .map(|v| v.to_string());
+    let has_mkdir_pre = |dir: &str| content
+        .lines()
+        .map(str::trim_start)
+        .any(|l| l.starts_with("ExecStartPre=") && l.contains("mkdir") && l.contains(dir));
+
+    let mut applied: Vec<&'static str> = Vec::new();
+    let mut out = String::with_capacity(content.len() + 96);
+    let mut in_service = false;
+    for line in content.lines() {
+        let t = line.trim();
+        // Rewrite `WorkingDirectory=/x` → `WorkingDirectory=-/x` in place.
+        if let Some(dir) = &workdir
+            && in_service
+            && t.strip_prefix("WorkingDirectory=").map(str::trim) == Some(dir.as_str())
+        {
+            out.push_str(&format!("WorkingDirectory=-{}\n", dir));
+            if !has_mkdir_pre(dir) {
+                out.push_str(&format!("ExecStartPre=/bin/mkdir -p {}\n", dir));
+                applied.push("ExecStartPre mkdir for the working directory");
+            }
+            applied.push("WorkingDirectory tolerates a missing directory");
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if t == "[Service]" {
+            in_service = true;
+            if !has_killmode {
+                out.push_str("KillMode=process\n");
+                applied.push("KillMode=process");
+            }
+        } else if t.starts_with('[') {
+            in_service = false;
+        }
+    }
+    if applied.is_empty() { None } else { Some((out, applied)) }
 }
 
 /// Gather reboot reason diagnostics from the local machine
@@ -5331,25 +5389,92 @@ async fn mtls_gate(
     Ok(next.call(req).await?.map_into_boxed_body())
 }
 
-/// Find the web directory — check multiple locations
-fn find_web_dir() -> String {
-    let candidates = [
-        // Development
-        "web",
-        // Installed
-        "/opt/wolfstack/web",
-        "/usr/share/wolfstack/web",
-    ];
+/// Where the web UI may live, in lookup order: the development checkout,
+/// then the two install locations.
+const WEB_DIR_CANDIDATES: [&str; 3] = ["web", "/opt/wolfstack/web", "/usr/share/wolfstack/web"];
 
-    for dir in &candidates {
-        let path = std::path::Path::new(dir);
-        if path.exists() && path.join("index.html").exists() {
-            return dir.to_string();
+/// Find the web directory — the first candidate holding an index.html.
+/// `None` when no candidate qualifies; callers that need a path anyway fall
+/// back to the development default and the startup log says so loudly.
+fn locate_web_dir() -> Option<String> {
+    WEB_DIR_CANDIDATES.iter()
+        .find(|dir| std::path::Path::new(dir).join("index.html").exists())
+        .map(|d| d.to_string())
+}
+
+fn find_web_dir() -> String {
+    locate_web_dir().unwrap_or_else(|| WEB_DIR_CANDIDATES[0].to_string())
+}
+
+#[cfg(test)]
+mod unit_self_heal_tests {
+    use super::heal_unit_content;
+
+    // The unit setup.sh wrote before 2026-06 (no KillMode) with the plain
+    // WorkingDirectory that fails 200/CHDIR when /opt/wolfstack is absent.
+    const LEGACY: &str = "\
+[Unit]
+Description=WolfStack - Server Management Platform
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wolfstack --bind 0.0.0.0
+WorkingDirectory=/opt/wolfstack
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+";
+
+    #[test]
+    fn legacy_unit_gets_all_three_directives() {
+        let (out, applied) = heal_unit_content(LEGACY).expect("legacy unit needs healing");
+        assert!(out.contains("[Service]\nKillMode=process\n"), "{out}");
+        assert!(out.contains("WorkingDirectory=-/opt/wolfstack\nExecStartPre=/bin/mkdir -p /opt/wolfstack\n"), "{out}");
+        assert!(!out.contains("WorkingDirectory=/opt/wolfstack\n"), "plain form must be rewritten: {out}");
+        assert_eq!(applied.len(), 3);
+        // Everything else is untouched, line for line.
+        for line in LEGACY.lines().filter(|l| !l.starts_with("WorkingDirectory=")) {
+            assert!(out.lines().any(|o| o == line), "lost line {line:?}");
         }
+        // Healing is idempotent: the healed unit needs nothing more.
+        assert!(heal_unit_content(&out).is_none());
     }
 
-    // Fallback
-    "web".to_string()
+    #[test]
+    fn already_healed_unit_is_left_alone() {
+        let healed = LEGACY
+            .replace("[Service]\n", "[Service]\nKillMode=process\n")
+            .replace("WorkingDirectory=/opt/wolfstack\n",
+                     "WorkingDirectory=-/opt/wolfstack\nExecStartPre=/bin/mkdir -p /opt/wolfstack\n");
+        assert!(heal_unit_content(&healed).is_none());
+    }
+
+    #[test]
+    fn operator_killmode_is_respected() {
+        // An explicit KillMode=mixed stays; only the workdir pair is added.
+        let unit = LEGACY.replace("Type=simple\n", "Type=simple\nKillMode=mixed\n");
+        let (out, applied) = heal_unit_content(&unit).unwrap();
+        assert!(out.contains("KillMode=mixed"));
+        assert!(!out.contains("KillMode=process"));
+        assert_eq!(applied.len(), 2);
+    }
+
+    #[test]
+    fn existing_mkdir_pre_is_not_duplicated() {
+        let unit = LEGACY.replace("WorkingDirectory=/opt/wolfstack\n",
+            "ExecStartPre=/bin/mkdir -p /opt/wolfstack\nWorkingDirectory=/opt/wolfstack\n");
+        let (out, _) = heal_unit_content(&unit).unwrap();
+        assert_eq!(out.matches("ExecStartPre=/bin/mkdir -p /opt/wolfstack").count(), 1);
+        assert!(out.contains("WorkingDirectory=-/opt/wolfstack"));
+    }
+
+    #[test]
+    fn unit_without_service_section_is_untouched() {
+        assert!(heal_unit_content("[Unit]\nDescription=x\n").is_none());
+    }
 }
 
 #[cfg(test)]

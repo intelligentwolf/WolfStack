@@ -5393,6 +5393,9 @@
                     </div>
                     <div style="display:flex; gap:8px;">
                         <button class="btn btn-sm" onclick="selectServerView(currentNodeId, 'compose')" style="font-size:12px;">← Back to Compose</button>
+                        <button class="btn btn-sm" onclick="showSecretsExport()" title="Download every secret as a passphrase-encrypted file for a standby or rebuilt node" style="font-size:12px;"><span class="ws-icon-clean-wrap" data-icon="download"></span> Export</button>
+                        <button class="btn btn-sm" onclick="document.getElementById('secrets-import-file').click()" title="Import a secrets export made on another node" style="font-size:12px;"><span class="ws-icon-clean-wrap" data-icon="upload"></span> Import</button>
+                        <input type="file" id="secrets-import-file" accept=".json,application/json" style="display:none;" onchange="secretsImportFile(event)">
                         <button class="btn btn-sm btn-primary" onclick="showSecretCreate()" style="font-size:12px;">+ Add Secret</button>
                     </div>
                 </div>
@@ -5487,6 +5490,77 @@
         </div>
 
         <!-- Secret Edit Modal -->
+        <div id="compose-deploy-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="compose-deploy-title">
+            <div class="modal" style="max-width:520px; width:90%;">
+                <div class="modal-header">
+                    <h3 id="compose-deploy-title">Deploy stack to another node</h3>
+                    <button class="modal-close" aria-label="Close" onclick="document.getElementById('compose-deploy-modal').classList.remove('active')">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p style="font-size:13px; color:var(--text-muted); margin:0 0 12px;">Copies the stack directory (compose file, .env and other files up to 1&nbsp;MB each, 16&nbsp;MB in total — bind-mounted data is not a stack and does not travel) to the chosen WolfStack node, adds the Secrets Manager entries the compose file references to that node, and brings the stack up there.</p>
+                    <div style="margin-bottom:12px;">
+                        <label for="compose-deploy-node" style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Target node</label>
+                        <select id="compose-deploy-node" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);"></select>
+                    </div>
+                    <label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:8px;"><input type="checkbox" id="compose-deploy-secrets" checked> Include the secrets this stack references</label>
+                    <label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:8px;"><input type="checkbox" id="compose-deploy-start" checked> Start the stack on the target (docker compose up -d)</label>
+                    <label style="display:flex; gap:8px; align-items:center; font-size:13px;"><input type="checkbox" id="compose-deploy-overwrite"> Overwrite a stack of the same name already on the target</label>
+                    <div id="compose-deploy-error" role="alert" aria-live="assertive" style="display:none; margin-top:12px; padding:8px 12px; border-radius:6px; background:rgba(239,68,68,0.12); color:var(--danger-color, #ef4444); font-size:13px;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('compose-deploy-modal').classList.remove('active')">Cancel</button>
+                    <button class="btn btn-primary" id="compose-deploy-run" onclick="composeDeployRun()">Deploy</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="secrets-export-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="secrets-export-title">
+            <div class="modal" style="max-width:480px; width:90%;">
+                <div class="modal-header">
+                    <h3 id="secrets-export-title">Export secrets</h3>
+                    <button class="modal-close" aria-label="Close" onclick="document.getElementById('secrets-export-modal').classList.remove('active')">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p style="font-size:13px; color:var(--text-muted); margin:0 0 12px;">Every secret on this node is written to one file, encrypted with the passphrase you choose (Argon2id, AES-256-GCM). You need the same passphrase to import it on another node. Twelve characters minimum.</p>
+                    <div style="margin-bottom:12px;">
+                        <label for="secrets-export-pass" style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Passphrase</label>
+                        <input id="secrets-export-pass" type="password" autocomplete="new-password" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <label for="secrets-export-pass2" style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Repeat passphrase</label>
+                        <input id="secrets-export-pass2" type="password" autocomplete="new-password" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
+                    </div>
+                    <div id="secrets-export-error" role="alert" aria-live="assertive" style="display:none; padding:8px 12px; border-radius:6px; background:rgba(239,68,68,0.12); color:var(--danger-color, #ef4444); font-size:13px;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('secrets-export-modal').classList.remove('active')">Cancel</button>
+                    <button class="btn btn-primary" onclick="secretsExportRun()">Download</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="secrets-import-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="secrets-import-title">
+            <div class="modal" style="max-width:480px; width:90%;">
+                <div class="modal-header">
+                    <h3 id="secrets-import-title">Import secrets</h3>
+                    <button class="modal-close" aria-label="Close" onclick="document.getElementById('secrets-import-modal').classList.remove('active')">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p id="secrets-import-summary" style="font-size:13px; color:var(--text-muted); margin:0 0 12px;"></p>
+                    <div style="margin-bottom:12px;">
+                        <label for="secrets-import-pass" style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Passphrase</label>
+                        <input id="secrets-import-pass" type="password" autocomplete="off" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
+                    </div>
+                    <label style="display:flex; gap:8px; align-items:center; font-size:13px;"><input type="checkbox" id="secrets-import-overwrite"> Replace values of keys that already exist on this node</label>
+                    <div id="secrets-import-error" role="alert" aria-live="assertive" style="display:none; margin-top:12px; padding:8px 12px; border-radius:6px; background:rgba(239,68,68,0.12); color:var(--danger-color, #ef4444); font-size:13px;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('secrets-import-modal').classList.remove('active')">Cancel</button>
+                    <button class="btn btn-primary" onclick="secretsImportRun()">Import</button>
+                </div>
+            </div>
+        </div>
+
         <div id="secret-edit-modal" class="modal-overlay">
             <div class="modal" style="max-width:500px; width:90%;">
                 <div class="modal-header">

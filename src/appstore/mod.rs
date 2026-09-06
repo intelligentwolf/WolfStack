@@ -811,7 +811,9 @@ fn install_compose(
     // attempt gets a clean slate. Without this the user is left with
     // an orphaned directory under /etc/wolfstack/compose that they'd
     // have to clean up manually.
-    if let Err(e) = compose_up(stack_name) {
+    let warning = match compose_up(stack_name) {
+        Ok(w) => w,
+        Err(e) => {
         let file = appstore_compose_file(stack_name);
         // Best effort: if compose isn't resolvable there is nothing running to
         // tear down anyway, and the caller already has the real error.
@@ -824,9 +826,10 @@ fn install_compose(
         }
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
-    }
+        }
+    };
 
-    Ok(format!("{} deployed via Docker Compose (stack {})", app.name, stack_name))
+    Ok(format!("{} deployed via Docker Compose (stack {}){}", app.name, stack_name, warning))
 }
 
 fn uninstall_compose(stack_name: &str) -> Result<String, String> {
@@ -857,7 +860,12 @@ fn uninstall_compose(stack_name: &str) -> Result<String, String> {
     Ok(format!("Compose stack {} removed", stack_name))
 }
 
-fn compose_up(stack_name: &str) -> Result<(), String> {
+/// `docker compose up -d` for an App Store stack. On success returns the
+/// warning suffix to append to the caller's message: empty when every
+/// `${KEY}` resolved, otherwise the list compose substituted a blank string
+/// for (it only warns, then starts the stack degraded — see
+/// `api::parse_undefined_compose_vars`).
+fn compose_up(stack_name: &str) -> Result<String, String> {
     let file = appstore_compose_file(stack_name);
     // Secrets-Manager entries ride in as process env so `${KEY}` references
     // in the compose YAML resolve — same injection as the Compose page
@@ -869,11 +877,19 @@ fn compose_up(stack_name: &str) -> Result<(), String> {
         .current_dir(appstore_compose_dir(stack_name))
         .output()
         .map_err(|e| format!("docker compose up failed to start: {}", e))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("docker compose up failed: {}", stderr.trim()));
     }
-    Ok(())
+    let unset = crate::api::parse_undefined_compose_vars(&stderr);
+    if unset.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        ". WARNING: {} resolved to an empty string — not in this host's Secrets Manager, \
+         so the stack is running with blank values",
+        unset.iter().map(|v| format!("${{{}}}", v)).collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// Read the on-disk compose file for a compose-backed install. Looks
@@ -908,8 +924,8 @@ pub fn write_compose_file(install_id: &str, new_yaml: &str) -> Result<String, St
         .map_err(|e| format!("create compose dir: {}", e))?;
     std::fs::write(appstore_compose_file(&stack), new_yaml)
         .map_err(|e| format!("write compose file: {}", e))?;
-    compose_up(&stack)?;
-    Ok(format!("{} compose file saved and stack reloaded", app.app_name))
+    let warning = compose_up(&stack)?;
+    Ok(format!("{} compose file saved and stack reloaded{}", app.app_name, warning))
 }
 
 fn install_lxc(
