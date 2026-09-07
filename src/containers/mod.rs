@@ -1488,7 +1488,8 @@ pub fn cleanup_stale_wolfnet_routes() {
             if pid_out.is_empty() || pid_out == "0" { continue; }
 
             // Detect this container's actual bridge device and gateway
-            let (bridge_dev, gw) = docker_bridge_info(name);
+            let net = docker_bridge_info(name);
+            let (bridge_dev, gw) = (net.bridge_dev.clone(), net.gateway.clone());
             bridge_devs.insert(bridge_dev.clone());
 
             // Ensure host route via the container's actual bridge (idempotent — replace if exists)
@@ -1496,17 +1497,15 @@ pub fn cleanup_stale_wolfnet_routes() {
                 .args(["route", "replace", &format!("{}/32", label), "dev", &bridge_dev])
                 .output();
 
-            // Ensure static ARP entry (get MAC via docker inspect)
-            if let Ok(mac_out) = Command::new("docker")
-                .args(["inspect", "--format", "{{range .NetworkSettings.Networks}}{{.MacAddress}}{{end}}", name])
-                .output()
-            {
-                let mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
-                if !mac.is_empty() {
-                    let _ = Command::new("ip")
-                        .args(["neigh", "replace", &label, "lladdr", &mac, "dev", &bridge_dev, "nud", "permanent"])
-                        .output();
-                }
+            // Ensure static ARP entry. The MAC comes from the SAME network
+            // the bridge and gateway were resolved from: the previous
+            // per-field template ranged over every network with no
+            // separator, so a container on two compose networks produced
+            // "02:42:…02:42:…" and this replace failed silently every tick.
+            if !net.mac.is_empty() {
+                let _ = Command::new("ip")
+                    .args(["neigh", "replace", &label, "lladdr", &net.mac, "dev", &bridge_dev, "nud", "permanent"])
+                    .output();
             }
 
             // Ensure container has the WolfNet IP alias on eth0 (via nsenter)
@@ -1527,38 +1526,37 @@ pub fn cleanup_stale_wolfnet_routes() {
             // own connection tracking handles the return path correctly, which is
             // required for reverse proxies and sustained connections (not just ping/curl).
             if bridge_dev != "docker0" {
-                // Get the container's Docker IP on its custom network
-                if let Ok(docker_ip_out) = Command::new("docker")
-                    .args(["inspect", "--format",
-                           "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name])
-                    .output()
-                {
-                    let docker_ip = String::from_utf8_lossy(&docker_ip_out.stdout).trim().to_string();
-                    if !docker_ip.is_empty() && docker_ip != label {
-                        // DNAT WolfNet IP → the container's CURRENT Docker IP, on
-                        // both PREROUTING (host-forwarded) and OUTPUT (host-local).
-                        // Idempotent via -C: steady state makes NO change, so there
-                        // is no reachability gap on the reconcile tick. Only when the
-                        // correct tagged rule is absent (fresh, or the container was
-                        // redeployed onto a new Docker IP) do we first purge EVERY
-                        // DNAT for this WolfNet IP — clearing stale rules that point
-                        // at a previous Docker IP (the accumulation Gary hit:
-                        // 10.10.10.3 → .2/.3/.4) plus any legacy comment-less rule —
-                        // then add the fresh, tagged one.
-                        for chain in ["PREROUTING", "OUTPUT"] {
-                            let correct = Command::new("iptables").args([
-                                "-t", "nat", "-C", chain, "-d", &label,
-                                "-j", "DNAT", "--to-destination", &docker_ip,
-                                "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
-                            ]).output().map(|o| o.status.success()).unwrap_or(false);
-                            if correct { continue; }
-                            purge_container_dnat_for_ip(chain, &label, &prefix);
-                            let _ = Command::new("iptables").args([
-                                "-t", "nat", "-A", chain, "-d", &label,
-                                "-j", "DNAT", "--to-destination", &docker_ip,
-                                "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
-                            ]).output();
-                        }
+                // The container's Docker IP on the network the bridge was
+                // resolved from — never a concatenation of every network's
+                // address (see docker_bridge_info). With the old template a
+                // two-network container got "172.18.0.5172.19.0.3": the -C
+                // check failed, the purge removed any good rule, and the -A
+                // was rejected, so the container had NO DNAT at all.
+                let docker_ip = net.ip.clone();
+                if !docker_ip.is_empty() && docker_ip != label {
+                    // DNAT WolfNet IP → the container's CURRENT Docker IP, on
+                    // both PREROUTING (host-forwarded) and OUTPUT (host-local).
+                    // Idempotent via -C: steady state makes NO change, so there
+                    // is no reachability gap on the reconcile tick. Only when the
+                    // correct tagged rule is absent (fresh, or the container was
+                    // redeployed onto a new Docker IP) do we first purge EVERY
+                    // DNAT for this WolfNet IP — clearing stale rules that point
+                    // at a previous Docker IP (the accumulation Gary hit:
+                    // 10.10.10.3 → .2/.3/.4) plus any legacy comment-less rule —
+                    // then add the fresh, tagged one.
+                    for chain in ["PREROUTING", "OUTPUT"] {
+                        let correct = Command::new("iptables").args([
+                            "-t", "nat", "-C", chain, "-d", &label,
+                            "-j", "DNAT", "--to-destination", &docker_ip,
+                            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
+                        ]).output().map(|o| o.status.success()).unwrap_or(false);
+                        if correct { continue; }
+                        purge_container_dnat_for_ip(chain, &label, &prefix);
+                        let _ = Command::new("iptables").args([
+                            "-t", "nat", "-A", chain, "-d", &label,
+                            "-j", "DNAT", "--to-destination", &docker_ip,
+                            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
+                        ]).output();
                     }
                 }
             }
@@ -1692,7 +1690,8 @@ pub fn cleanup_stale_wolfnet_routes() {
                 .unwrap_or_default();
             if pid_out.is_empty() || pid_out == "0" { continue; }
 
-            let (bridge_dev, gw) = docker_bridge_info(name);
+            let net = docker_bridge_info(name);
+            let (bridge_dev, gw) = (net.bridge_dev.clone(), net.gateway.clone());
             bridge_devs.insert(bridge_dev);
 
             // Add route for WolfNet subnet via the Docker gateway (idempotent).
@@ -2309,24 +2308,114 @@ pub fn ensure_docker_wolfnet_network() -> Result<(), String> {
 /// Detect the host bridge interface and gateway for a Docker container.
 /// Custom Docker networks use `br-<id>` instead of `docker0`, so we inspect
 /// the container's actual network settings rather than assuming the default bridge.
-fn docker_bridge_info(container: &str) -> (String, String) {
-    // Get the network name, gateway, and IP from the container's first network
-    let inspect_fmt = "{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}}|{{$cfg.Gateway}}|{{$cfg.IPAddress}}|{{$cfg.MacAddress}}\n{{end}}";
+/// The one Docker network WolfStack plumbs a container's WolfNet IP
+/// through: host `/32` route, permanent ARP entry, DNAT target and the
+/// container-side gateway all refer to THIS network, so its IP and MAC
+/// must be read from the same place — never from a template that ranges
+/// over every network.
+#[derive(Debug, Clone)]
+struct DockerPrimaryNet {
+    pub bridge_dev: String,
+    pub gateway: String,
+    pub ip: String,
+    pub mac: String,
+}
+
+const DOCKER_NET_INSPECT_FMT: &str =
+    "{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}}|{{$cfg.Gateway}}|{{$cfg.IPAddress}}|{{$cfg.MacAddress}}\n{{end}}";
+
+/// Pure: choose the primary network from the `name|gateway|ip|mac` lines
+/// DOCKER_NET_INSPECT_FMT emits (Go templates range a map in sorted key
+/// order, so the choice is stable across ticks). The first network that
+/// actually holds an IPv4 address wins; a container attached to a network
+/// it has no address on yet (compose connects secondary networks after
+/// create) must not be plumbed through that network. Falls back to the
+/// first line, then to Docker's default bridge.
+/// Returns (net_name, gateway, ip, mac).
+fn parse_docker_primary_network(lines: &str) -> (String, String, String, String) {
+    let parsed: Vec<[&str; 4]> = lines
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut it = l.split('|').map(|p| p.trim());
+            let mut f = [""; 4];
+            for slot in f.iter_mut() {
+                *slot = it.next().unwrap_or("");
+            }
+            f
+        })
+        .collect();
+    let chosen = parsed
+        .iter()
+        .find(|f| !f[2].is_empty())
+        .or_else(|| parsed.first());
+    let f = match chosen {
+        Some(f) => *f,
+        None => [""; 4],
+    };
+    let net_name = if f[0].is_empty() { "bridge" } else { f[0] };
+    let gateway = if f[1].is_empty() { "172.17.0.1" } else { f[1] };
+    (net_name.to_string(), gateway.to_string(), f[2].to_string(), f[3].to_string())
+}
+
+#[cfg(test)]
+mod docker_primary_network_tests {
+    use super::parse_docker_primary_network;
+
+    #[test]
+    fn single_network_is_taken_verbatim() {
+        let (n, gw, ip, mac) = parse_docker_primary_network(
+            "bridge|172.17.0.1|172.17.0.2|02:42:ac:11:00:02\n");
+        assert_eq!((n.as_str(), gw.as_str(), ip.as_str(), mac.as_str()),
+                   ("bridge", "172.17.0.1", "172.17.0.2", "02:42:ac:11:00:02"));
+    }
+
+    #[test]
+    fn two_networks_never_concatenate_and_pick_the_first_with_an_ip() {
+        // The pre-fix templates produced "172.18.0.5172.19.0.3" and
+        // "02:42:ac:12:00:0502:42:ac:13:00:03" here — an unusable DNAT
+        // target and an ARP entry the kernel rejected, every tick.
+        let listing = "app_backend|172.18.0.1|172.18.0.5|02:42:ac:12:00:05\n\
+                       proxy_net|172.19.0.1|172.19.0.3|02:42:ac:13:00:03\n";
+        let (n, gw, ip, mac) = parse_docker_primary_network(listing);
+        assert_eq!(n, "app_backend");
+        assert_eq!(gw, "172.18.0.1");
+        assert_eq!(ip, "172.18.0.5");
+        assert_eq!(mac, "02:42:ac:12:00:05");
+    }
+
+    #[test]
+    fn a_network_without_an_address_is_skipped() {
+        let listing = "aaa_pending||||\nzzz_live|172.20.0.1|172.20.0.9|02:42:ac:14:00:09\n";
+        let (n, gw, ip, mac) = parse_docker_primary_network(listing);
+        assert_eq!(n, "zzz_live");
+        assert_eq!(gw, "172.20.0.1");
+        assert_eq!(ip, "172.20.0.9");
+        assert_eq!(mac, "02:42:ac:14:00:09");
+    }
+
+    #[test]
+    fn no_networks_falls_back_to_the_default_bridge() {
+        let (n, gw, ip, mac) = parse_docker_primary_network("");
+        assert_eq!((n.as_str(), gw.as_str(), ip.as_str(), mac.as_str()),
+                   ("bridge", "172.17.0.1", "", ""));
+    }
+}
+
+/// Detect the host bridge interface, gateway, container IP and MAC for a
+/// Docker container — all from its primary network (see
+/// `parse_docker_primary_network`). Custom Docker networks use `br-<id>`
+/// instead of `docker0`, so the network is inspected rather than assumed.
+fn docker_bridge_info(container: &str) -> DockerPrimaryNet {
     let network_info = Command::new("docker")
-        .args(["inspect", "--format", inspect_fmt, container])
+        .args(["inspect", "--format", DOCKER_NET_INSPECT_FMT, container])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
 
-    // Take the first network line
-    let first_line = network_info.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split('|').collect();
-    let net_name = if !parts.is_empty() { parts[0].trim() } else { "bridge" };
-    let gateway = if parts.len() > 1 && !parts[1].is_empty() {
-        parts[1].to_string()
-    } else {
-        "172.17.0.1".to_string()
-    };
+    let (net_name, gateway, ip, mac) = parse_docker_primary_network(&network_info);
+    let net_name = net_name.as_str();
 
     // Determine the host bridge interface for this Docker network
     let bridge_dev = if net_name == "bridge" || net_name == "host" || net_name.is_empty() {
@@ -2359,7 +2448,7 @@ fn docker_bridge_info(container: &str) -> (String, String) {
         }
     };
 
-    (bridge_dev, gateway)
+    DockerPrimaryNet { bridge_dev, gateway, ip, mac }
 }
 
 /// For a running Docker container, return `(ip, egress_iface)` —
@@ -2433,25 +2522,20 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
 
     // 1. Detect the container's actual bridge device and gateway
     //    Custom Docker networks use br-<id>, not docker0
-    let (bridge_dev, gateway) = docker_bridge_info(container);
+    let net = docker_bridge_info(container);
+    let bridge_dev = net.bridge_dev.clone();
+    let gateway = net.gateway.clone();
 
-    // 2. Get the container's bridge IP
-    let container_bridge_ip = Command::new("docker")
-        .args(["inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
+    // 2./3. The container's IP and MAC on THAT network. These used to come
+    //    from two templates ranging over every network with no separator,
+    //    which on a multi-network container (any compose stack with a
+    //    proxy network) yielded a concatenated IP and MAC — the ARP entry
+    //    and the ping fallback below then both worked on garbage.
+    let container_bridge_ip = net.ip.clone();
     if container_bridge_ip.is_empty() {
         return Err(format!("Container '{}' has no bridge IP — is it running?", container));
     }
-
-    // 3. Get the container's MAC address (inside the per-network settings)
-    let container_mac = Command::new("docker")
-        .args(["inspect", "--format", "{{range .NetworkSettings.Networks}}{{.MacAddress}}{{end}}", container])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let container_mac = net.mac.clone();
 
     // 4. Configure Container Side — use nsenter to avoid requiring 'ip' inside the container.
     //    Many images (e.g. official nginx) don't ship iproute2, so `docker exec ip ...` silently fails.
@@ -2591,7 +2675,16 @@ fn ensure_lxc_bridge_checked() -> Result<(), String> {
     // triggers update-rc.d -> `systemctl daemon-reload`, producing a relentless
     // per-minute reload storm AND re-bouncing lxcbr0/dnsmasq. (regions9 /
     // PapaSchlumpf investigation, 2026-06-17.)
+    //
+    // The /32 host-route verification at the bottom of this function is
+    // the ONE repair that must still run on this path: it is a handful of
+    // `ip route show` calls, touches nothing systemd, and is the only
+    // thing that puts back a route the linkdown sweep removed. The fast
+    // path was added after it and silently made the "ALWAYS, even on
+    // steady-state ticks" promise below false — a dropped route then
+    // stayed gone until the container was restarted.
     if bridge_has_ip("lxcbr0", "10.0.3.1") {
+        ensure_host_wolfnet_routes();
         return Ok(());
     }
 
@@ -6821,17 +6914,25 @@ pub fn docker_logs(container: &str, lines: u32) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// After `docker start` / `docker restart` the container has a brand-new
+/// network namespace: its WolfNet /32 alias, src-hinted route, the host
+/// /32 route and the permanent ARP entry all have to be laid down again.
+/// `docker_start` always did this; `docker_restart` never did, so a
+/// restarted container was unreachable on its WolfNet IP until the 60 s
+/// reconcile tick got to it.
+fn docker_reapply_wolfnet(container: &str) {
+    // Override file first, then the wolfnet.ip label.
+    if let Some(ip) = docker_effective_wolfnet_ip(container) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let _ = docker_connect_wolfnet(container, &ip);
+    }
+}
+
 /// Start a Docker container
 pub fn docker_start(container: &str) -> Result<String, String> {
     let result = run_docker_cmd(&["start", container])?;
 
-    // Re-apply WolfNet IP if configured (check override file first, then label)
-    if let Some(ip) = docker_effective_wolfnet_ip(container) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        if let Err(_e) = docker_connect_wolfnet(container, &ip) {
-
-        }
-    }
+    docker_reapply_wolfnet(container);
 
     // WolfUSB: re-attach any USB devices assigned to this container
     let self_id = crate::agent::self_node_id();
@@ -6851,6 +6952,7 @@ pub fn docker_stop(container: &str) -> Result<String, String> {
 /// Restart a Docker container
 pub fn docker_restart(container: &str) -> Result<String, String> {
     let result = run_docker_cmd(&["restart", container])?;
+    docker_reapply_wolfnet(container);
     let self_id = crate::agent::self_node_id();
     crate::wolfusb::on_container_started(container, "docker", &self_id);
     invalidate_docker_list_cache();
@@ -7490,7 +7592,7 @@ pub fn docker_set_wolfnet_ip(container: &str, ip: Option<&str>) -> Result<String
             // Apply live if running: remove old routes, apply new
             if let Some(ref old) = old_ip
                 && old != new_ip {
-                    let _ = Command::new("ip").args(["route", "del", &format!("{}/32", old), "dev", "docker0"]).output();
+                    let _ = Command::new("ip").args(["route", "del", &format!("{}/32", old)]).output();
                 }
             // Connect to WolfNet (idempotent)
             let _ = docker_connect_wolfnet(container, new_ip);
@@ -7506,7 +7608,7 @@ pub fn docker_set_wolfnet_ip(container: &str, ip: Option<&str>) -> Result<String
 
             // Remove old route if any
             if let Some(ref old) = old_ip {
-                let _ = Command::new("ip").args(["route", "del", &format!("{}/32", old), "dev", "docker0"]).output();
+                let _ = Command::new("ip").args(["route", "del", &format!("{}/32", old)]).output();
             }
 
             Ok("WolfNet IP removed".to_string())

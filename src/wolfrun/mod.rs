@@ -1442,6 +1442,19 @@ pub async fn reconcile(
     let mut local_lists: HashMap<&'static str, Vec<crate::containers::ContainerInfo>> = HashMap::new();
     let mut remote_lists: HashMap<(String, &'static str), Option<Vec<serde_json::Value>>> = HashMap::new();
 
+    // VIPs that currently carry at least one WolfRun DNAT rule in nat
+    // PREROUTING. The LB_CACHE below only rebuilds when the BACKEND SET
+    // changes, so a ruleset wiped underneath us (firewall reload, an
+    // `iptables -t nat -F`, a rules restore) was never repaired: the VIP
+    // kept answering ping — it is a local route on lo — while every TCP
+    // connect to it died. One listing per tick, off the runtime. `None`
+    // when the listing itself failed, which must NOT read as "all
+    // missing" or a host without iptables would rebuild every tick.
+    let lb_rules_present = tokio::task::spawn_blocking(vips_with_lb_rules)
+        .await
+        .ok()
+        .flatten();
+
     for service in &services {
         // 1. Check actual state — query each instance's node for its container status
         let mut live_instances: Vec<ServiceInstance> = Vec::new();
@@ -1671,7 +1684,12 @@ pub async fn reconcile(
                 }
             };
 
-            if changed {
+            let rules_missing = !backend_ips.is_empty()
+                && lb_rules_present
+                    .as_ref()
+                    .map(|present| !present.contains(vip.as_str()))
+                    .unwrap_or(false);
+            if changed || rules_missing {
                 // OFF THE ASYNC RUNTIME. A rebuild is dozens-to-hundreds of
                 // iptables invocations, each taking the global netfilter
                 // lock; running it inline blocked a tokio worker for the
@@ -2963,6 +2981,67 @@ pub fn rebuild_lb_rules(vip: &str, backend_ips: &[String], ports: &[String], lb_
     }
 
 
+}
+
+/// Pure: every VIP tagged by a `wolfrun-lb-<vip>` comment in an
+/// `iptables -S` listing. Token-exact, so 10.10.10.5 never matches the
+/// rules of 10.10.10.50.
+fn vips_tagged_in_listing(listing: &str) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for line in listing.lines() {
+        let mut toks = line.split_whitespace();
+        while let Some(t) = toks.next() {
+            if t != "--comment" { continue; }
+            if let Some(c) = toks.next()
+                && let Some(vip) = c.trim_matches('"').strip_prefix("wolfrun-lb-")
+                && !vip.is_empty()
+            {
+                set.insert(vip.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// VIPs whose LB DNAT rules are actually present in nat PREROUTING right
+/// now. `rebuild_lb_rules` always writes at least one PREROUTING rule per
+/// backend, so "no tagged rule" for a VIP with backends means the ruleset
+/// was lost. `None` if the listing could not be taken.
+fn vips_with_lb_rules() -> Option<std::collections::HashSet<String>> {
+    let out = std::process::Command::new("iptables")
+        .args(["-t", "nat", "-S", "PREROUTING"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(vips_tagged_in_listing(&String::from_utf8_lossy(&out.stdout)))
+}
+
+#[cfg(test)]
+mod lb_rule_presence_tests {
+    use super::vips_tagged_in_listing;
+
+    #[test]
+    fn finds_each_tagged_vip_once_and_is_token_exact() {
+        let listing = "\
+-P PREROUTING ACCEPT
+-A PREROUTING -d 10.10.10.50/32 -p tcp -m tcp --dport 80 -m statistic --mode nth --every 2 --packet 0 -j DNAT --to-destination 10.10.10.101:80 -m comment --comment wolfrun-lb-10.10.10.50
+-A PREROUTING -d 10.10.10.50/32 -p tcp -m tcp --dport 80 -j DNAT --to-destination 10.10.10.102:80 -m comment --comment wolfrun-lb-10.10.10.50
+-A PREROUTING -d 10.10.10.7/32 -m comment --comment \"wolfrun-lb-10.10.10.7\" -j DNAT --to-destination 10.10.10.103
+-A PREROUTING -d 10.10.10.105/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 172.18.0.5
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+";
+        let set = vips_tagged_in_listing(listing);
+        assert!(set.contains("10.10.10.50"));
+        assert!(set.contains("10.10.10.7"));
+        assert!(!set.contains("10.10.10.5"), "prefix of .50 must not count as present");
+        assert!(!set.contains("10.10.10.105"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn empty_listing_has_no_vips() {
+        assert!(vips_tagged_in_listing("-P PREROUTING ACCEPT\n").is_empty());
+    }
 }
 
 /// Remove all iptables rules tagged with a WolfRun LB comment for a given VIP

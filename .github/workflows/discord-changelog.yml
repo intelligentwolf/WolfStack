@@ -3,6 +3,17 @@ name: Discord Changelog
 on:
   push:
     branches: [master]
+  # Manual post to the same channel — a credit that was missed, a note
+  # about a release, anything that belongs next to the changelog.
+  workflow_dispatch:
+    inputs:
+      title:
+        description: "Embed title"
+        required: false
+        default: "📣 WolfStack"
+      message:
+        description: "Embed body (Discord markdown)"
+        required: true
 
 jobs:
   notify:
@@ -12,7 +23,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Post a manual message to Discord
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK }}
+          TITLE: ${{ inputs.title }}
+          MESSAGE: ${{ inputs.message }}
+        run: |
+          jq -n \
+            --arg title "$TITLE" \
+            --arg desc "$MESSAGE" \
+            --arg footer "Posted from ${{ github.repository }}" \
+            '{
+              embeds: [{
+                title: $title,
+                description: $desc,
+                color: 3066993,
+                footer: { text: $footer },
+                timestamp: (now | todate)
+              }]
+            }' > payload.json
+          curl -sf -H "Content-Type: application/json" \
+            -d @payload.json \
+            "$WEBHOOK_URL"
+
       - name: Post changelog to Discord
+        if: github.event_name == 'push'
         env:
           WEBHOOK_URL: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK }}
         run: |
@@ -33,8 +69,26 @@ jobs:
             FILES_CHANGED=$(git diff --stat HEAD~1 | tail -1)
           fi
 
+          # Credit the people whose reports and testing shaped the release.
+          # Commits carry them as trailers — `Reported-by: Name` for the
+          # person who found it, `Thanks-to: Name` for testing or ideas —
+          # so the credit travels with the change instead of depending on
+          # someone remembering at post time.
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="-5"
+          else
+            RANGE="${{ github.event.before }}..${{ github.event.after }}"
+          fi
+          CREDITS=$(git log --format=%B $RANGE \
+            | grep -iE '^(Reported-by|Thanks-to): *[^ ]' \
+            | sed -E 's/^[^:]+: *//' | awk '!seen[tolower($0)]++' | paste -sd ', ' -)
+          THANKS=""
+          if [ -n "$CREDITS" ]; then
+            THANKS=$(printf '\n\n🙏 With thanks to %s' "$CREDITS")
+          fi
+
           # Build a rich Discord embed
-          DESCRIPTION=$(printf '%s\n\n📊 %s' "$COMMITS" "$FILES_CHANGED" | head -c 4000 | jq -Rs .)
+          DESCRIPTION=$(printf '%s\n\n📊 %s%s' "$COMMITS" "$FILES_CHANGED" "$THANKS" | head -c 4000 | jq -Rs .)
           COMPARE_URL="${{ github.event.compare }}"
           AUTHOR="${{ github.event.pusher.name }}"
           REPO="${{ github.repository }}"

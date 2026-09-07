@@ -12339,15 +12339,21 @@ pub async fn docker_action(
             }));
         }
     }
-    let result = match body.action.as_str() {
-        "start" => containers::docker_start(&id),
-        "stop" => containers::docker_stop(&id),
-        "restart" => containers::docker_restart(&id),
-        "remove" => containers::docker_remove_permanent(&id),
-        "pause" => containers::docker_pause(&id),
-        "unpause" => containers::docker_unpause(&id),
-        _ => Err(format!("Unknown action: {}", body.action)),
-    };
+    // Every arm shells out to docker, and start/restart also sleep 1 s
+    // and re-plumb WolfNet — blocking work, so it leaves the runtime.
+    let action = body.action.clone();
+    let target = id.clone();
+    let result = web::block(move || match action.as_str() {
+        "start" => containers::docker_start(&target),
+        "stop" => containers::docker_stop(&target),
+        "restart" => containers::docker_restart(&target),
+        "remove" => containers::docker_remove_permanent(&target),
+        "pause" => containers::docker_pause(&target),
+        "unpause" => containers::docker_unpause(&target),
+        _ => Err(format!("Unknown action: {}", action)),
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("container action task failed: {}", e)));
 
     match result {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
@@ -37759,20 +37765,28 @@ pub async fn wolfrun_service_action(req: HttpRequest, state: web::Data<AppState>
         if inst.standby { continue; }
         if let Some(node) = state.cluster.get_node(&inst.node_id) {
             if node.is_self {
-                // Local container — call functions directly (avoids HTTP self-call issues)
-                let result = match (&svc.runtime, action.as_str()) {
-                    (crate::wolfrun::Runtime::Docker, "start") => crate::containers::docker_start(&inst.container_name),
-                    (crate::wolfrun::Runtime::Docker, "stop") => crate::containers::docker_stop(&inst.container_name),
-                    (crate::wolfrun::Runtime::Docker, "restart") => crate::containers::docker_restart(&inst.container_name),
-                    (crate::wolfrun::Runtime::Lxc, "start") => crate::containers::lxc_start(&inst.container_name),
-                    (crate::wolfrun::Runtime::Lxc, "stop") => crate::containers::lxc_stop(&inst.container_name),
+                // Local container — call functions directly (avoids HTTP
+                // self-call issues). Off the runtime: each arm shells out,
+                // Docker start/restart sleep 1 s re-plumbing WolfNet, and
+                // this loop runs once per instance.
+                let runtime = svc.runtime.clone();
+                let action_name = action.clone();
+                let name = inst.container_name.clone();
+                let result = web::block(move || match (&runtime, action_name.as_str()) {
+                    (crate::wolfrun::Runtime::Docker, "start") => crate::containers::docker_start(&name),
+                    (crate::wolfrun::Runtime::Docker, "stop") => crate::containers::docker_stop(&name),
+                    (crate::wolfrun::Runtime::Docker, "restart") => crate::containers::docker_restart(&name),
+                    (crate::wolfrun::Runtime::Lxc, "start") => crate::containers::lxc_start(&name),
+                    (crate::wolfrun::Runtime::Lxc, "stop") => crate::containers::lxc_stop(&name),
                     (crate::wolfrun::Runtime::Lxc, "restart") => {
-                        let _ = crate::containers::lxc_stop(&inst.container_name);
+                        let _ = crate::containers::lxc_stop(&name);
                         std::thread::sleep(std::time::Duration::from_millis(500));
-                        crate::containers::lxc_start(&inst.container_name)
+                        crate::containers::lxc_start(&name)
                     }
-                    _ => Err(format!("Unknown action: {}", action)),
-                };
+                    _ => Err(format!("Unknown action: {}", action_name)),
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("container action task failed: {}", e)));
                 match result {
                     Ok(_) => { ok_count += 1; }
                     Err(e) => {
