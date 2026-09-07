@@ -13469,7 +13469,29 @@ pub async fn wolfha_capabilities(
     if !crate::auth::is_safe_name(&container) {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid container name"}));
     }
+    // A Proxmox-container probe names the datasets and needs no entry:
+    // it is what a primary asks BEFORE seeding, to learn whether this
+    // node can hold the container at all.
+    let pve_probe = query.get("kind").map(|k| k.trim() == "pve_container").unwrap_or(false);
+    let datasets: Vec<String> = query.get("datasets")
+        .map(|d| d.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
     let blk = web::block(move || -> Result<crate::wolfha::replication::ReplicationCapabilities, String> {
+        if pve_probe {
+            let mut caps = crate::wolfha::replication::detect_pve_capabilities(&datasets, true);
+            // A VMID this node (or its Proxmox cluster) already uses for
+            // something that is not our copy can never be seeded here —
+            // say so at probe time, not after the first stream starts.
+            let store = crate::wolfha::HaStore::load();
+            if store.get(&container).is_none() {
+                let taken = crate::wolfha::replication::zfs_send::vmid_config_paths(&container);
+                if !taken.is_empty() {
+                    caps.notes.push(format!("VMID {} is already in use here ({})", container, taken.join(", ")));
+                    caps.drivers.retain(|d| *d != crate::wolfha::replication::DriverKind::ZfsSend);
+                }
+            }
+            return Ok(caps);
+        }
         let store = crate::wolfha::HaStore::load();
         if store.get(&container).is_none() {
             return Err(format!("'{}' is not WolfHA-managed on this node", container));
@@ -13482,6 +13504,246 @@ pub async fn wolfha_capabilities(
         Ok(Err(e)) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
     }
+}
+
+/// GET /api/wolfha/zfs-snapshots?container=VMID — which WolfHA
+/// replication snapshots this standby holds, per dataset. The primary's
+/// incremental base inventory (replication::zfs_send).
+pub async fn wolfha_zfs_snapshots(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = wolfha_peer_auth(&req, &state) { return resp; }
+    let Some(vmid) = query.get("container").map(|s| s.trim().to_string()) else {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "container parameter required"}));
+    };
+    if !crate::wolfha::replication::zfs_send::is_vmid(&vmid) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid container id"}));
+    }
+    match web::block(move || crate::wolfha::pve_replica_snapshots(&vmid)).await {
+        Ok(map) => HttpResponse::Ok().json(map),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/wolfha/receive-zfs — a primary streams one dataset of a
+/// Proxmox container into this standby's `zfs receive`.
+///
+/// The multipart body carries its text fields BEFORE the `stream` part;
+/// everything is validated when that part is reached, so a request that
+/// cannot succeed is refused before a byte of the stream is read and the
+/// primary's `zfs send` is cut off by the error instead of pouring
+/// gigabytes into a doomed request. The stream is piped straight into
+/// the child's stdin — never staged on disk, never held in memory.
+pub async fn wolfha_receive_zfs(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    mut payload: actix_multipart::Multipart,
+) -> HttpResponse {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    if let Err(resp) = wolfha_peer_auth(&req, &state) { return resp; }
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    while let Some(item) = payload.next().await {
+        let mut field = match item {
+            Ok(f) => f,
+            Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("multipart error: {}", e) })),
+        };
+        let name = field.name().unwrap_or("").to_string();
+        if name != "stream" {
+            let mut buf = Vec::new();
+            while let Some(chunk) = field.next().await {
+                if let Ok(data) = chunk { buf.extend_from_slice(&data); }
+            }
+            fields.insert(name, String::from_utf8_lossy(&buf).to_string());
+            continue;
+        }
+        let f = fields.clone();
+        let plan = match web::block(move || crate::wolfha::pve_prepare_receive(&f)).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+            Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+        };
+        let mut child = match tokio::process::Command::new("zfs")
+            .args(&plan.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("spawn zfs receive: {}", e) })),
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": "zfs receive: no stdin" }));
+        };
+        let mut bytes: u64 = 0;
+        let mut upload_err: Option<String> = None;
+        while let Some(chunk) = field.next().await {
+            let data = match chunk {
+                Ok(d) => d,
+                Err(e) => { upload_err = Some(format!("upload read: {}", e)); break; }
+            };
+            if let Err(e) = stdin.write_all(&data).await {
+                upload_err = Some(format!("zfs receive stopped accepting data: {}", e));
+                break;
+            }
+            bytes += data.len() as u64;
+        }
+        drop(stdin);
+        let out = match child.wait_with_output().await {
+            Ok(o) => o,
+            Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("zfs receive: {}", e) })),
+        };
+        let zfs_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if let Some(e) = upload_err {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("{} ({} bytes received{})", e, bytes, if zfs_err.is_empty() { String::new() } else { format!("; zfs: {}", zfs_err) })
+            }));
+        }
+        if !out.status.success() {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("zfs receive of {} failed after {} bytes: {}", plan.dataset, bytes, zfs_err)
+            }));
+        }
+        let f = fields.clone();
+        return match web::block(move || crate::wolfha::pve_commit_receive(&f, &plan).map(|_| plan.dataset)).await {
+            Ok(Ok(dataset)) => {
+                tracing::info!("wolfha: received ZFS stream of {} ({} bytes)", dataset, bytes);
+                HttpResponse::Ok().json(serde_json::json!({ "ok": true, "bytes": bytes }))
+            }
+            Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("stream received but the standby could not be recorded: {}", e)
+            })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+        };
+    }
+    HttpResponse::BadRequest().json(serde_json::json!({ "error": "the request carried no stream part" }))
+}
+
+/// Undo a failed Proxmox-container protect: no entry, boot flag as it
+/// was, replication snapshots gone. The container itself was never
+/// touched beyond its `onboot` flag.
+async fn wolfha_enable_pve_unwind(
+    container: &str,
+    datasets: &[String],
+    had_onboot: bool,
+    tasks: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
+    tid: &str,
+    why: String,
+) {
+    let mut st = crate::wolfha::HaStore::load();
+    st.remove(container);
+    let _ = st.save();
+    let (c, ds) = (container.to_string(), datasets.to_vec());
+    let _ = tokio::task::spawn_blocking(move || {
+        if had_onboot { let _ = crate::wolfha::pve_set_onboot(&c, true); }
+        crate::wolfha::pve_destroy_our_snapshots(&c, &ds);
+    }).await;
+    wolfha_protect_fail(container, &why);
+    migration_fail(tasks, tid, &why);
+}
+
+/// Protect a Proxmox container on ZFS: probe every standby, take over the
+/// boot flag, record the entry, and run the first round (a full stream to
+/// each standby). Any failure unwinds completely — no entry, boot flag
+/// restored, replication snapshots destroyed — so a failed protect leaves
+/// the container exactly as it was.
+#[allow(clippy::too_many_arguments)]
+async fn wolfha_enable_pve(
+    container: String,
+    peers: Vec<crate::wolfha::HaPeer>,
+    interval: u64,
+    auto_failover: bool,
+    witness: String,
+    failover_after: u64,
+    self_peer: crate::wolfha::HaPeer,
+    secret: String,
+    tasks: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
+    tid: String,
+) {
+    let fail = |msg: String| {
+        wolfha_protect_fail(&container, &msg);
+        migration_fail(&tasks, &tid, &msg);
+    };
+    migration_update(&tasks, &tid, "seed", "Checking the container's volumes and every standby…");
+    wolfha_protect_note(&container, "Checking the container's volumes and every standby…");
+    let c = container.clone();
+    let datasets = match tokio::task::spawn_blocking(move || crate::wolfha::pve_datasets(&c)).await {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return fail(format!("cannot protect this container: {}", e)),
+        Err(e) => return fail(format!("{}", e)),
+    };
+    let local = crate::wolfha::replication::detect_pve_capabilities(&datasets, false);
+    if let Some(why) = crate::wolfha::replication::pve_replication_blocked_reason(&local) {
+        return fail(format!("cannot protect this container: {}", why));
+    }
+    for peer in &peers {
+        if let Err(e) = crate::wolfha::pve_probe_replica(&container, peer, &secret, &datasets).await {
+            return fail(format!("cannot protect this container: {}", e));
+        }
+    }
+    let c = container.clone();
+    let had_onboot = match tokio::task::spawn_blocking(move || {
+        let cfg = crate::wolfha::pve_read_config(&c)?;
+        let on = crate::wolfha::replication::zfs_send::config_onboot(&cfg);
+        if on {
+            crate::wolfha::pve_set_onboot(&c, false)?;
+        }
+        Ok::<bool, String>(on)
+    }).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return fail(format!("could not take over the container's boot flag: {}", e)),
+        Err(e) => return fail(format!("{}", e)),
+    };
+    let mut store = crate::wolfha::HaStore::load();
+    store.remove(&container);
+    store.entries.push(crate::wolfha::HaEntry {
+        container: container.clone(),
+        kind: crate::wolfha::SubjectKind::PveContainer,
+        role: crate::wolfha::HaRole::Primary,
+        interval_minutes: interval,
+        replicas: peers.clone(),
+        primary: None,
+        autostart_managed: had_onboot,
+        last_sync: std::collections::HashMap::new(),
+        last_delta_at: 0,
+        stale: false,
+        pending_vm_delta: None,
+        vm_chain: None,
+        auto_failover,
+        witness,
+        failover_after_secs: failover_after,
+        self_identity: Some(self_peer),
+        zfs_datasets: datasets.clone(),
+    });
+    if let Err(e) = store.save() {
+        let c = container.clone();
+        if had_onboot { let _ = tokio::task::spawn_blocking(move || crate::wolfha::pve_set_onboot(&c, true)).await; }
+        return fail(format!("could not save the HA entry: {}", e));
+    }
+    migration_update(&tasks, &tid, "seed",
+        &format!("Streaming {} dataset(s) to {} standby(s) with zfs send (the container keeps running)…", datasets.len(), peers.len()));
+    wolfha_protect_note(&container,
+        &format!("Streaming {} dataset(s) to {} standby(s) with zfs send…", datasets.len(), peers.len()));
+    if let Err(e) = crate::wolfha::sync_container_now(&container).await {
+        return wolfha_enable_pve_unwind(&container, &datasets, had_onboot, &tasks, &tid,
+            format!("Seeding failed: {}. No HA entry was created — fix the cause and try again.", e)).await;
+    }
+    let failures: Vec<String> = crate::wolfha::HaStore::load().get(&container)
+        .map(|e| e.last_sync.iter().filter(|(_, s)| !s.ok).map(|(n, s)| format!("{}: {}", n, s.message)).collect())
+        .unwrap_or_default();
+    if !failures.is_empty() {
+        return wolfha_enable_pve_unwind(&container, &datasets, had_onboot, &tasks, &tid,
+            format!("Seeding failed on {} — {}. No HA entry was created — fix the node and try again.",
+                if failures.len() == 1 { "a standby" } else { "standbys" }, failures.join("; "))).await;
+    }
+    wolfha_protect_clear(&container);
+    migration_done(&tasks, &tid, &format!(
+        "'{}' is protected — {} standby(s) hold a ZFS copy of {} dataset(s); incremental sends every {} min.",
+        container, peers.len(), datasets.len(), interval));
 }
 
 #[derive(serde::Deserialize)]
@@ -14040,15 +14302,30 @@ pub async fn wolfha_enable(
     if !crate::auth::is_safe_name(&container) {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid container name"}));
     }
-    if containers::is_proxmox() {
+    let is_pve = subject_kind == crate::wolfha::SubjectKind::PveContainer;
+    if containers::is_proxmox() && !is_pve {
         return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "WolfHA Phase 1 supports native LXC nodes only — this node is Proxmox-managed"
+            "error": "this node is Proxmox-managed — protect its containers as \"Proxmox container (ZFS)\", the native LXC and VM paths need a native node"
         }));
+    }
+    if is_pve && !containers::is_proxmox() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "a Proxmox container can only be protected from the Proxmox host it runs on"
+        }));
+    }
+    if is_pve && !crate::wolfha::replication::zfs_send::is_vmid(&container) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "a Proxmox container is identified by its numeric VMID" }));
     }
     let base = containers::lxc_base_dir(&container);
     let container_dir = format!("{}/{}", base, container);
     let rootfs = format!("{}/rootfs", container_dir);
-    if subject_kind == crate::wolfha::SubjectKind::Vm {
+    if is_pve {
+        if !std::path::Path::new(&crate::wolfha::pve_config_path(&container)).exists() {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("Proxmox container {} not found on this node", container)
+            }));
+        }
+    } else if subject_kind == crate::wolfha::SubjectKind::Vm {
         let vm = container.clone();
         match web::block(move || -> Result<(), String> {
             // What CAN'T fail over is refused up front, honestly, instead
@@ -14134,7 +14411,7 @@ pub async fn wolfha_enable(
         }
         if node.node_type == "proxmox" {
             return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": format!("node '{}' is Proxmox-managed — WolfHA Phase 1 replicas need native nodes", node.hostname)
+                "error": format!("node '{}' is a Proxmox API node that is not running WolfStack — a standby must run WolfStack (install it on that host to use it)", node.hostname)
             }));
         }
         peers.push(crate::wolfha::HaPeer { node_id: node.id, address: node.address, port: node.port });
@@ -14157,6 +14434,11 @@ pub async fn wolfha_enable(
         // Holds the per-container protect slot for the life of this
         // task — released by Drop on every exit path.
         let _inflight_guard = inflight_guard;
+        if subject_kind == crate::wolfha::SubjectKind::PveContainer {
+            wolfha_enable_pve(container, peers, interval, auto_failover, witness, failover_after,
+                self_peer, secret, tasks, tid).await;
+            return;
+        }
         // One live full tar of the rootfs, shipped to every replica. The
         // container keeps running — the copy is crash-consistent and the
         // first delta rounds true it up.
@@ -14217,6 +14499,7 @@ pub async fn wolfha_enable(
                 witness: witness.clone(),
                 failover_after_secs: failover_after,
                 primary: Some(self_peer.clone()),
+                zfs_datasets: Vec::new(),
             }).unwrap_or_default();
             let size_mb = seed_size / (1024 * 1024);
             for (i, peer) in peers.iter().enumerate() {
@@ -14278,6 +14561,7 @@ pub async fn wolfha_enable(
                 witness: witness.clone(),
                 failover_after_secs: failover_after,
                 self_identity: Some(self_peer.clone()),
+                zfs_datasets: Vec::new(),
             });
             if let Err(e) = store.save() {
                 let vm = container.clone();
@@ -14321,6 +14605,7 @@ pub async fn wolfha_enable(
             witness: witness.clone(),
             failover_after_secs: failover_after,
             primary: Some(self_peer.clone()),
+            zfs_datasets: Vec::new(),
         }).unwrap_or_default();
 
         let client = &*API_HTTP_CLIENT;
@@ -14415,6 +14700,7 @@ pub async fn wolfha_enable(
             witness: witness.clone(),
             failover_after_secs: failover_after,
             self_identity: Some(self_peer.clone()),
+            zfs_datasets: Vec::new(),
         });
         if let Err(e) = store.save() {
             wolfha_protect_fail(&container, &format!("Replicas seeded but saving the HA entry failed: {}", e));
@@ -14712,7 +14998,12 @@ pub async fn wolfha_demote(
 
     if final_sync {
         let secret = crate::auth::load_cluster_secret();
-        let status = crate::wolfha::sync_one_replica(&container, &new_primary, &secret).await;
+        // Stopped above, so this snapshot IS the container's final state.
+        let status = if kind == crate::wolfha::SubjectKind::PveContainer {
+            crate::wolfha::pve_final_sync(&container, &new_primary, &secret).await
+        } else {
+            crate::wolfha::sync_one_replica(&container, &new_primary, &secret).await
+        };
         if !status.ok {
             // The handoff still proceeds — the promoting side decided to
             // take over; it just gets the last periodic state instead of
@@ -14845,8 +15136,18 @@ pub async fn wolfha_drop(
         // Read the kind BEFORE removing the entry — afterwards there is
         // nothing left to tell us what this copy was.
         let kind = store.get(&container).map(|e| e.kind).unwrap_or_default();
+        let datasets = store.get(&container).map(|e| e.zfs_datasets.clone()).unwrap_or_default();
         store.remove(&container);
         store.save()?;
+        if kind == crate::wolfha::SubjectKind::PveContainer {
+            if destroy {
+                return crate::wolfha::pve_remove_replica(&container, &datasets);
+            }
+            return Ok(format!(
+                "'{}' is no longer WolfHA-managed here; the stopped Proxmox container and its volumes were left in place (onboot stays 0)",
+                container
+            ));
+        }
         if kind == crate::wolfha::SubjectKind::Vm {
             // A VM replica is a disk image plus a definition, not a rootfs
             // directory, so it is removed through the VM store.
@@ -14946,10 +15247,21 @@ pub async fn wolfha_disable(
                 notes.push(format!("replica on {} unreachable — its copy remains until dropped manually", peer.node_id));
             }
         }
+        if entry.kind == crate::wolfha::SubjectKind::PveContainer {
+            // The replication snapshots are bases nobody will send from now.
+            let (c, ds) = (container.clone(), entry.zfs_datasets.clone());
+            let _ = web::block(move || crate::wolfha::pve_destroy_our_snapshots(&c, &ds)).await;
+        }
         if entry.autostart_managed {
             // Hand the boot back to whatever owned it before HA: the LXC
-            // flag for containers, the VM sidecar flag for VMs.
-            if entry.kind == crate::wolfha::SubjectKind::Vm {
+            // flag for containers, the VM sidecar flag for VMs, `onboot`
+            // for a Proxmox container.
+            if entry.kind == crate::wolfha::SubjectKind::PveContainer {
+                let c = container.clone();
+                if let Ok(Err(e)) = web::block(move || crate::wolfha::pve_set_onboot(&c, true)).await {
+                    notes.push(format!("could not restore the container's onboot flag: {}", e));
+                }
+            } else if entry.kind == crate::wolfha::SubjectKind::Vm {
                 let c = container.clone();
                 if let Ok(Err(e)) = web::block(move || crate::wolfha::vm_set_autostart(&c, true)).await {
                     notes.push(format!("could not restore the VM's autostart flag: {}", e));
@@ -47396,6 +47708,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfha/status", web::get().to(wolfha_status))
         .route("/api/wolfha/manifest", web::get().to(wolfha_manifest))
         .route("/api/wolfha/capabilities", web::get().to(wolfha_capabilities))
+        .route("/api/wolfha/zfs-snapshots", web::get().to(wolfha_zfs_snapshots))
+        .route("/api/wolfha/receive-zfs", web::post().to(wolfha_receive_zfs))
         .route("/api/wolfha/apply-vm-delta", web::post().to(wolfha_apply_vm_delta))
         .route("/api/wolfha/signatures", web::post().to(wolfha_signatures))
         .route("/api/wolfha/apply-delta", web::post().to(wolfha_apply_delta))

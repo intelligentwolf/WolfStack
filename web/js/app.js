@@ -84527,12 +84527,15 @@ async function loadWolfHa() {
             </div>`;
         }).join('');
         const isVm = copies.some(c => c.kind === 'vm');
+        const isPve = copies.some(c => c.kind === 'pve_container');
         const warn = primary ? '' :
             `<div style="margin-top:6px;font-size:11px;color:var(--warning);">No active primary is reachable for this ${isVm ? 'VM' : 'container'} — promote the freshest standby to bring it back.</div>`;
         // Theme tokens only, same rule as the badges above: a hardcoded
         // colour here reads as a wash on light/arctic/fruit.
         const kindBadge = isVm
             ? '<span title="Virtual machine — replicated with QEMU dirty bitmaps (crash-consistent)" style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--info-bg);color:var(--info);border:1px solid var(--info);">VM</span>'
+            : isPve
+            ? '<span title="Proxmox container — every ZFS volume replicated with zfs send (crash-consistent)" style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--info-bg);color:var(--info);border:1px solid var(--info);">Proxmox / ZFS</span>'
             : '<span title="LXC container — replicated from the rootfs" style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-tertiary);color:var(--text-muted);border:1px solid var(--border);">CT</span>';
         return `<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px;background:var(--bg-secondary);">
             <div style="display:flex;align-items:center;gap:8px;">
@@ -84746,6 +84749,7 @@ function wolfHaOpenProtectModal() {
                 <select id="wolfha-kind" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;" onchange="wolfHaLoadSubjects()">
                     <option value="container">Container (native LXC)</option>
                     <option value="vm">Virtual machine (native QEMU)</option>
+                    <option value="pve_container">Container (Proxmox, ZFS volumes)</option>
                 </select>
                 <span id="wolfha-kind-hint" style="font-size:11px;color:var(--text-muted);">Replicated as a file-level copy of the rootfs, using block deltas where the files are large.</span></div>
             <div><label style="font-size:13px;color:var(--text-muted);" id="wolfha-node-label">Node the container runs on</label>
@@ -84824,15 +84828,18 @@ async function wolfHaLoadSubjects() {
     const kind = document.getElementById('wolfha-kind')?.value || 'container';
     const sel = document.getElementById('wolfha-container');
     const isVm = kind === 'vm';
+    const isPve = kind === 'pve_container';
 
     const nodeLabel = document.getElementById('wolfha-node-label');
-    if (nodeLabel) nodeLabel.textContent = isVm ? 'Node the VM runs on' : 'Node the container runs on';
+    if (nodeLabel) nodeLabel.textContent = isVm ? 'Node the VM runs on' : isPve ? 'Proxmox host the container runs on' : 'Node the container runs on';
     const subjLabel = document.getElementById('wolfha-subject-label');
-    if (subjLabel) subjLabel.textContent = isVm ? 'Virtual machine (native QEMU)' : 'Container (native LXC)';
+    if (subjLabel) subjLabel.textContent = isVm ? 'Virtual machine (native QEMU)' : isPve ? 'Container (Proxmox VMID)' : 'Container (native LXC)';
     const kindHint = document.getElementById('wolfha-kind-hint');
     if (kindHint) {
         kindHint.textContent = isVm
             ? 'Replicated with QEMU dirty bitmaps — only the disk blocks the guest changed are sent, and the copy is crash-consistent. The VM keeps running throughout.'
+            : isPve
+            ? 'Replicated with zfs send: every volume of the container (rootfs and mount points on a ZFS pool storage) is snapshotted atomically and only the changed blocks travel. Standbys must be Proxmox hosts running WolfStack with the same ZFS pool layout; bind mounts and non-ZFS volumes cannot be protected.'
             : 'Replicated as a file-level copy of the rootfs, using block deltas where the files are large.';
     }
 
@@ -84848,7 +84855,7 @@ async function wolfHaLoadSubjects() {
             return;
         }
         sel.innerHTML = `<option value="">— select ${isVm ? 'VM' : 'container'} —</option>`
-            + items.map(c => `<option value="${vlanEsc(c.name)}">${vlanEsc(c.hostname || c.name)}</option>`).join('');
+            + items.map(c => `<option value="${vlanEsc(c.name)}">${vlanEsc(c.hostname || c.name)}${isPve && c.hostname && c.hostname !== c.name ? ` (${vlanEsc(c.name)})` : ''}</option>`).join('');
     } catch (e) {
         sel.innerHTML = `<option value="">could not list ${isVm ? 'VMs' : 'containers'}</option>`;
     }

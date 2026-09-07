@@ -45,6 +45,7 @@
 //! they did before.
 
 pub mod qemu_bitmap;
+pub mod zfs_send;
 pub mod rolling;
 pub mod snapshot;
 
@@ -71,6 +72,12 @@ pub enum DriverKind {
     /// VM subjects only — the bitmap lives in the qcow2 and is a block
     /// layer feature, so it has no meaning for a container rootfs.
     QemuBitmap,
+    /// `zfs send -I` between snapshots of the subject's own datasets.
+    /// Proxmox-container subjects only — their volumes ARE ZFS datasets,
+    /// and the standby must run ZFS with the same pool layout to receive
+    /// them (see `zfs_send.rs` for why that coupling is acceptable here
+    /// and nowhere else).
+    ZfsSend,
 }
 
 impl DriverKind {
@@ -82,6 +89,7 @@ impl DriverKind {
             DriverKind::FileManifest => 0,
             DriverKind::RollingDelta => 1,
             DriverKind::QemuBitmap => 2,
+            DriverKind::ZfsSend => 3,
         }
     }
 
@@ -91,6 +99,7 @@ impl DriverKind {
             DriverKind::FileManifest => "whole-file",
             DriverKind::RollingDelta => "block delta",
             DriverKind::QemuBitmap => "QEMU dirty bitmap",
+            DriverKind::ZfsSend => "ZFS send",
         }
     }
 }
@@ -157,6 +166,9 @@ pub const IMPLEMENTED_DRIVERS: &[DriverKind] = &[
     // the replica-side applier.
     DriverKind::RollingDelta,
     DriverKind::QemuBitmap,
+    // Proxmox containers on ZFS: streamed send/receive, peer probe,
+    // snapshot-history chain. See replication::zfs_send.
+    DriverKind::ZfsSend,
 ];
 
 /// Choose the strategy for a sync: the best driver BOTH ends support.
@@ -398,6 +410,71 @@ pub fn vm_replication_blocked_reason(caps: &ReplicationCapabilities) -> Option<S
     })
 }
 
+/// What THIS node can do for a Proxmox container whose volumes are the
+/// given datasets — as the primary (they must exist here) or as a
+/// standby (their parents must exist here, and the datasets must not
+/// belong to something that is not our replica).
+///
+/// Like a VM, a Proxmox container never falls back to the file drivers:
+/// its volumes are not a stable host directory, so the only thing a
+/// standby can hold is a received ZFS stream. Missing pieces are named in
+/// `notes` so "why can't I protect this?" has an answer.
+pub fn detect_pve_capabilities(datasets: &[String], as_replica: bool) -> ReplicationCapabilities {
+    let mut caps = ReplicationCapabilities {
+        drivers: Vec::new(),
+        backing_id: datasets.join(","),
+        notes: Vec::new(),
+    };
+    if !crate::containers::is_proxmox() {
+        caps.notes.push("this node is not a Proxmox host (no `pct`), so it cannot run a Proxmox container".into());
+    }
+    if !zfs_send::have_zfs() {
+        caps.notes.push("ZFS is not installed on this node, so it cannot send or receive a ZFS stream".into());
+    }
+    if datasets.is_empty() {
+        caps.notes.push("no ZFS datasets were named".into());
+    }
+    if caps.notes.is_empty() {
+        for ds in datasets {
+            if !zfs_send::is_safe_dataset(ds) {
+                caps.notes.push(format!("dataset name {:?} is not valid", ds));
+                continue;
+            }
+            if as_replica {
+                match zfs_send::parent_dataset(ds) {
+                    Some(parent) if zfs_send::dataset_exists(parent) => {}
+                    Some(parent) => caps.notes.push(format!(
+                        "this node has no ZFS dataset '{}' to receive '{}' into — the standby needs the \
+                         same pool layout as the primary", parent, ds)),
+                    None => caps.notes.push(format!("'{}' has no parent dataset", ds)),
+                }
+            } else if !zfs_send::dataset_exists(ds) {
+                caps.notes.push(format!("dataset '{}' does not exist on this node", ds));
+            }
+        }
+    }
+    if caps.notes.is_empty() {
+        caps.drivers.push(DriverKind::ZfsSend);
+    }
+    caps.retain_implemented();
+    // As for VMs: the floor is meaningless for this subject kind.
+    caps.drivers.retain(|d| *d != DriverKind::FileManifest);
+    caps
+}
+
+/// Why a Proxmox container cannot be replicated to/from this node, or
+/// `None` when it can.
+pub fn pve_replication_blocked_reason(caps: &ReplicationCapabilities) -> Option<String> {
+    if caps.supports(DriverKind::ZfsSend) {
+        return None;
+    }
+    Some(if caps.notes.is_empty() {
+        "ZFS replication is unavailable on this node.".to_string()
+    } else {
+        caps.notes.join("; ")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +562,25 @@ mod tests {
     fn rank_order_is_strictly_increasing() {
         assert!(DriverKind::RollingDelta.rank() > DriverKind::FileManifest.rank());
         assert!(DriverKind::QemuBitmap.rank() > DriverKind::RollingDelta.rank());
+        assert!(DriverKind::ZfsSend.rank() > DriverKind::QemuBitmap.rank());
+    }
+
+    /// A Proxmox container on a node without ZFS (this test box) must
+    /// offer no driver and say why — never the file floor, which would
+    /// ship a payload no Proxmox standby can start.
+    #[test]
+    fn pve_subject_without_zfs_offers_no_driver_and_explains_why() {
+        let caps = detect_pve_capabilities(&["rpool/data/subvol-1-disk-0".to_string()], true);
+        if caps.supports(DriverKind::ZfsSend) {
+            // A real Proxmox+ZFS host running the tests: the probe is honest either way.
+            return;
+        }
+        assert!(!caps.supports(DriverKind::FileManifest));
+        let why = pve_replication_blocked_reason(&caps).expect("must give a reason");
+        assert!(!why.is_empty());
+        // A bad dataset name is refused before any zfs call.
+        let bad = detect_pve_capabilities(&["../etc".to_string()], true);
+        assert!(!bad.supports(DriverKind::ZfsSend));
     }
 
     /// A non-qcow2 VM disk must NOT silently fall back to a file-level
@@ -517,6 +613,7 @@ mod tests {
             (DriverKind::FileManifest, "\"file_manifest\""),
             (DriverKind::RollingDelta, "\"rolling_delta\""),
             (DriverKind::QemuBitmap, "\"qemu_bitmap\""),
+            (DriverKind::ZfsSend, "\"zfs_send\""),
         ];
         for (kind, wire) in pairs {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
