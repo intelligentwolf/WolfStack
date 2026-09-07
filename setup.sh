@@ -3058,14 +3058,31 @@ wolfusb_install_modules_pkg() {
     return 0
 }
 
-mkdir -p /etc/modules-load.d
-printf 'vhci-hcd\nusbip-core\nusbip-host\n' > /etc/modules-load.d/wolfusb.conf
-
 if ! wolfusb_try_modprobe; then
     echo "  USB/IP kernel modules not available — installing modules package..."
     if wolfusb_install_modules_pkg && wolfusb_try_modprobe; then
         :  # success
     fi
+fi
+
+# Load the USB/IP modules at boot - but only the ones this kernel actually
+# ships. Listing a module the kernel does not have (vendor kernels on
+# Rockchip / Raspberry Pi boards, minimal cloud kernels) makes
+# systemd-modules-load.service fail on EVERY boot: a red unit in
+# `systemctl --failed` that sends operators chasing the wrong thing when
+# a boot goes bad. No usable module - no file.
+mkdir -p /etc/modules-load.d
+WOLFUSB_MODS=""
+for m in vhci-hcd usbip-core usbip-host; do
+    if modinfo -n "$m" >/dev/null 2>&1; then
+        WOLFUSB_MODS="${WOLFUSB_MODS}${m}
+"
+    fi
+done
+if [ -n "$WOLFUSB_MODS" ]; then
+    printf '%s' "$WOLFUSB_MODS" > /etc/modules-load.d/wolfusb.conf
+else
+    rm -f /etc/modules-load.d/wolfusb.conf
 fi
 
 if [ -d /sys/devices/platform/vhci_hcd.0 ] && \

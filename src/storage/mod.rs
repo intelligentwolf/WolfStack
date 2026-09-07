@@ -3048,9 +3048,173 @@ Type=oneshot
 RemainAfterExit=yes
 # WolfStack touches this flag once every auto-mount entry has been attempted
 # (success or failure). /run is per-boot tmpfs - no stale flag across boots.
-ExecStart=/bin/sh -c 'until [ -e /run/wolfstack/mounts-ready ]; do sleep 1; done'
+# Bounded and ALWAYS successful: if WolfStack never signals (failed start
+# after an upgrade, slow NAS), release the dependants after 280 s instead of
+# failing this unit - a failed wait fails the target, fails every fstab
+# mount that Requires it, and a mount without nofail then fails
+# local-fs.target and drops the host into emergency mode.
+ExecStart=/bin/sh -c 'timeout 280 sh -c \"until [ -e /run/wolfstack/mounts-ready ]; do sleep 1; done\"; exit 0'
 TimeoutStartSec=300
 ";
+
+/// What the startup fstab repair did in this process. Read by the
+/// boot-health analyzer so the inbox says exactly which of "not run
+/// yet", "nothing to do", "repaired these" or "failed because" is true,
+/// rather than inferring it from whether a risky line is still present.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FstabRepairState {
+    /// The startup thread has not reached the repair yet.
+    #[default]
+    NotRun,
+    /// fstab read; no line needed `nofail`.
+    Clean,
+    /// `nofail` was added to the lines for these mount points.
+    Repaired(Vec<String>),
+    /// These mount points needed `nofail` and the file could not be
+    /// rewritten; `error` says why.
+    Failed { mountpoints: Vec<String>, error: String },
+}
+
+static FSTAB_REPAIR_STATE: std::sync::Mutex<FstabRepairState> =
+    std::sync::Mutex::new(FstabRepairState::NotRun);
+
+pub fn fstab_repair_state() -> FstabRepairState {
+    FSTAB_REPAIR_STATE.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// Mount points whose /etc/fstab line WolfStack repaired at this daemon
+/// start (added `nofail`).
+pub fn fstab_repairs_this_start() -> Vec<String> {
+    match fstab_repair_state() {
+        FstabRepairState::Repaired(v) => v,
+        _ => Vec::new(),
+    }
+}
+
+fn set_fstab_repair_state(s: FstabRepairState) {
+    if let Ok(mut g) = FSTAB_REPAIR_STATE.lock() { *g = s; }
+}
+
+/// Pure: if this fstab line orders on wolfstack-mounts.target (or the
+/// wait service) and lacks `nofail`, return (mount point, repaired line).
+/// Every other line, comments included, returns None. The repaired line
+/// is the original with `nofail,` prepended to its options field and
+/// nothing else touched.
+pub fn fstab_line_needs_nofail(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') { return None; }
+    let mut it = t.split_whitespace();
+    let _dev = it.next()?;
+    let mp = it.next()?;
+    let _fs = it.next()?;
+    let opts = it.next()?;
+    if !opts.contains("wolfstack-mounts") { return None; }
+    if opts.split(',').any(|o| o == "nofail") { return None; }
+    let fixed = crate::predictive::boot_health::with_nofail(line)?;
+    Some((mp.to_string(), fixed))
+}
+
+/// The documented contract for ordering an fstab mount on
+/// wolfstack-mounts.target is `nofail,_netdev,x-systemd.requires=…` —
+/// and `nofail` is the load-bearing part (see the block comment above:
+/// without it the mount is Before=local-fs.target while the target
+/// chain is after wolfstack.service, an ordering cycle systemd breaks
+/// by deleting an arbitrary job, so boot fails on some reboots and not
+/// others, and when it fails it fails into emergency mode). Nothing
+/// enforced that until now: a host whose operator dropped `nofail`
+/// (Markos, Orange Pi 5 Max, 2026-09-07) was left to find out at the
+/// console. Runs at every start, before the unit chain is (re)written;
+/// only lines that reference OUR target are touched, the original file
+/// is kept as /etc/fstab.wolfstack-bak-<unix-time>, and the mount
+/// point of every repaired line is recorded for the inbox.
+fn repair_fstab_mounts_target_lines() {
+    const FSTAB: &str = "/etc/fstab";
+    let text = match std::fs::read_to_string(FSTAB) {
+        Ok(t) => t,
+        Err(e) => {
+            set_fstab_repair_state(FstabRepairState::Failed {
+                mountpoints: Vec::new(),
+                error: format!("could not read {}: {}", FSTAB, e),
+            });
+            return;
+        }
+    };
+    let mut repaired: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        match fstab_line_needs_nofail(body) {
+            Some((mp, fixed)) => {
+                repaired.push(mp);
+                out.push_str(&fixed);
+                if line.ends_with('\n') { out.push('\n'); }
+            }
+            None => out.push_str(line),
+        }
+    }
+    if repaired.is_empty() {
+        set_fstab_repair_state(FstabRepairState::Clean);
+        return;
+    }
+    let fail = |error: String| {
+        error!("storage: fstab needs nofail on {:?} — {}", repaired, error);
+        set_fstab_repair_state(FstabRepairState::Failed { mountpoints: repaired.clone(), error });
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bak = format!("{}.wolfstack-bak-{}", FSTAB, ts);
+    if let Err(e) = std::fs::write(&bak, &text) {
+        return fail(format!("the backup {} could not be written: {}", bak, e));
+    }
+    // Write-to-temp then rename: a plain fs::write truncates first, and a
+    // crash or power loss between truncate and write would leave a
+    // half-written fstab — the one outcome this repair exists to prevent.
+    // Same pattern as write_config_atomic. The temp file takes the
+    // original's permissions so rename() cannot change the mode of
+    // /etc/fstab.
+    let tmp = format!("{}.wolfstack-tmp.{}", FSTAB, std::process::id());
+    if let Err(e) = std::fs::write(&tmp, &out) {
+        let _ = std::fs::remove_file(&tmp);
+        return fail(format!("the temporary file {} could not be written: {}", tmp, e));
+    }
+    if let Ok(meta) = std::fs::metadata(FSTAB)
+        && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return fail(format!("could not set permissions on {}: {}", tmp, e));
+    }
+    if let Err(e) = std::fs::rename(&tmp, FSTAB) {
+        let _ = std::fs::remove_file(&tmp);
+        return fail(format!("could not replace {}: {}", FSTAB, e));
+    }
+    warn!("storage: added nofail to the fstab line(s) for {:?} (ordered on wolfstack-mounts.target without it; previous file kept at {})", repaired, bak);
+    let _ = Command::new("systemctl").arg("daemon-reload").output();
+    set_fstab_repair_state(FstabRepairState::Repaired(repaired));
+}
+
+#[cfg(test)]
+mod fstab_nofail_tests {
+    use super::fstab_line_needs_nofail;
+
+    #[test]
+    fn a_target_line_without_nofail_is_repaired_in_place() {
+        let (mp, fixed) = fstab_line_needs_nofail(
+            "/mnt/a:/mnt/b /pool fuse.mergerfs defaults,_netdev,x-systemd.requires=wolfstack-mounts.target 0 0",
+        ).unwrap();
+        assert_eq!(mp, "/pool");
+        assert_eq!(fixed, "/mnt/a:/mnt/b /pool fuse.mergerfs nofail,defaults,_netdev,x-systemd.requires=wolfstack-mounts.target 0 0");
+    }
+
+    #[test]
+    fn lines_that_already_have_nofail_or_do_not_reference_the_target_are_left_alone() {
+        assert!(fstab_line_needs_nofail("/mnt/a /pool fuse.mergerfs nofail,x-systemd.requires=wolfstack-mounts.target 0 0").is_none());
+        assert!(fstab_line_needs_nofail("UUID=abc / ext4 errors=remount-ro 0 1").is_none());
+        assert!(fstab_line_needs_nofail("# x-systemd.requires=wolfstack-mounts.target").is_none());
+        assert!(fstab_line_needs_nofail("").is_none());
+    }
+}
 
 const MOUNTS_TARGET_UNIT: &str = "\
 [Unit]
@@ -3122,6 +3286,7 @@ fn ensure_mounts_target_units() {
     if !std::path::Path::new("/run/systemd/system").exists() {
         return;
     }
+    repair_fstab_mounts_target_lines();
     let mut changed = false;
     for (path, body) in [
         (MOUNTS_WAIT_UNIT_PATH, MOUNTS_WAIT_UNIT),

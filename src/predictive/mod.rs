@@ -55,6 +55,9 @@ pub mod container_boot;
 pub mod container_memory;
 pub mod threshold;
 pub mod boot_partition;
+/// Previous-boot emergency-mode detection and fstab lines that can
+/// cause it.
+pub mod boot_health;
 pub mod cert_expiry;
 pub mod backup_freshness;
 pub mod vm_disk;
