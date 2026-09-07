@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.25.1: a container on two Docker networks is reachable on its WolfNet IP again, and a VIP whose nat rules were wiped is rebuilt instead of answering only ping** _(2026-09-07 — [`d6c48112`](https://github.com/intelligentwolf/WolfStack/commit/d6c48112ba236e16f778f8e7bc80bed29e5d8d4a))_
 - **v25.25.0: WolfHA protects Proxmox-managed containers on ZFS with zfs send** _(2026-09-07 — [`ac2923dd`](https://github.com/intelligentwolf/WolfStack/commit/ac2923dde407f3ca11e5beb19ad843bc19415536))_
 - **v25.24.0: warm-standby fixes from a live Proxmox failover, plus secrets export and deploy-stack-to-node** _(2026-09-06 — [`fa2e57d7`](https://github.com/intelligentwolf/WolfStack/commit/fa2e57d7fb804460de5f24478ef7bc594cdf5664))_
 - **v25.23.5: cross-cluster transfer tokens are compared in constant time** _(2026-09-06 — [`4f6e2dd9`](https://github.com/intelligentwolf/WolfStack/commit/4f6e2dd91887c64fc5014ed23030b22202c49d23))_
