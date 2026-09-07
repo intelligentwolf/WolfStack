@@ -10553,7 +10553,9 @@ pveum aclmod / -token 'root@pam!wolfstack' -role WolfStackMonitor</code></pre>
                                 <code>nofail,_netdev,x-systemd.requires=wolfstack-mounts.target</code> to its fstab
                                 options — the target activates once WolfStack has finished attempting all
                                 auto-mounts. <strong>nofail is required</strong>: without it systemd hits an
-                                ordering cycle at boot and drops the mount (or worse) from the boot transaction.
+                                ordering cycle at boot and can drop the host into emergency mode. WolfStack
+                                adds <code>nofail</code> to such a line itself at startup (previous file kept
+                                as <code>/etc/fstab.wolfstack-bak-*</code>) and reports it in the inbox.
                             </small>
                         </div>
                     </div>
