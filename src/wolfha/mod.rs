@@ -26,8 +26,12 @@
 //!   only reused after a reverse sync (failback = promote on the
 //!   original node once it has caught up).
 //!
-//! Phase 1 scope: native LXC on native nodes only (Proxmox-managed
-//! containers have LVM/ZFS-backed rootfs that isn't a stable host dir).
+//! Subjects: native LXC (file drivers), native QEMU VMs (dirty-bitmap
+//! deltas), and — since Colt's warm-standby report of 2026-09-06 —
+//! Proxmox-managed containers whose volumes are ZFS datasets, replicated
+//! with `zfs send` (see `replication::zfs_send`). Proxmox containers on
+//! LVM-thin or directory storage are still out of scope: their rootfs is
+//! neither a stable host directory nor a ZFS dataset.
 
 pub mod replication;
 
@@ -69,6 +73,9 @@ pub enum SubjectKind {
     #[default]
     Container,
     Vm,
+    /// A Proxmox-managed container (keyed by VMID) whose volumes are ZFS
+    /// datasets. Replicated only by `zfs send`; runs through `pct`.
+    PveContainer,
 }
 
 impl SubjectKind {
@@ -76,6 +83,7 @@ impl SubjectKind {
         match self {
             SubjectKind::Container => "container",
             SubjectKind::Vm => "VM",
+            SubjectKind::PveContainer => "Proxmox container",
         }
     }
 }
@@ -83,7 +91,9 @@ impl SubjectKind {
 /// Is the subject running on this node right now?
 pub fn subject_is_running(kind: SubjectKind, name: &str) -> bool {
     match kind {
-        SubjectKind::Container => crate::containers::lxc_is_running(name),
+        // On a Proxmox host `lxc_is_running` asks `pct status`, which is
+        // the right runtime for a Proxmox container.
+        SubjectKind::Container | SubjectKind::PveContainer => crate::containers::lxc_is_running(name),
         SubjectKind::Vm => crate::vms::manager::VmManager::new().check_running(name),
     }
 }
@@ -91,7 +101,8 @@ pub fn subject_is_running(kind: SubjectKind, name: &str) -> bool {
 /// Start the subject. Used by promotion.
 pub fn subject_start(kind: SubjectKind, name: &str) -> Result<(), String> {
     match kind {
-        SubjectKind::Container => crate::containers::lxc_start(name).map(|_| ()),
+        // `lxc_start` runs `pct start` on a Proxmox host.
+        SubjectKind::Container | SubjectKind::PveContainer => crate::containers::lxc_start(name).map(|_| ()),
         SubjectKind::Vm => crate::vms::manager::VmManager::new().start_vm(name),
     }
 }
@@ -103,7 +114,7 @@ pub fn subject_start(kind: SubjectKind, name: &str) -> Result<(), String> {
 /// flush its filesystems hands over a cleaner copy.
 pub fn subject_stop(kind: SubjectKind, name: &str) -> Result<(), String> {
     match kind {
-        SubjectKind::Container => crate::containers::lxc_stop(name).map(|_| ()),
+        SubjectKind::Container | SubjectKind::PveContainer => crate::containers::lxc_stop(name).map(|_| ()),
         SubjectKind::Vm => crate::vms::manager::VmManager::new().stop_vm(name, false),
     }
 }
@@ -229,6 +240,12 @@ pub struct HaEntry {
     /// failover keeps watching the old dead primary forever.
     #[serde(default)]
     pub self_identity: Option<HaPeer>,
+    /// Proxmox container only: the ZFS datasets that make up the subject
+    /// (`<pool>/subvol-<vmid>-disk-<n>`, rootfs first as listed in its
+    /// config). On a standby they are the datasets to mount at promotion
+    /// and destroy on drop; they arrive in HaMeta with every stream.
+    #[serde(default)]
+    pub zfs_datasets: Vec<String>,
 }
 
 /// The HA settings a primary pushes to its replicas with every seed and
@@ -249,6 +266,9 @@ pub struct HaMeta {
     /// `primary` at this on every delta, so ownership changes propagate.
     #[serde(default)]
     pub primary: Option<HaPeer>,
+    /// Proxmox container only — see `HaEntry::zfs_datasets`.
+    #[serde(default)]
+    pub zfs_datasets: Vec<String>,
 }
 
 impl HaMeta {
@@ -261,6 +281,7 @@ impl HaMeta {
             witness: e.witness.clone(),
             failover_after_secs: e.failover_after_secs,
             primary: e.self_identity.clone(),
+            zfs_datasets: e.zfs_datasets.clone(),
         }
     }
 
@@ -274,6 +295,9 @@ impl HaMeta {
         e.auto_failover = self.auto_failover;
         e.witness = self.witness.clone();
         e.failover_after_secs = self.failover_after_secs;
+        if !self.zfs_datasets.is_empty() {
+            e.zfs_datasets = self.zfs_datasets.clone();
+        }
         if e.role == HaRole::Replica
             && let Some(p) = &self.primary
         {
@@ -700,6 +724,7 @@ pub fn install_seed(
         witness: String::new(),
         failover_after_secs: default_failover_after(),
         self_identity: None,
+        zfs_datasets: Vec::new(),
     };
     if let Some(m) = meta {
         m.apply_to(&mut entry);
@@ -770,6 +795,19 @@ pub fn promote_local(container: &str, me: Option<HaPeer>) -> Result<(), String> 
             .map_err(|e| format!("promotion stopped before starting the VM: {}", e))?;
     }
 
+    // A Proxmox container's volumes were received as datasets; Proxmox
+    // expects each mounted at its inherited mountpoint before `pct start`.
+    if kind == SubjectKind::PveContainer {
+        let datasets = HaStore::load().get(container).map(|e| e.zfs_datasets.clone()).unwrap_or_default();
+        if datasets.is_empty() {
+            return Err(format!("no datasets are recorded for Proxmox container {} on this node — it was never seeded here", container));
+        }
+        for ds in &datasets {
+            replication::zfs_send::mount(ds)
+                .map_err(|e| format!("promotion stopped before starting the container: could not mount {}: {}", ds, e))?;
+        }
+    }
+
     subject_start(kind, container)
         .map_err(|e| format!("started promotion but the {} failed to start: {}", kind.label(), e))?;
 
@@ -780,16 +818,20 @@ pub fn promote_local(container: &str, me: Option<HaPeer>) -> Result<(), String> 
     // Container-only: the nudge runs a command INSIDE the guest via
     // lxc-attach, which has no VM equivalent. A VM sends its own traffic
     // as it boots, which teaches the switch the same thing slightly later.
-    if kind != SubjectKind::Container {
+    if kind == SubjectKind::Vm {
         return Ok(());
     }
     let c = container.to_string();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(3));
-        let _ = Command::new("lxc-attach")
-            .args(["-n", &c, "--", "sh", "-c",
-                   "gw=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}'); [ -n \"$gw\" ] && ping -c1 -W2 \"$gw\" >/dev/null 2>&1"])
-            .output();
+        const NUDGE: &str = "gw=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}'); [ -n \"$gw\" ] && ping -c1 -W2 \"$gw\" >/dev/null 2>&1";
+        let _ = if kind == SubjectKind::PveContainer {
+            // pct(1): `pct exec <vmid> [<extra-args>]` — run a command inside
+            // the container.
+            Command::new("pct").args(["exec", &c, "--", "sh", "-c", NUDGE]).output()
+        } else {
+            Command::new("lxc-attach").args(["-n", &c, "--", "sh", "-c", NUDGE]).output()
+        };
     });
     Ok(())
 }
@@ -801,6 +843,13 @@ pub fn demote_local(container: &str, new_primary: HaPeer) -> Result<(), String> 
     if subject_is_running(kind, container) {
         subject_stop(kind, container)
             .map_err(|e| format!("could not stop '{}' for demotion: {}", container, e))?;
+    }
+    // A demoted Proxmox container must not come back at the next boot
+    // of this node — the boot guard decides, exactly as for a native one.
+    if kind == SubjectKind::PveContainer
+        && let Err(e) = pve_set_onboot(container, false)
+    {
+        tracing::warn!("wolfha[{}]: could not clear onboot on demotion: {}", container, e);
     }
     let base = crate::containers::lxc_base_dir(container);
     let container_dir = format!("{}/{}", base, container);
@@ -854,6 +903,7 @@ pub fn demote_local(container: &str, new_primary: HaPeer) -> Result<(), String> 
                 witness: String::new(),
                 failover_after_secs: default_failover_after(),
                 self_identity: None,
+                zfs_datasets: Vec::new(),
             });
         }
     }
@@ -1306,6 +1356,7 @@ pub fn install_vm_seed(
         witness: String::new(),
         failover_after_secs: default_failover_after(),
         self_identity: None,
+        zfs_datasets: Vec::new(),
     };
     if let Some(m) = meta {
         m.apply_to(&mut entry);
@@ -2118,6 +2169,21 @@ pub async fn sync_container_now(container: &str) -> Result<(), String> {
         None
     };
 
+    // A Proxmox container's round is one atomic snapshot of every volume,
+    // shipped to each standby as an incremental from whatever base that
+    // standby holds; pruned once every standby has confirmed it.
+    let pve_round: Option<PveRound> = if kind == SubjectKind::PveContainer {
+        let c = container.to_string();
+        match tokio::task::spawn_blocking(move || pve_take_snapshot(&c)).await {
+            Ok(Ok(r)) => Some(r),
+            Ok(Err(e)) => return Err(format!("could not snapshot the container's volumes: {}", e)),
+            Err(e) => return Err(format!("snapshot task: {}", e)),
+        }
+    } else {
+        None
+    };
+    let mut pve_all_ok = true;
+
     // One full seed image per round at most, shared by every replica that
     // turns out to need one; staged lazily, cleaned up after the loop.
     let mut staged_seed: Option<StagedVmSeed> = None;
@@ -2198,6 +2264,12 @@ pub async fn sync_container_now(container: &str) -> Result<(), String> {
                     }
                 }
             }
+            None if kind == SubjectKind::PveContainer => {
+                let round = pve_round.as_ref().expect("a Proxmox container round was snapshotted above");
+                let st = pve_ship_round(container, peer, &secret, round).await;
+                pve_all_ok &= st.ok;
+                st
+            }
             None => sync_one_replica(container, peer, &secret).await,
         };
         let mut store = HaStore::load();
@@ -2234,6 +2306,10 @@ pub async fn sync_container_now(container: &str) -> Result<(), String> {
             }
             _ => {}
         }
+    }
+    if let Some(round) = pve_round {
+        let c = container.to_string();
+        let _ = tokio::task::spawn_blocking(move || pve_finish_round(&c, &round, pve_all_ok)).await;
     }
     // A seed staged for this round is done with — every replica that
     // needed one has been served (or failed and will retry next round
@@ -2377,6 +2453,549 @@ async fn sync_vm_replica_inner(
         }
     }
     Err(format!("VM delta upload failed: {}", last_err))
+}
+
+// ─── Proxmox containers on ZFS (SubjectKind::PveContainer) ───
+//
+// The subject is a Proxmox CT identified by its VMID; its volumes are ZFS
+// datasets and travel as `zfs send` streams (replication::zfs_send). The
+// standby holds the same datasets under the same names, a config under
+// /etc/pve/lxc/<vmid>.conf with `onboot: 0`, and an HaStore entry.
+// Colt's 2026-09-06 live failover is the shape this follows: WoL-driven
+// incremental sends, operator promotion, reverse sync for failback.
+
+pub fn pve_config_path(vmid: &str) -> String {
+    format!("/etc/pve/lxc/{}.conf", vmid)
+}
+
+/// The live section of the container's config (no snapshot sections).
+pub fn pve_read_config(vmid: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(pve_config_path(vmid))
+        .map_err(|e| format!("Proxmox container {} has no config on this node: {}", vmid, e))?;
+    Ok(replication::zfs_send::live_config_section(&text))
+}
+
+/// Every volume of the container as ZFS datasets, from its config and
+/// this node's storage.cfg.
+pub fn pve_volumes(vmid: &str) -> Result<Vec<replication::zfs_send::PveVolume>, String> {
+    let storage_cfg = std::fs::read_to_string("/etc/pve/storage.cfg")
+        .map_err(|e| format!("read /etc/pve/storage.cfg: {}", e))?;
+    let pools = replication::zfs_send::parse_storage_cfg_zfspools(&storage_cfg);
+    let config = pve_read_config(vmid)?;
+    replication::zfs_send::container_volumes(&config, &pools)
+}
+
+pub fn pve_datasets(vmid: &str) -> Result<Vec<String>, String> {
+    Ok(pve_volumes(vmid)?.into_iter().map(|v| v.dataset).collect())
+}
+
+/// Persist the container's `onboot` flag through Proxmox itself.
+/// Source: pct(1) `pct set <vmid> [OPTIONS]`, `--onboot <boolean>` —
+/// the same key pct.conf(5) documents. Used on the PRIMARY (a live,
+/// registered container); a standby's config is written directly because
+/// there is no registered container to `pct set` until the file exists.
+pub fn pve_set_onboot(vmid: &str, on: bool) -> Result<(), String> {
+    let out = Command::new("pct")
+        .args(["set", vmid, "--onboot", if on { "1" } else { "0" }])
+        .output()
+        .map_err(|e| format!("pct: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// One round's snapshot across every volume, taken atomically.
+#[derive(Debug, Clone)]
+pub struct PveRound {
+    pub datasets: Vec<String>,
+    pub snapshot: String,
+}
+
+/// Blocking. Snapshot every volume of the container at one instant.
+pub fn pve_take_snapshot(vmid: &str) -> Result<PveRound, String> {
+    let datasets = pve_datasets(vmid)?;
+    let snapshot = replication::zfs_send::snapshot_name(vmid, now_unix());
+    replication::zfs_send::snapshot_all(&datasets, &snapshot)
+        .map_err(|e| format!("zfs snapshot of the container's volumes failed: {}", e))?;
+    Ok(PveRound { datasets, snapshot })
+}
+
+/// Blocking. After a round: when every standby confirmed the new
+/// snapshot it is the only base anyone needs, so older ones go. When any
+/// standby failed, everything is kept — its base is among them, and the
+/// next fully successful round prunes.
+pub fn pve_finish_round(vmid: &str, round: &PveRound, all_ok: bool) {
+    if !all_ok {
+        return;
+    }
+    let keep: std::collections::HashSet<String> = std::iter::once(round.snapshot.clone()).collect();
+    for ds in &round.datasets {
+        let Ok(ours) = replication::zfs_send::list_ours(ds, vmid) else { continue };
+        for s in replication::zfs_send::prune_plan(&ours, &keep) {
+            if let Err(e) = replication::zfs_send::destroy_snapshot(ds, &s) {
+                tracing::warn!("wolfha[{}]: could not prune snapshot {}@{}: {}", vmid, ds, s, e);
+            }
+        }
+    }
+}
+
+/// Blocking. Remove every replication snapshot of the container's
+/// volumes — HA disabled, or a failed protect being unwound.
+pub fn pve_destroy_our_snapshots(vmid: &str, datasets: &[String]) {
+    for ds in datasets {
+        let Ok(ours) = replication::zfs_send::list_ours(ds, vmid) else { continue };
+        for s in ours {
+            let _ = replication::zfs_send::destroy_snapshot(ds, &s);
+        }
+    }
+}
+
+/// Ask a standby whether it can hold this container: a Proxmox host with
+/// ZFS and the same parent datasets. Run before anything is sent, so a
+/// protect that cannot work is refused with the reason instead of failing
+/// mid-seed.
+pub async fn pve_probe_replica(
+    vmid: &str,
+    peer: &HaPeer,
+    secret: &str,
+    datasets: &[String],
+) -> Result<(), String> {
+    let client = &*crate::api::API_HTTP_CLIENT;
+    let path = format!(
+        "/api/wolfha/capabilities?container={}&kind=pve_container&datasets={}",
+        vmid,
+        datasets.join(",")
+    );
+    let mut last = String::new();
+    for url in crate::api::build_node_urls(&peer.address, peer.port, &path) {
+        match client.get(&url).peer_auth(secret).timeout(std::time::Duration::from_secs(20)).send().await {
+            Ok(r) if r.status().is_success() => {
+                let caps: replication::ReplicationCapabilities = r.json().await
+                    .map_err(|e| format!("{}: unreadable capabilities reply: {}", peer.node_id, e))?;
+                return match replication::pve_replication_blocked_reason(&caps) {
+                    None => Ok(()),
+                    Some(why) => Err(format!("standby {} cannot receive this container: {}", peer.node_id, why)),
+                };
+            }
+            Ok(r) => last = format!("{}: HTTP {}", url, r.status()),
+            Err(e) => last = format!("{}: {}", url, e),
+        }
+    }
+    Err(format!("standby {} did not answer the capabilities probe ({}) — it may be running a WolfStack build without ZFS replication", peer.node_id, last))
+}
+
+/// Stream `zfs send` of one dataset straight into a peer's
+/// `/api/wolfha/receive-zfs`. Never buffered: the child's stdout IS the
+/// request body. Returns the byte count that went over the wire.
+async fn zfs_stream_to_peer(
+    peer: &HaPeer,
+    secret: &str,
+    fields: &[(&str, String)],
+    dataset: &str,
+    from: Option<&str>,
+    to: &str,
+) -> Result<u64, String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncReadExt;
+    let client = &*crate::api::API_HTTP_CLIENT;
+    let args = replication::zfs_send::send_args(dataset, from, to);
+    let mut last_err = String::new();
+    for url in crate::api::build_node_urls(&peer.address, peer.port, "/api/wolfha/receive-zfs") {
+        let mut child = tokio::process::Command::new("zfs")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("spawn zfs send: {}", e))?;
+        let stdout = child.stdout.take().ok_or("zfs send: no stdout")?;
+        let mut stderr = child.stderr.take().ok_or("zfs send: no stderr")?;
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = counter.clone();
+        let stream = tokio_util::io::ReaderStream::with_capacity(stdout, 1 << 20).inspect(move |chunk| {
+            if let Ok(b) = chunk {
+                seen.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        // Text fields FIRST so the receiver can validate the request and
+        // refuse it before a single byte of the stream is consumed.
+        let mut form = reqwest::multipart::Form::new();
+        for (k, v) in fields {
+            form = form.text((*k).to_string(), v.clone());
+        }
+        form = form.part(
+            "stream",
+            reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream)).file_name("stream.zfs"),
+        );
+        let resp = client.post(&url)
+            .peer_auth(secret)
+            // A first full send of a large container is the slowest thing
+            // this module does; same ceiling as a VM seed.
+            .timeout(std::time::Duration::from_secs(6 * 60 * 60))
+            .multipart(form)
+            .send().await;
+        let mut zfs_err = String::new();
+        let _ = stderr.read_to_string(&mut zfs_err).await;
+        let status = child.wait().await.map_err(|e| format!("zfs send: {}", e))?;
+        let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
+        match resp {
+            Ok(r) if r.status().is_success() && status.success() => return Ok(bytes),
+            Ok(r) => {
+                let code = r.status();
+                let body = r.text().await.unwrap_or_default();
+                let body: String = body.chars().take(400).collect();
+                if body.contains(replication::zfs_send::ZFS_NEEDS_SEED) {
+                    // The standby's answer is final — no other port will
+                    // change it, and the caller re-sends a full stream.
+                    return Err(body);
+                }
+                last_err = format!("{}: HTTP {} {}{}", url, code, body,
+                    if zfs_err.trim().is_empty() { String::new() } else { format!(" (zfs send: {})", zfs_err.trim()) });
+            }
+            Err(e) => last_err = format!("{}: {}{}", url, e,
+                if zfs_err.trim().is_empty() { String::new() } else { format!(" (zfs send: {})", zfs_err.trim()) }),
+        }
+    }
+    Err(format!("ZFS stream of {} failed: {}", dataset, last_err))
+}
+
+/// Ship this round's snapshot of every volume to one standby: an
+/// incremental from the newest snapshot both sides hold, or a full
+/// stream when they share none (first seed, diverged copy, wiped node).
+pub async fn pve_ship_round(vmid: &str, peer: &HaPeer, secret: &str, round: &PveRound) -> HaSyncStatus {
+    let started = now_unix();
+    match pve_ship_round_inner(vmid, peer, secret, round).await {
+        Ok((bytes, message)) => HaSyncStatus {
+            at: started,
+            ok: true,
+            message,
+            files_sent: round.datasets.len() as u64,
+            bytes_sent: bytes,
+        },
+        Err(e) => HaSyncStatus { at: started, ok: false, message: e, files_sent: 0, bytes_sent: 0 },
+    }
+}
+
+async fn pve_ship_round_inner(
+    vmid: &str,
+    peer: &HaPeer,
+    secret: &str,
+    round: &PveRound,
+) -> Result<(u64, String), String> {
+    let client = &*crate::api::API_HTTP_CLIENT;
+    // 1. What the standby already holds, per dataset.
+    let mut remote: Option<std::collections::HashMap<String, Vec<String>>> = None;
+    let mut last = String::new();
+    for url in crate::api::build_node_urls(&peer.address, peer.port,
+        &format!("/api/wolfha/zfs-snapshots?container={}", vmid))
+    {
+        match client.get(&url).peer_auth(secret).timeout(std::time::Duration::from_secs(60)).send().await {
+            Ok(r) if r.status().is_success() => {
+                remote = Some(r.json().await.map_err(|e| format!("bad snapshot inventory from {}: {}", url, e))?);
+                break;
+            }
+            Ok(r) if r.status().as_u16() == 404 => {
+                return Err(format!("standby {} does not support ZFS replication (older WolfStack build) — upgrade it", peer.node_id));
+            }
+            Ok(r) => last = format!("{}: HTTP {}", url, r.status()),
+            Err(e) => last = format!("{}: {}", url, e),
+        }
+    }
+    let remote = remote.ok_or_else(|| format!("standby snapshot inventory unavailable: {}", last))?;
+
+    // 2. What rides along with every dataset.
+    let config = pve_read_config(vmid)?;
+    let (primary_json, ha_meta_json) = {
+        let store = HaStore::load();
+        let e = store.get(vmid).filter(|e| e.role == HaRole::Primary)
+            .ok_or_else(|| format!("'{}' is not a primary on this node", vmid))?;
+        (
+            serde_json::to_string(&e.self_identity).unwrap_or_default(),
+            serde_json::to_string(&HaMeta::from_entry(e)).unwrap_or_default(),
+        )
+    };
+
+    let mut total = 0u64;
+    let (mut incremental, mut full) = (0usize, 0usize);
+    for ds in &round.datasets {
+        let (ds_c, v_c) = (ds.clone(), vmid.to_string());
+        let ours = tokio::task::spawn_blocking(move || replication::zfs_send::list_ours(&ds_c, &v_c))
+            .await.map_err(|e| e.to_string())??;
+        let have = remote.get(ds).cloned().unwrap_or_default();
+        let base = replication::zfs_send::newest_common(&ours, &have).cloned();
+        let fields = |from: &str| -> Vec<(&'static str, String)> {
+            vec![
+                ("container", vmid.to_string()),
+                ("kind", "pve_container".to_string()),
+                ("dataset", ds.clone()),
+                ("snapshot", round.snapshot.clone()),
+                ("from", from.to_string()),
+                ("config", config.clone()),
+                ("primary", primary_json.clone()),
+                ("ha_meta", ha_meta_json.clone()),
+            ]
+        };
+        match base {
+            Some(b) => match zfs_stream_to_peer(peer, secret, &fields(&b), ds, Some(&b), &round.snapshot).await {
+                Ok(n) => { total += n; incremental += 1; }
+                Err(e) if e.contains(replication::zfs_send::ZFS_NEEDS_SEED) => {
+                    // The standby proved it lacks the base after all —
+                    // the repair is a full stream, never a patch.
+                    tracing::info!("wolfha[{}]: standby {} needs a full stream of {} ({})", vmid, peer.node_id, ds, e);
+                    total += zfs_stream_to_peer(peer, secret, &fields(""), ds, None, &round.snapshot).await?;
+                    full += 1;
+                }
+                Err(e) => return Err(e),
+            },
+            None => {
+                total += zfs_stream_to_peer(peer, secret, &fields(""), ds, None, &round.snapshot).await?;
+                full += 1;
+            }
+        }
+    }
+    Ok((
+        total,
+        format!(
+            "{} dataset(s) sent, {} ({} incremental, {} full — ZFS send, crash-consistent)",
+            round.datasets.len(), human_bytes(total), incremental, full
+        ),
+    ))
+}
+
+/// The handoff's final stream: the container is already stopped, so the
+/// snapshot taken here IS its final state. Sent to the node about to
+/// promote first (it must have it), then best-effort to every other
+/// standby so their bases stay current.
+pub async fn pve_final_sync(vmid: &str, new_primary: &HaPeer, secret: &str) -> HaSyncStatus {
+    let c = vmid.to_string();
+    let round = match tokio::task::spawn_blocking(move || pve_take_snapshot(&c)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return HaSyncStatus { at: now_unix(), ok: false, message: format!("final snapshot failed: {}", e), files_sent: 0, bytes_sent: 0 },
+        Err(e) => return HaSyncStatus { at: now_unix(), ok: false, message: format!("final snapshot task: {}", e), files_sent: 0, bytes_sent: 0 },
+    };
+    let st = pve_ship_round(vmid, new_primary, secret, &round).await;
+    let mut all_ok = st.ok;
+    let others: Vec<HaPeer> = HaStore::load().get(vmid).map(|e| e.replicas.clone()).unwrap_or_default();
+    for peer in others {
+        if peer.node_id == new_primary.node_id || peer.address == new_primary.address || peer_is_local(&peer) {
+            continue;
+        }
+        let ost = pve_ship_round(vmid, &peer, secret, &round).await;
+        if !ost.ok {
+            all_ok = false;
+            tracing::warn!("wolfha[{}]: handoff stream did not reach standby {} ({}) — the new primary re-seeds it", vmid, peer.node_id, ost.message);
+        }
+    }
+    let c = vmid.to_string();
+    let _ = tokio::task::spawn_blocking(move || pve_finish_round(&c, &round, all_ok)).await;
+    st
+}
+
+/// Standby side: which of our snapshots each of the container's datasets
+/// holds here — the primary's incremental base inventory.
+pub fn pve_replica_snapshots(vmid: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    let store = HaStore::load();
+    let Some(e) = store.get(vmid).filter(|e| e.kind == SubjectKind::PveContainer) else { return out };
+    for ds in &e.zfs_datasets {
+        out.insert(ds.clone(), replication::zfs_send::list_ours(ds, vmid).unwrap_or_default());
+    }
+    out
+}
+
+/// Everything a standby checked BEFORE consuming a stream.
+pub struct PveReceivePlan {
+    pub vmid: String,
+    pub dataset: String,
+    pub snapshot: String,
+    pub from: Option<String>,
+    pub args: Vec<String>,
+}
+
+/// Standby side, blocking. Validate a receive request and ready the
+/// dataset for it. Every refusal happens here, before the first byte, so
+/// the primary's `zfs send` is cut off by the HTTP error rather than
+/// streaming gigabytes into a request that was doomed.
+pub fn pve_prepare_receive(f: &std::collections::HashMap<String, String>) -> Result<PveReceivePlan, String> {
+    use replication::zfs_send as z;
+    if !crate::containers::is_proxmox() {
+        return Err("this node is not a Proxmox host, so it cannot hold a Proxmox container".into());
+    }
+    if !z::have_zfs() {
+        return Err("ZFS is not installed on this node".into());
+    }
+    let get = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
+    let vmid = get("container");
+    if !z::is_vmid(&vmid) {
+        return Err(format!("invalid container id {:?}", vmid));
+    }
+    let dataset = get("dataset");
+    if !z::is_safe_dataset(&dataset) {
+        return Err(format!("invalid dataset {:?}", dataset));
+    }
+    let snapshot = get("snapshot");
+    if !z::is_ours(&snapshot, &vmid) {
+        return Err(format!("snapshot {:?} is not a WolfHA replication snapshot for {}", snapshot, vmid));
+    }
+    let from = Some(get("from")).filter(|s| !s.is_empty());
+    if let Some(fr) = &from
+        && !z::is_ours(fr, &vmid)
+    {
+        return Err(format!("incremental base {:?} is not a WolfHA replication snapshot for {}", fr, vmid));
+    }
+    let store = HaStore::load();
+    let entry = store.get(&vmid);
+    match entry {
+        Some(e) if e.role == HaRole::Primary && !e.stale => {
+            return Err(format!("'{}' is the ACTIVE primary here — refusing a stream that would overwrite it", vmid));
+        }
+        Some(e) if e.kind != SubjectKind::PveContainer => {
+            return Err(format!("'{}' is WolfHA-managed here as a {}, not a Proxmox container", vmid, e.kind.label()));
+        }
+        _ => {}
+    }
+    if entry.is_none() && f.get("primary").map(|p| p.trim().is_empty()).unwrap_or(true) {
+        return Err("a first stream must carry the primary's peer identity".into());
+    }
+    if subject_is_running(SubjectKind::PveContainer, &vmid) {
+        return Err(format!("container {} is running here — refusing to overwrite a live volume", vmid));
+    }
+    let ours = entry.is_some();
+    if !ours {
+        let taken = z::vmid_config_paths(&vmid);
+        if !taken.is_empty() {
+            return Err(format!(
+                "VMID {} is already in use on this Proxmox node or cluster ({}) and is not a WolfHA copy — refusing to overwrite it",
+                vmid, taken.join(", ")
+            ));
+        }
+        if z::dataset_exists(&dataset) {
+            return Err(format!("dataset {} already exists here and is not a WolfHA copy — refusing to overwrite it", dataset));
+        }
+    }
+    match &from {
+        None => {
+            // Full stream: the dataset must not exist. A copy WolfHA put
+            // here (re-seed of a diverged standby) is replaced.
+            if z::dataset_exists(&dataset) {
+                z::destroy_dataset(&dataset)
+                    .map_err(|e| format!("could not clear the old copy of {} for re-seeding: {}", dataset, e))?;
+            }
+            match z::parent_dataset(&dataset) {
+                Some(p) if z::dataset_exists(p) => {}
+                Some(p) => return Err(format!("this node has no dataset '{}' to receive into — the standby needs the primary's pool layout", p)),
+                None => return Err(format!("'{}' has no parent dataset", dataset)),
+            }
+        }
+        Some(fr) => {
+            if !z::dataset_exists(&dataset) {
+                return Err(format!("{}: no copy of {} on this node — a full stream is needed", z::ZFS_NEEDS_SEED, dataset));
+            }
+            let have = z::list_ours(&dataset, &vmid)?;
+            if !have.contains(fr) {
+                return Err(format!(
+                    "{}: this node's copy of {} does not hold the base snapshot {} — a full stream is needed",
+                    z::ZFS_NEEDS_SEED, dataset, fr
+                ));
+            }
+        }
+    }
+    Ok(PveReceivePlan { args: z::receive_args(&dataset), vmid, dataset, snapshot, from })
+}
+
+/// Standby side, blocking. After `zfs receive` succeeded: store the
+/// primary's config as a standby config, keep only the newest base, and
+/// bring the HA entry up to date (creating it on the first stream).
+pub fn pve_commit_receive(f: &std::collections::HashMap<String, String>, plan: &PveReceivePlan) -> Result<(), String> {
+    use replication::zfs_send as z;
+    let vmid = &plan.vmid;
+    if let Some(cfg) = f.get("config").filter(|c| !c.trim().is_empty()) {
+        std::fs::write(pve_config_path(vmid), z::replica_config(cfg))
+            .map_err(|e| format!("write {}: {}", pve_config_path(vmid), e))?;
+    }
+    // Only the newest snapshot is a base anyone will send from.
+    if let Ok(ours) = z::list_ours(&plan.dataset, vmid) {
+        let keep: std::collections::HashSet<String> = std::iter::once(plan.snapshot.clone()).collect();
+        for s in z::prune_plan(&ours, &keep) {
+            let _ = z::destroy_snapshot(&plan.dataset, &s);
+        }
+    }
+    let primary: Option<HaPeer> = f.get("primary").and_then(|p| serde_json::from_str(p).ok());
+    let meta: Option<HaMeta> = f.get("ha_meta").and_then(|m| serde_json::from_str(m).ok());
+    let mut store = HaStore::load();
+    if store.get(vmid).is_none() {
+        store.entries.push(HaEntry {
+            container: vmid.clone(),
+            kind: SubjectKind::PveContainer,
+            role: HaRole::Replica,
+            interval_minutes: 0,
+            replicas: Vec::new(),
+            primary: primary.clone(),
+            autostart_managed: false,
+            last_sync: HashMap::new(),
+            last_delta_at: 0,
+            stale: false,
+            pending_vm_delta: None,
+            vm_chain: None,
+            auto_failover: false,
+            witness: String::new(),
+            failover_after_secs: default_failover_after(),
+            self_identity: None,
+            zfs_datasets: Vec::new(),
+        });
+    }
+    let e = store.get_mut(vmid).ok_or("HA entry vanished")?;
+    tracing::info!(
+        "wolfha[{}]: {} of {} applied — copy is at {}",
+        vmid,
+        match &plan.from { Some(f) => format!("incremental from {}", f), None => "full stream".to_string() },
+        plan.dataset, plan.snapshot
+    );
+    e.last_delta_at = now_unix();
+    e.stale = false;
+    if let Some(m) = &meta {
+        m.apply_to(e);
+    }
+    if let Some(p) = primary
+        && e.role == HaRole::Replica
+    {
+        e.primary = Some(p);
+    }
+    if !e.zfs_datasets.contains(&plan.dataset) {
+        e.zfs_datasets.push(plan.dataset.clone());
+    }
+    store.save()
+}
+
+/// Standby side, blocking. Delete a dormant copy: the registered
+/// container and its volumes through Proxmox (`pct destroy`), falling
+/// back to destroying the datasets and the config directly when Proxmox
+/// does not know the container (a half-installed copy).
+/// Source: pct(1) `pct destroy <vmid>` — "Destroy the container (also
+/// delete all uses files)".
+pub fn pve_remove_replica(vmid: &str, datasets: &[String]) -> Result<String, String> {
+    if subject_is_running(SubjectKind::PveContainer, vmid) {
+        return Err(format!("container {} is RUNNING here — refusing to delete it", vmid));
+    }
+    let via_pct = std::path::Path::new(&pve_config_path(vmid)).exists()
+        && Command::new("pct").args(["destroy", vmid]).output().map(|o| o.status.success()).unwrap_or(false);
+    let mut left: Vec<String> = Vec::new();
+    for ds in datasets {
+        if replication::zfs_send::dataset_exists(ds)
+            && let Err(e) = replication::zfs_send::destroy_dataset(ds)
+        {
+            left.push(format!("{} ({})", ds, e));
+        }
+    }
+    let _ = std::fs::remove_file(pve_config_path(vmid));
+    if left.is_empty() {
+        Ok(format!("standby copy of container {} removed{}", vmid, if via_pct { " (pct destroy)" } else { "" }))
+    } else {
+        Err(format!("container {} unregistered but these datasets could not be destroyed: {}", vmid, left.join(", ")))
+    }
 }
 
 // ─── Scheduler + boot guard (spawned from main.rs) ───
@@ -2604,6 +3223,9 @@ fn container_static_ip(container: &str) -> Option<String> {
 fn subject_static_ip(kind: SubjectKind, name: &str) -> Option<String> {
     match kind {
         SubjectKind::Container => container_static_ip(name),
+        SubjectKind::PveContainer => std::fs::read_to_string(pve_config_path(name))
+            .ok()
+            .and_then(|c| replication::zfs_send::net0_static_ip(&c)),
         SubjectKind::Vm => crate::vms::manager::VmManager::new()
             .get_vm(name)
             .and_then(|c| c.wolfnet_ip)
@@ -3148,6 +3770,7 @@ mod tests {
     fn subject_kind_wire_names_are_stable() {
         assert_eq!(serde_json::to_string(&super::SubjectKind::Container).unwrap(), "\"container\"");
         assert_eq!(serde_json::to_string(&super::SubjectKind::Vm).unwrap(), "\"vm\"");
+        assert_eq!(serde_json::to_string(&super::SubjectKind::PveContainer).unwrap(), "\"pve_container\"");
     }
 
     /// A pending delta must survive a restart — it is the only copy of
