@@ -58,6 +58,8 @@ pub mod boot_partition;
 /// Previous-boot emergency-mode detection and fstab lines that can
 /// cause it.
 pub mod boot_health;
+/// One WolfNet IP with two live owners (two nodes, or a node and a peer).
+pub mod wolfnet_ip_conflict;
 pub mod cert_expiry;
 pub mod backup_freshness;
 pub mod vm_disk;

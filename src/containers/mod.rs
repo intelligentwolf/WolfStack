@@ -1167,6 +1167,169 @@ pub fn wolfnet_used_ips_cached() -> Vec<String> {
 /// to recreate a VM with the same IP and get rejected).
 pub fn invalidate_wolfnet_ips_cache() {
     *WOLFNET_IPS_CACHE.lock().unwrap() = None;
+    *WOLFNET_ACTIVE_IPS_CACHE.lock().unwrap() = None;
+}
+
+static WOLFNET_ACTIVE_IPS_CACHE: Mutex<Option<(Vec<String>, Instant)>> = Mutex::new(None);
+
+/// Cached `wolfnet_active_ips()` — the RUNNING set. This is what the
+/// status report, the route announce, the route seed and the local half
+/// of the route map advertise. The used set (stopped included) is for
+/// allocation only: a stopped container's IP must stay reserved, but it
+/// must never attract cluster traffic. Before this split every route
+/// source used the used set, so an IP held stopped on one node and
+/// running on another had two owners and flipped between them on every
+/// poll (klas, 2026-09-07).
+pub fn wolfnet_active_ips_cached() -> Vec<String> {
+    let mut cache = WOLFNET_ACTIVE_IPS_CACHE.lock().unwrap();
+    if let Some((ref val, ts)) = *cache
+        && ts.elapsed().as_secs() < WOLFNET_IPS_CACHE_TTL_SECS {
+            return val.clone();
+        }
+    let val = wolfnet_active_ips();
+    *cache = Some((val.clone(), Instant::now()));
+    val
+}
+
+/// What a cluster peer last reported about its WolfNet IPs, kept by the
+/// status poll (`record_remote_wolfnet_ips`). `active` = running
+/// workloads (conflict detection); `reserved` = every workload, stopped
+/// included (allocation). Entries older than REMOTE_WOLFNET_IPS_MAX_AGE
+/// are ignored so a deleted node cannot reserve addresses forever.
+#[derive(Debug, Clone)]
+pub struct RemoteWolfnetIps {
+    pub label: String,
+    pub host_ip: String,
+    pub active: Vec<String>,
+    pub reserved: Vec<String>,
+    pub seen: Instant,
+}
+
+static REMOTE_WOLFNET_IPS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, RemoteWolfnetIps>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+const REMOTE_WOLFNET_IPS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+pub fn record_remote_wolfnet_ips(node_id: &str, label: &str, host_ip: &str, active: &[String], reserved: &[String]) {
+    if let Ok(mut m) = REMOTE_WOLFNET_IPS.lock() {
+        m.insert(node_id.to_string(), RemoteWolfnetIps {
+            label: label.to_string(),
+            host_ip: host_ip.to_string(),
+            active: active.to_vec(),
+            reserved: reserved.to_vec(),
+            seen: Instant::now(),
+        });
+    }
+}
+
+/// Fresh peer reports only.
+pub fn remote_wolfnet_ips() -> Vec<RemoteWolfnetIps> {
+    REMOTE_WOLFNET_IPS
+        .lock()
+        .map(|m| m.values().filter(|r| r.seen.elapsed() < REMOTE_WOLFNET_IPS_MAX_AGE).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// One entry of a wolfnetd status.json `peers` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WolfnetPeer {
+    pub hostname: String,
+    pub address: String,
+    /// wolfnetd's own `connected` — `Peer::is_connected()`, a signed
+    /// packet inside the last 120 s. It decides whether this peer
+    /// actually takes delivery of its address: wolfnet main.rs
+    /// `encrypt_and_send` returns false without an endpoint or when
+    /// `is_connected()` is false, and the packet then falls through to
+    /// the container route map.
+    pub connected: bool,
+}
+
+/// Pure: every peer in a wolfnetd status.json.
+pub fn parse_wolfnet_status_peers(json: &str) -> Vec<WolfnetPeer> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let Some(peers) = v.get("peers").and_then(|p| p.as_array()) else { return Vec::new() };
+    peers
+        .iter()
+        .filter_map(|p| {
+            let address = p.get("address")?.as_str()?.split('/').next()?.trim().to_string();
+            if address.parse::<std::net::Ipv4Addr>().is_err() { return None; }
+            let hostname = p.get("hostname").and_then(|h| h.as_str()).unwrap_or("").to_string();
+            // Absent only if the status file is not a wolfnetd one —
+            // every released PeerStatus carries it. Absent reads as
+            // "not delivering", which reserves the address without
+            // raising a shadowing finding for it.
+            let connected = p.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
+            Some(WolfnetPeer { hostname, address, connected })
+        })
+        .collect()
+}
+
+/// Every peer wolfnetd currently knows — config-listed, PEX-learned or
+/// roaming (VPN clients included) — from the status file it rewrites
+/// every 5 s. The config-file peer list misses everything learned at
+/// runtime, which is exactly the set that collides with allocation.
+pub fn wolfnet_live_peers() -> Vec<WolfnetPeer> {
+    std::fs::read_to_string("/var/run/wolfnet/status.json")
+        .map(|s| parse_wolfnet_status_peers(&s))
+        .unwrap_or_default()
+}
+
+/// Addresses legitimately present on EVERY node's active set — WolfRun
+/// service VIPs (a local route on lo on each node) and Kubernetes route
+/// IPs from the cluster-synced config. Conflict detection must skip them.
+pub fn wolfnet_anycast_ips() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(data) = std::fs::read_to_string(&crate::paths::get().wolfrun_services)
+        && let Ok(services) = serde_json::from_str::<Vec<serde_json::Value>>(&data) {
+            for svc in &services {
+                if let Some(vip) = svc.get("service_ip").and_then(|v| v.as_str())
+                    && !vip.is_empty() {
+                        out.push(vip.to_string());
+                    }
+            }
+        }
+    if let Ok(data) = std::fs::read_to_string(&crate::paths::get().kubernetes_config)
+        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&data)
+            && let Some(clusters) = config.get("clusters").and_then(|c| c.as_array()) {
+                for cluster in clusters {
+                    if let Some(routes) = cluster.get("wolfnet_routes").and_then(|r| r.as_array()) {
+                        for route in routes {
+                            if let Some(ip) = route.get("wolfnet_ip").and_then(|v| v.as_str())
+                                && !ip.is_empty() {
+                                    out.push(ip.to_string());
+                                }
+                        }
+                    }
+                }
+            }
+    out
+}
+
+#[cfg(test)]
+mod wolfnet_status_peers_tests {
+    use super::{parse_wolfnet_status_peers, WolfnetPeer};
+
+    #[test]
+    fn peers_come_back_with_a_bare_address_and_their_tunnel_state() {
+        let json = r#"{"hostname":"hemulen","address":"10.10.10.2","peers":[
+            {"hostname":"ninni","address":"10.10.10.3","connected":true},
+            {"hostname":"","address":"10.10.10.160/32","connected":false},
+            {"hostname":"nostate","address":"10.10.10.161"},
+            {"hostname":"bad","address":"not-an-ip"}
+        ]}"#;
+        let peers = parse_wolfnet_status_peers(json);
+        assert_eq!(peers, vec![
+            WolfnetPeer { hostname: "ninni".into(), address: "10.10.10.3".into(), connected: true },
+            WolfnetPeer { hostname: "".into(), address: "10.10.10.160".into(), connected: false },
+            WolfnetPeer { hostname: "nostate".into(), address: "10.10.10.161".into(), connected: false },
+        ]);
+    }
+
+    #[test]
+    fn garbage_or_missing_peers_yield_nothing() {
+        assert!(parse_wolfnet_status_peers("").is_empty());
+        assert!(parse_wolfnet_status_peers(r#"{"hostname":"x"}"#).is_empty());
+    }
 }
 
 // ─── LXC Storage Paths Registry ───
@@ -1243,6 +1406,13 @@ const WOLFNET_CT_COMMENT: &str = "wolfstack-wolfnet-container";
 /// Returns the bare `-d` IP without the `/32`. Pure — unit-tested — so the
 /// accumulation/orphan matching can't regress.
 fn container_dnat_dst_ip(line: &str, wolfnet_prefix: &str) -> Option<String> {
+    container_dnat_rule_parts(line, wolfnet_prefix).map(|(dip, _)| dip)
+}
+
+/// Both halves of a container→WolfNet DNAT rule: `(wolfnet_ip, bridge_ip)`.
+/// Same shape test as `container_dnat_dst_ip` — which is now a thin wrapper,
+/// so the "which rules are ours" rule lives in exactly one place.
+fn container_dnat_rule_parts(line: &str, wolfnet_prefix: &str) -> Option<(String, String)> {
     if !line.contains("DNAT")
         || line.contains("wolfstack-vip-map")
         || line.contains("wolfstack-ip-map")
@@ -1260,7 +1430,201 @@ fn container_dnat_dst_ip(line: &str, wolfnet_prefix: &str) -> Option<String> {
     let tdest = line[tpos + 17..].split_whitespace().next()?;
     let tip = tdest.split(':').next()?; // strip :port if present
     if tip.starts_with(wolfnet_prefix) { return None; }
-    Some(dip.to_string())
+    Some((dip.to_string(), tip.to_string()))
+}
+
+/// Pure: `container name → its bridge addresses` from one
+/// `docker inspect --format '{{.Name}}|{{range …}}{{.IPAddress}} {{end}}'`
+/// over every RUNNING container. Docker prints the name with a leading
+/// slash; addresses are space-separated and may be empty.
+fn parse_running_container_addrs(text: &str) -> Vec<(String, Vec<String>)> {
+    text.lines()
+        .filter_map(|l| {
+            let (name, addrs) = l.split_once('|')?;
+            let name = name.trim().trim_start_matches('/').to_string();
+            if name.is_empty() { return None; }
+            Some((
+                name,
+                addrs.split_whitespace().filter(|a| !a.is_empty()).map(|a| a.to_string()).collect(),
+            ))
+        })
+        .collect()
+}
+
+/// `bridge address → the RUNNING container that holds it now`. One
+/// `docker ps -q` plus one batched inspect; empty when either fails,
+/// which makes every caller fall back to "nobody else owns it" — the
+/// conservative answer (leave the rule alone).
+fn running_container_addr_owners() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let ids = match Command::new("timeout").args(["10", "docker", "ps", "-q"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>(),
+        _ => return out,
+    };
+    if ids.is_empty() { return out; }
+    let mut args: Vec<String> = vec![
+        "10".into(), "docker".into(), "inspect".into(), "--format".into(),
+        "{{.Name}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}".into(),
+    ];
+    args.extend(ids);
+    let text = match Command::new("timeout").args(&args).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return out,
+    };
+    for (name, addrs) in parse_running_container_addrs(&text) {
+        for a in addrs {
+            out.insert(a, name.clone());
+        }
+    }
+    out
+}
+
+/// Pure: may a stopped-but-labelled container keep its DNAT rules?
+///
+/// A stopped container's rule is HARMLESS while nothing else holds the
+/// bridge address it points at — and it must be kept, because Docker
+/// restarts (restart policies, health-check bounces, `docker compose up`)
+/// read as stopped for a moment and an eagerly deleted rule would leave
+/// the container answering ping but not TCP until the next reconcile:
+/// exactly the fault this whole area exists to remove.
+///
+/// It becomes DANGEROUS the moment Docker hands that address to a
+/// different running container, because the rule then delivers this
+/// WolfNet IP's traffic to a stranger. That, and only that, is a purge.
+fn stopped_dnat_is_misdirected(
+    container: &str,
+    targets: &[String],
+    addr_owner: &std::collections::HashMap<String, String>,
+) -> bool {
+    targets.iter().any(|t| addr_owner.get(t).is_some_and(|owner| owner != container))
+}
+
+/// Every `(wolfnet_ip, bridge_ip)` pair our container DNAT rules carry,
+/// from one listing per chain.
+fn container_dnat_pairs(wolfnet_prefix: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for chain in ["PREROUTING", "OUTPUT"] {
+        if let Ok(o) = Command::new("iptables").args(["-t", "nat", "-S", chain]).output()
+            && o.status.success()
+        {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Some(p) = container_dnat_rule_parts(line, wolfnet_prefix) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Delete any container DNAT that points at `addr` but belongs to a
+/// different WolfNet IP than `keep_ip`. Called when a container starts
+/// and takes a bridge address: that is the exact moment a stopped
+/// container's leftover rule stops being harmless.
+fn purge_foreign_dnat_pointing_at(addr: &str, keep_ip: &str, wolfnet_prefix: &str) {
+    if addr.is_empty() || wolfnet_prefix.is_empty() { return; }
+    let stale: std::collections::BTreeSet<String> = container_dnat_pairs(wolfnet_prefix)
+        .into_iter()
+        .filter(|(wn, target)| target == addr && wn != keep_ip)
+        .map(|(wn, _)| wn)
+        .collect();
+    for wn in stale {
+        warn!("WolfNet: {} now holds bridge address {}; dropping the stale DNAT that still sent {} there", keep_ip, addr, wn);
+        for chain in ["PREROUTING", "OUTPUT"] {
+            purge_container_dnat_for_ip(chain, &wn, wolfnet_prefix);
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_dnat_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn rule_parts_returns_both_halves_and_ignores_foreign_rules() {
+        let p = "10.10.10.";
+        assert_eq!(
+            container_dnat_rule_parts(
+                "-A PREROUTING -d 10.10.10.150/32 -j DNAT --to-destination 172.18.0.5 -m comment --comment wolfstack-wolfnet-container", p),
+            Some(("10.10.10.150".into(), "172.18.0.5".into()))
+        );
+        // WolfRun VIP and IP-mapping rules are never ours to touch.
+        assert_eq!(container_dnat_rule_parts(
+            "-A PREROUTING -d 10.10.10.50/32 -j DNAT --to-destination 10.10.10.101:80 -m comment --comment wolfrun-lb-10.10.10.50", p), None);
+        assert_eq!(container_dnat_rule_parts(
+            "-A PREROUTING -d 10.10.10.60/32 -j DNAT --to-destination 172.18.0.9 -m comment --comment wolfstack-ip-map", p), None);
+        // A target inside WolfNet is not a container bridge rule.
+        assert_eq!(container_dnat_rule_parts(
+            "-A PREROUTING -d 10.10.10.61/32 -j DNAT --to-destination 10.10.10.9", p), None);
+    }
+
+    #[test]
+    fn running_container_addresses_parse_with_the_leading_slash_stripped() {
+        let text = "/app_web|172.18.0.5 172.19.0.3 \n/db|172.18.0.6 \n|172.18.0.7 \n";
+        assert_eq!(
+            parse_running_container_addrs(text),
+            vec![
+                ("app_web".to_string(), vec!["172.18.0.5".to_string(), "172.19.0.3".to_string()]),
+                ("db".to_string(), vec!["172.18.0.6".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stopped_containers_rule_is_kept_unless_someone_else_took_the_address() {
+        let mut owners = std::collections::HashMap::new();
+        // Nobody holds it — a restart bounce must not lose its DNAT.
+        assert!(!stopped_dnat_is_misdirected("app_web", &["172.18.0.5".into()], &owners));
+        // The container itself is back up (raced the check) — still fine.
+        owners.insert("172.18.0.5".to_string(), "app_web".to_string());
+        assert!(!stopped_dnat_is_misdirected("app_web", &["172.18.0.5".into()], &owners));
+        // Docker recycled the address to a stranger — now it misdirects.
+        owners.insert("172.18.0.5".to_string(), "someone_else".to_string());
+        assert!(stopped_dnat_is_misdirected("app_web", &["172.18.0.5".into()], &owners));
+    }
+}
+
+/// DNAT WolfNet IP → the container's CURRENT Docker IP, on both PREROUTING
+/// (host-forwarded) and OUTPUT (host-local). Idempotent via -C: steady
+/// state makes NO change, so there is no reachability gap on the
+/// reconcile tick. Only when the correct tagged rule is absent (fresh, or
+/// the container was redeployed onto a new Docker IP) do we first purge
+/// EVERY DNAT for this WolfNet IP — clearing stale rules that point at a
+/// previous Docker IP (the accumulation Gary hit: 10.10.10.3 → .2/.3/.4)
+/// plus any legacy comment-less rule — then add the fresh, tagged one.
+/// Called from the 60 s reconcile and, so a started container does not
+/// wait a tick for it, from docker_connect_wolfnet.
+fn ensure_container_dnat(label: &str, docker_ip: &str, prefix: &str) {
+    for chain in ["PREROUTING", "OUTPUT"] {
+        let correct = Command::new("iptables").args([
+            "-t", "nat", "-C", chain, "-d", label,
+            "-j", "DNAT", "--to-destination", docker_ip,
+            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
+        ]).output().map(|o| o.status.success()).unwrap_or(false);
+        if correct { continue; }
+        purge_container_dnat_for_ip(chain, label, prefix);
+        let _ = Command::new("iptables").args([
+            "-t", "nat", "-A", chain, "-d", label,
+            "-j", "DNAT", "--to-destination", docker_ip,
+            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
+        ]).output();
+    }
+}
+
+/// The `10.10.10.` style prefix of a WolfNet IP, for the DNAT matchers.
+fn wolfnet_prefix_of(ip: &str) -> String {
+    ip.rsplit_once('.').map(|(p, _)| format!("{}.", p)).unwrap_or_default()
+}
+
+/// Remove this WolfNet IP's container DNAT from both chains (container
+/// stopped or its IP changed).
+pub fn purge_container_dnat_for_wolfnet_ip(ip: &str) {
+    let prefix = wolfnet_prefix_of(ip);
+    if prefix.is_empty() { return; }
+    for chain in ["PREROUTING", "OUTPUT"] {
+        purge_container_dnat_for_ip(chain, ip, &prefix);
+    }
 }
 
 /// Delete EVERY container→WolfNet DNAT rule in `chain` whose destination is
@@ -1465,6 +1829,14 @@ pub fn cleanup_stale_wolfnet_routes() {
     // treating that as "no containers" would make the sweep delete EVERY
     // container DNAT rule on the host. On failure we skip the whole block and
     // retry next tick — leftover rules are harmless, a wrongful mass-delete is not.
+    // One listing per chain for the whole pass: the stopped-container
+    // check below is then a lookup rather than two iptables invocations
+    // per stopped container per tick.
+    let dnat_pairs = container_dnat_pairs(&prefix);
+    // Built at most once per tick, and only if a stopped labelled
+    // container actually has rules to judge.
+    let mut addr_owners: Option<std::collections::HashMap<String, String>> = None;
+
     let ps = Command::new("docker")
         .args(["ps", "-a", "--format", "{{.Names}}"])
         .output();
@@ -1485,7 +1857,30 @@ pub fn cleanup_stale_wolfnet_routes() {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            if pid_out.is_empty() || pid_out == "0" { continue; }
+            if pid_out.is_empty() || pid_out == "0" {
+                // Stopped but still labelled. Its IP stays reserved
+                // (claimed_ips above) and its DNAT STAYS unless the bridge
+                // address that rule points at now belongs to a different
+                // running container — see stopped_dnat_is_misdirected. A
+                // Docker-driven restart reads as stopped for a moment, and
+                // deleting the rule there would leave the container
+                // answering ping but not TCP until the next tick.
+                let targets: Vec<String> = dnat_pairs.iter()
+                    .filter(|(wn, _)| *wn == label)
+                    .map(|(_, target)| target.clone())
+                    .collect();
+                if !targets.is_empty() {
+                    let owners = addr_owners
+                        .get_or_insert_with(running_container_addr_owners);
+                    if stopped_dnat_is_misdirected(name, &targets, owners) {
+                        warn!("WolfNet: {} is stopped and its DNAT for {} now points at an address another container holds; removing it", name, label);
+                        for chain in ["PREROUTING", "OUTPUT"] {
+                            purge_container_dnat_for_ip(chain, &label, &prefix);
+                        }
+                    }
+                }
+                continue;
+            }
 
             // Detect this container's actual bridge device and gateway
             let net = docker_bridge_info(name);
@@ -1534,30 +1929,7 @@ pub fn cleanup_stale_wolfnet_routes() {
                 // was rejected, so the container had NO DNAT at all.
                 let docker_ip = net.ip.clone();
                 if !docker_ip.is_empty() && docker_ip != label {
-                    // DNAT WolfNet IP → the container's CURRENT Docker IP, on
-                    // both PREROUTING (host-forwarded) and OUTPUT (host-local).
-                    // Idempotent via -C: steady state makes NO change, so there
-                    // is no reachability gap on the reconcile tick. Only when the
-                    // correct tagged rule is absent (fresh, or the container was
-                    // redeployed onto a new Docker IP) do we first purge EVERY
-                    // DNAT for this WolfNet IP — clearing stale rules that point
-                    // at a previous Docker IP (the accumulation Gary hit:
-                    // 10.10.10.3 → .2/.3/.4) plus any legacy comment-less rule —
-                    // then add the fresh, tagged one.
-                    for chain in ["PREROUTING", "OUTPUT"] {
-                        let correct = Command::new("iptables").args([
-                            "-t", "nat", "-C", chain, "-d", &label,
-                            "-j", "DNAT", "--to-destination", &docker_ip,
-                            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
-                        ]).output().map(|o| o.status.success()).unwrap_or(false);
-                        if correct { continue; }
-                        purge_container_dnat_for_ip(chain, &label, &prefix);
-                        let _ = Command::new("iptables").args([
-                            "-t", "nat", "-A", chain, "-d", &label,
-                            "-j", "DNAT", "--to-destination", &docker_ip,
-                            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
-                        ]).output();
-                    }
+                    ensure_container_dnat(&label, &docker_ip, &prefix);
                 }
             }
         }
@@ -1850,6 +2222,21 @@ pub fn wolfnet_allocate_ip(host_ip: &str, extra_used: &[u8]) -> String {
         used_ips.insert(ip);
     }
 
+    // Live WolfNet peers and stopped workloads on other nodes — see
+    // wolfnet_used_ip_set for why both must be excluded.
+    for peer in wolfnet_live_peers() {
+        if let Some(last) = peer.address.rsplit('.').next().and_then(|s| s.parse::<u8>().ok()) {
+            used_ips.insert(last);
+        }
+    }
+    for r in remote_wolfnet_ips() {
+        for ip in r.reserved {
+            if let Some(last) = ip.rsplit('.').next().and_then(|s| s.parse::<u8>().ok()) {
+                used_ips.insert(last);
+            }
+        }
+    }
+
     // Check cluster-wide route cache (populated by poll_remote_nodes)
     // This catches container IPs from ALL nodes in the cluster
     {
@@ -2057,15 +2444,26 @@ fn wolfnet_ips_internal(running_only: bool) -> Vec<String> {
     // Docker containers on a "wolfnet" Docker network (if it exists).
     // 10s cap — this runs in the WolfNet push/seed paths and a wedged
     // dockerd hung the task forever (masterpier's athena, 2026-07-03).
+    // `docker network inspect` lists attached containers whatever their
+    // run state, so in active-only mode each address is kept only when a
+    // RUNNING container holds it — otherwise a stopped container here
+    // would re-enter the routing set and re-create the double-claim this
+    // split exists to end.
     if let Ok(output) = Command::new("timeout")
         .args(["10", "docker", "network", "inspect", "wolfnet", "--format",
                "{{range .Containers}}{{.IPv4Address}} {{end}}"])
         .output()
     {
+        let running_addrs: Option<std::collections::HashMap<String, String>> =
+            if running_only { Some(running_container_addr_owners()) } else { None };
         let text = String::from_utf8_lossy(&output.stdout);
         for addr in text.split_whitespace() {
             if let Some(ip) = addr.split('/').next()
                 && !ip.is_empty() && !ips.contains(&ip.to_string()) {
+                    if let Some(ref owners) = running_addrs
+                        && !owners.contains_key(ip) {
+                            continue;
+                        }
                     ips.push(ip.to_string());
                 }
         }
@@ -2627,6 +3025,12 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
 
             } 
         }
+    }
+
+    // 6b. Custom bridge: the DNAT the reconcile would otherwise add up to
+    //     60 s from now — a freshly started container is reachable at once.
+    if bridge_dev != "docker0" && container_bridge_ip != ip {
+        ensure_container_dnat(ip, &container_bridge_ip, &wolfnet_prefix_of(ip));
     }
 
     // 7. Route traffic for this WolfNet IP to the container's bridge
@@ -6934,6 +7338,16 @@ pub fn docker_start(container: &str) -> Result<String, String> {
 
     docker_reapply_wolfnet(container);
 
+    // This container has just taken a bridge address. If a stopped
+    // container's DNAT still sends its own WolfNet IP there, that rule
+    // now misdirects — drop it here rather than up to 60 s later.
+    let net = docker_bridge_info(container);
+    if !net.ip.is_empty() {
+        let own = docker_effective_wolfnet_ip(container).unwrap_or_default();
+        let prefix = wolfnet_subnet_prefix().map(|p| format!("{}.", p)).unwrap_or_default();
+        purge_foreign_dnat_pointing_at(&net.ip, &own, &prefix);
+    }
+
     // WolfUSB: re-attach any USB devices assigned to this container
     let self_id = crate::agent::self_node_id();
     crate::wolfusb::on_container_started(container, "docker", &self_id);
@@ -6945,6 +7359,13 @@ pub fn docker_start(container: &str) -> Result<String, String> {
 /// Stop a Docker container
 pub fn docker_stop(container: &str) -> Result<String, String> {
     let result = run_docker_cmd(&["stop", container])?;
+    // The DNAT deliberately STAYS: it is harmless until something else
+    // takes this container's bridge address, and whatever does take it
+    // clears the rule on its own start (purge_foreign_dnat_pointing_at),
+    // as does the reconcile. Deleting it here would break the stop/start
+    // half of a restart just as surely as doing it in the reconcile.
+    // The IP inventory does change — this container stops being active.
+    invalidate_wolfnet_ips_cache();
     invalidate_docker_list_cache();
     Ok(result)
 }
@@ -7593,6 +8014,7 @@ pub fn docker_set_wolfnet_ip(container: &str, ip: Option<&str>) -> Result<String
             if let Some(ref old) = old_ip
                 && old != new_ip {
                     let _ = Command::new("ip").args(["route", "del", &format!("{}/32", old)]).output();
+                    purge_container_dnat_for_wolfnet_ip(old);
                 }
             // Connect to WolfNet (idempotent)
             let _ = docker_connect_wolfnet(container, new_ip);
@@ -8534,7 +8956,7 @@ pub fn seed_local_routes_if_empty() -> usize {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(wolfnet_used_ips_cached());
+        let _ = tx.send(wolfnet_active_ips_cached());
     });
     let local_ips = match rx.recv_timeout(std::time::Duration::from_secs(15)) {
         Ok(ips) => ips,
@@ -10894,6 +11316,20 @@ fn wolfnet_used_ip_set() -> Option<(String, std::collections::HashSet<String>)> 
     }
 
     // Also reserve .1 (usually gateway), .254 (VM TAP gateway), and .255 (broadcast)
+    // Peers wolfnetd knows at runtime (VPN clients, PEX-learned nodes)
+    // are not in config.toml, and a workload handed one of their
+    // addresses is unreachable from everywhere: the daemon delivers to
+    // the peer before it consults the container route map.
+    for peer in wolfnet_live_peers() {
+        used.insert(peer.address);
+    }
+    // Stopped workloads on other nodes: reserved there, so reserved here.
+    for r in remote_wolfnet_ips() {
+        for ip in r.reserved {
+            used.insert(ip);
+        }
+    }
+
     used.insert(format!("{}.1", prefix));
     used.insert(format!("{}.254", prefix));
     used.insert(format!("{}.255", prefix));

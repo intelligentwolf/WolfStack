@@ -32,7 +32,7 @@ use crate::predictive::{
     vulnerability, osv, port_conflict, wolfnet_dhcp, wolfnet_reachability,
     docker_wolfnet_collision, missing_subnet_route, compromise_indicators,
     tamper_detection, threat_intel,
-    unused_packages, notify, container_boot, boot_partition, boot_health,
+    unused_packages, notify, container_boot, boot_partition, boot_health, wolfnet_ip_conflict,
 };
 
 /// Cadence between ticks once the loop is running.
@@ -132,7 +132,7 @@ pub async fn tick(
     // 1. Sample data sources concurrently with hard timeouts. Each
     //    sampler kills its child process on timeout — stuck NFS or
     //    a wedged docker daemon can no longer hang the orchestrator.
-    let (host_facts, container_facts, restart_facts, failed_units, cert_facts, mem_facts, backup_facts, vm_facts, sshd_cfg, vuln_facts, osv_facts, port_facts, wolfnet_dhcp_facts, wolfnet_reach_facts, docker_wn_collision_facts, missing_route_facts, compromise_facts, tamper_facts, threat_intel_facts, unused_pkg_facts, container_boot_facts, boot_facts, boot_health_facts) = tokio::join!(
+    let (host_facts, container_facts, restart_facts, failed_units, cert_facts, mem_facts, backup_facts, vm_facts, sshd_cfg, vuln_facts, osv_facts, port_facts, wolfnet_dhcp_facts, wolfnet_reach_facts, docker_wn_collision_facts, missing_route_facts, compromise_facts, tamper_facts, threat_intel_facts, unused_pkg_facts, container_boot_facts, boot_facts, boot_health_facts, wn_conflict_facts) = tokio::join!(
         disk_fill::sample_disks_now_async(DF_TIMEOUT),
         container_disk::sample_containers_now_async(CONTAINER_SAMPLE_TIMEOUT),
         container_restart::sample_docker_restarts_now_async(CONTAINER_SAMPLE_TIMEOUT),
@@ -163,6 +163,8 @@ pub async fn tick(
         // Previous-boot journal + /etc/fstab: two journalctl calls and
         // one file read.
         boot_health::sample_now_async(SYSTEMD_TIMEOUT),
+        // In-memory peer reports + one small status file.
+        wolfnet_ip_conflict::sample_now_async(SYSTEMD_TIMEOUT),
     );
     // Sample current SystemMetrics off the shared monitor — same
     // sysinfo source as the live UI, so threshold findings line up
@@ -370,6 +372,9 @@ pub async fn tick(
     new_proposals.extend(boot_health::analyze(
         &ctx, &boot_health_facts, &acks_snap, &proposals_snap,
     ));
+    new_proposals.extend(wolfnet_ip_conflict::analyze(
+        &ctx, &wn_conflict_facts, &acks_snap, &proposals_snap,
+    ));
 
     // 5b. Build the "covered" set — every (finding_type, scope) the
     //     analyzers had data for this tick. Auto-resolve uses this
@@ -400,6 +405,7 @@ pub async fn tick(
     covered.extend(container_boot::covered_scopes(&ctx, &container_boot_facts));
     covered.extend(boot_partition::covered_scopes(&ctx, &boot_facts));
     covered.extend(boot_health::covered_scopes(&ctx, &boot_health_facts, &proposals_snap));
+    covered.extend(wolfnet_ip_conflict::covered_scopes(&ctx, &wn_conflict_facts, &proposals_snap));
     // Mark every PRIOR pending OSV proposal whose target was scanned
     // this tick as covered, even if its CVE didn't re-emit. That's
     // what closes the loop when a package gets upgraded — the CVE

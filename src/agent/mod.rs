@@ -1723,9 +1723,15 @@ pub enum AgentMessage {
         known_nodes: Vec<Node>,
         #[serde(default)]
         deleted_ids: Vec<String>,
-        /// WolfNet IPs in use on this node (host IP first, then container/VM IPs)
+        /// WolfNet IPs in use on this node (host IP first, then the IPs of
+        /// RUNNING containers/VMs). Receivers build the route map from this.
         #[serde(default)]
         wolfnet_ips: Vec<String>,
+        /// Every WolfNet IP this node holds, stopped workloads included —
+        /// for allocation on peers only, never for routing. Empty from a
+        /// node older than v25.25.3 (its `wolfnet_ips` is then the used set).
+        #[serde(default)]
+        wolfnet_reserved_ips: Vec<String>,
         #[serde(default)]
         has_docker: bool,
         #[serde(default)]
@@ -2317,7 +2323,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         continue;
                     }
                     if let Ok(msg) = resp.json::<AgentMessage>().await
-                        && let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, license_key, pubkey: peer_pubkey } = msg {
+                        && let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, wolfnet_reserved_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, license_key, pubkey: peer_pubkey } = msg {
                             let now = now_unix();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -2726,6 +2732,23 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                     );
                                 }
                             }
+                            // Remember what this peer holds: its running set
+                            // for conflict detection, its full set so a stopped
+                            // container there keeps its IP reserved here.
+                            if peer_cluster == self_cluster {
+                                let label = if node.hostname.is_empty() { node.address.clone() } else { node.hostname.clone() };
+                                let host = wolfnet_ips.first().cloned().unwrap_or_default();
+                                // A peer older than v25.25.3 sends no reserved
+                                // list and its `wolfnet_ips` IS the used set
+                                // (stopped included) — usable as reservations,
+                                // not as a running set for conflict detection.
+                                let (active, reserved): (&[String], &[String]) = if wolfnet_reserved_ips.is_empty() {
+                                    (&[], &wolfnet_ips)
+                                } else {
+                                    (&wolfnet_ips, &wolfnet_reserved_ips)
+                                };
+                                crate::containers::record_remote_wolfnet_ips(&node.id, &label, &host, active, reserved);
+                            }
                             // Cache the peer's host WolfNet IP so future
                             // build_node_urls calls can insert a
                             // HTTP-over-WolfNet attempt before falling
@@ -2802,8 +2825,12 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
     //   push-delivered route with stale data. This heals on the next
     //   poll cycle (10s) when the StatusReport cache refreshes.
 
-    // 1. Add LOCAL container/VM/VIP IPs → this node's wolfnet IP
-    let local_ips = crate::containers::wolfnet_used_ips_cached();
+    // 1. Add LOCAL container/VM/VIP IPs → this node's wolfnet IP.
+    //    RUNNING workloads only: a stopped container's IP claimed here
+    //    (and pushed by the announce) fought the node actually running
+    //    it, and the winner changed on every poll. Allocation still sees
+    //    stopped IPs through wolfnet_used_ips / wolfnet_reserved_ips.
+    let local_ips = crate::containers::wolfnet_active_ips_cached();
     let local_wn_ip = local_ips.first().cloned().unwrap_or_default();
     if local_ips.len() > 1 {
         let host_wn_ip = &local_ips[0];

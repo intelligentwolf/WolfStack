@@ -5067,7 +5067,17 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
                         // conflict check below dormant (AstroMando #3,
                         // 2026-06-27).
                         let sr = data.get("StatusReport").unwrap_or(&data);
-                        if let Some(ips) = sr.get("wolfnet_ips").and_then(|v| v.as_array()) {
+                        // Reservations, not routes: a container that is
+                        // stopped on the joining node still owns its IP, and
+                        // letting it join against an address another member
+                        // routes is the double-claim we refuse. Nodes older
+                        // than v25.25.3 send no reserved list and their
+                        // `wolfnet_ips` IS the full set.
+                        if let Some(ips) = sr.get("wolfnet_reserved_ips")
+                            .and_then(|v| v.as_array())
+                            .filter(|a| !a.is_empty())
+                            .or_else(|| sr.get("wolfnet_ips").and_then(|v| v.as_array()))
+                        {
                             remote_wolfnet_ips = ips.iter()
                                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                                 .collect();
@@ -12011,7 +12021,7 @@ pub async fn announce_wolfnet_routes_to_peers(
     let _ = tokio::task::spawn_blocking(containers::seed_local_routes_if_empty).await;
 
     // Build the announce payload first — shared by both discovery paths.
-    let local_ips = containers::wolfnet_used_ips_cached();
+    let local_ips = containers::wolfnet_active_ips_cached();
     let host_ip = match local_ips.first() {
         Some(ip) if !ip.is_empty() => ip.clone(),
         _ => {
