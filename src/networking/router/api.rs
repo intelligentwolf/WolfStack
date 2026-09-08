@@ -5871,7 +5871,7 @@ pub async fn wolfnet_routes_resync(req: HttpRequest, state: S) -> HttpResponse {
     let mut routes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     // Local container / VM / VIP IPs → this node's wolfnet IP.
-    let local_ips = crate::containers::wolfnet_used_ips();
+    let local_ips = crate::containers::wolfnet_active_ips(); // running only
     let local_host_wn_ip = local_ips.first().cloned().unwrap_or_default();
     if local_ips.len() > 1
         && local_host_wn_ip.parse::<std::net::Ipv4Addr>().is_ok()

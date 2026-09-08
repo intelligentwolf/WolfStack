@@ -2656,7 +2656,7 @@ async fn main() -> std::io::Result<()> {
                 // even if the window is somehow hit.
                 // Run all blocking sysinfo/subprocess work off the async runtime.
                 let sc = state_clone.clone();
-                let (metrics, components, docker_count, lxc_count, vm_count, compose_count, has_docker, has_lxc, has_kvm) =
+                let (metrics, components, docker_count, lxc_count, vm_count, compose_count, has_docker, has_lxc, has_kvm, wn_active, wn_reserved) =
                     tokio::task::spawn_blocking(move || {
                         let mut monitor = sc.monitor.lock().unwrap();
                         let m = monitor.collect();
@@ -2672,7 +2672,11 @@ async fn main() -> std::io::Result<()> {
                         let hd = containers::has_docker_cached();
                         let hl = containers::has_lxc_cached();
                         let hk = containers::has_kvm_cached();
-                        (m, c, dc, lc, vc, cmc, hd, hl, hk)
+                        // Both WolfNet scans shell out (ip, docker, lxc-info,
+                        // VM json) — they belong here, not on the executor.
+                        let wa = containers::wolfnet_active_ips_cached();
+                        let wr = containers::wolfnet_used_ips_cached();
+                        (m, c, dc, lc, vc, cmc, hd, hl, hk, wa, wr)
                     }).await.unwrap();
                 // Record historical snapshot
                 {
@@ -2697,7 +2701,8 @@ async fn main() -> std::io::Result<()> {
                     public_ip: public_ip.read().await.clone(),
                     known_nodes,
                     deleted_ids,
-                    wolfnet_ips: containers::wolfnet_used_ips_cached(),
+                    wolfnet_ips: wn_active,
+                    wolfnet_reserved_ips: wn_reserved,
                     has_docker,
                     has_lxc,
                     has_kvm,

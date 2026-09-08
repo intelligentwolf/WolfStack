@@ -76559,6 +76559,10 @@ function predictiveRuntimeBadge(p) {
     const rid = (p.scope && p.scope.resource_id) || '';
     if (ft.startsWith('docker_'))         return { label: 'DOCKER',   icon: '', color: '#06b6d4' };
     if (ft.startsWith('lxc_'))            return { label: 'LXC',      icon: '', color: '#06b6d4' };
+    // After the runtime prefixes on purpose: a Docker-subnet collision is
+    // a Docker problem that happens to mention WolfNet, and reads better
+    // as DOCKER. Everything else naming WolfNet is an overlay problem.
+    if (ft.includes('wolfnet'))           return { label: 'WOLFNET',  icon: '', color: '#3b82f6' };
     if (ft === 'vm_disk_fill')            return { label: 'VM',       icon: '', color: '#f59e0b' };
     if (ft === 'cert_expiry_window')      return { label: 'CERT',     icon: '', color: '#10b981' };
     if (ft === 'backup_stale')            return { label: 'BACKUP',   icon: '', color: '#8b5cf6' };
