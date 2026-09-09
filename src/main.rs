@@ -1770,15 +1770,13 @@ async fn main() -> std::io::Result<()> {
                             }
                             while log.len() > 200 { log.remove(0); }
                         }
-                        // 2. Fan out to the operator's configured
-                        //    channels: Discord/Slack/Telegram via the
-                        //    alerting module, email via the AI module
-                        //    (uses the same SMTP creds the daily
-                        //    report uses). Both are best-effort — a
-                        //    failed dispatch logs a warning but never
-                        //    blocks the watcher.
+                        // 2. Fan out to the operator's selected delivery
+                        //    paths: Discord/Slack/Telegram/ntfy via the
+                        //    alerting module, email via the AI module's SMTP
+                        //    creds (the same ones the daily report uses).
+                        //    Both are best-effort — a failed dispatch logs a
+                        //    warning but never blocks the watcher.
                         let alert_cfg = crate::alerting::AlertConfig::load();
-                        let ai_cfg = crate::ai::AiConfig::load();
                         // Storage / SMART failures — Lifecycle category. The
                         // event itself is rare (state-change-gated, not per-tick)
                         // but operators told us Simple mode should stay minimal:
@@ -1798,18 +1796,13 @@ async fn main() -> std::io::Result<()> {
                             // category_allowed guard for the email path
                             // doesn't need to be repeated here.
                             crate::alerting::send_alert(&alert_cfg, cat, &title, &body).await;
-                            if category_allowed && ai_cfg.email_enabled && !ai_cfg.email_to.is_empty() {
-                                let cfg = ai_cfg.clone();
-                                let subj = title.clone();
-                                let b = body.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Err(e) = crate::ai::send_alert_email(&cfg, &subj, &b) {
-                                        tracing::warn!(
-                                            target: "wolfstack::array",
-                                            "email dispatch failed: {}", e
-                                        );
-                                    }
-                                });
+                            // Email, if the operator kept it among their
+                            // delivery paths (and SMTP is set up — the helper
+                            // owns both checks).
+                            if category_allowed {
+                                crate::alerting::send_alert_email_if_selected(
+                                    &alert_cfg, &title, &body,
+                                ).await;
                             }
                         }
                     }
@@ -3649,10 +3642,11 @@ async fn main() -> std::io::Result<()> {
                             // the webhook recipients see the same originator
                             // metadata.
                             let (subject, body) = crate::alerting::decorate_local(&subject, &body);
-                            if posture_allowed
-                                && let Err(e) = ai::send_alert_email(&config, &subject, &body) {
-                                    tracing::warn!("Failed to send critical issues email: {}", e);
-                                }
+                            if posture_allowed {
+                                crate::alerting::send_alert_email_if_selected(
+                                    &alert_config, &subject, &body,
+                                ).await;
+                            }
 
                             // Also send to webhook channels
                             if alert_config.enabled && alert_config.has_channels() {
@@ -4145,7 +4139,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                 let config = alerting::AlertConfig::load();
 
 
-                if config.enabled && config.has_channels() {
+                // `has_delivery`: this loop's dispatch (send_local_alert) also
+                // mails the operator, so an email-only setup must not be gated out.
+                if config.enabled && config.has_delivery() {
                     let all_nodes = alert_cluster.get_all_nodes();
 
                     for node in &all_nodes {
@@ -4582,7 +4578,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     restart_failed = false;
                                     // Send recovery alert if we previously reported failure
                                     let config = alerting::AlertConfig::load();
-                                    if config.enabled && config.has_channels() {
+                                    if config.enabled && config.has_delivery() {
                                         let title = "[WolfStack OK] WolfNet auto-recovered".to_string();
                                         let body = format!(
                                             "✅ WolfNet Auto-Recovery\n\n\
@@ -4608,7 +4604,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                              What should the admin check and how can they fix this?"
                                         ).await.unwrap_or_default();
                                         let config = alerting::AlertConfig::load();
-                                        if config.enabled && config.has_channels() {
+                                        if config.enabled && config.has_delivery() {
                                             let title = "[WolfStack ALERT] WolfNet down — auto-restart failed".to_string();
                                             let mut body = format!(
                                                 "⚠️ WolfNet Down\n\n\
@@ -4646,7 +4642,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                         )
                                     ).await.unwrap_or_default();
                                     let config = alerting::AlertConfig::load();
-                                    if config.enabled && config.has_channels() {
+                                    if config.enabled && config.has_delivery() {
                                         let title = "[WolfStack ALERT] WolfNet down — auto-restart failed".to_string();
                                         let mut body = format!(
                                             "⚠️ WolfNet Down\n\n\

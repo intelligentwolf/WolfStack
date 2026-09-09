@@ -5392,6 +5392,11 @@ pub async fn remove_node(req: HttpRequest, state: web::Data<AppState>, path: web
     // eventually catch it, but a delete should clean up immediately.
     let removed_node = state.cluster.get_node(&id);
     if state.cluster.remove_server(&id) {
+        // The Inbox aggregation caches its peer fan-out for 30 s and keys the
+        // per-node status list off cluster membership. Without this, a node
+        // the operator just deleted keeps appearing in the Inbox (and in its
+        // "may be incomplete" warning) until the cache expires.
+        invalidate_cluster_cache(&state);
         // Evict from THIS node's WolfNet config right away (synchronous).
         // Best-effort: "not found" is fine, and a WolfNet-less node has nothing
         // to evict.
@@ -34908,7 +34913,20 @@ fn run_repair(kind: &str, target: &str) -> Result<serde_json::Value, String> {
 pub async fn alerts_config_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::alerting::AlertConfig::load();
-    HttpResponse::Ok().json(config.to_masked_json())
+    let mut json = config.to_masked_json();
+    // Email is a delivery path like the others, but its transport lives on
+    // AiConfig — so the Alerts page had no way to show that alerts were also
+    // being mailed, which is how an operator ends up paged twice with nothing
+    // on screen explaining the second copy. Report whether it's set up (and
+    // where to configure it), never the address itself.
+    let email_cfg = crate::ai::AiConfig::load();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "has_email".to_string(),
+            serde_json::Value::Bool(email_cfg.email_enabled && !email_cfg.email_to.is_empty()),
+        );
+    }
+    HttpResponse::Ok().json(json)
 }
 
 pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -35050,6 +35068,16 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
         config.ntfy_topic = String::new();
         config.ntfy_token = String::new();
     }
+    // Delivery-path selection: an array of channel names ("ntfy", "email", …).
+    // An empty array means "every configured channel" — the pre-selection
+    // behaviour — so the UI can offer "all of them" without a magic value.
+    // Unknown names are dropped rather than defaulted: quietly adding a path
+    // the operator didn't ask for is the exact complaint this setting fixes.
+    if let Some(arr) = v.get("channels").and_then(|v| v.as_array()) {
+        config.channels = crate::alerting::Channel::parse_list(
+            arr.iter().filter_map(|c| c.as_str()),
+        );
+    }
 
     match config.save() {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),
@@ -35062,11 +35090,22 @@ pub async fn alerts_test(req: HttpRequest, state: web::Data<AppState>) -> HttpRe
     let mut config = crate::alerting::AlertConfig::load();
     config.enabled = true; // Force enable for test
     let results = crate::alerting::send_test(&config).await;
-    let ok_count = results.iter().filter(|(_, r)| r.is_ok()).count();
-    let details: Vec<serde_json::Value> = results.iter().map(|(ch, r)| {
-        serde_json::json!({ "channel": ch, "success": r.is_ok(), "error": r.as_ref().err().map(|e| e.to_string()) })
+    let ok_count = results.iter().filter(|r| r.succeeded()).count();
+    let details: Vec<serde_json::Value> = results.iter().map(|r| {
+        serde_json::json!({
+            "channel": r.channel.as_str(),
+            "success": r.succeeded(),
+            // Configured but not a selected delivery path: nothing was sent,
+            // and a real alert wouldn't go there either. The UI says so
+            // rather than showing it as a failure.
+            "skipped": r.skipped,
+            "error": r.error(),
+        })
     }).collect();
-    HttpResponse::Ok().json(serde_json::json!({ "sent": ok_count, "results": details }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "sent": ok_count,
+        "results": details,
+    }))
 }
 
 // ─── System package install ───

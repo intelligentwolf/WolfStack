@@ -295,6 +295,17 @@ fn build_proposal(p: &PeerProbe, local_has_public_ip: bool, scope: &ProposalScop
         "sudo wolfnetctl peers".to_string(),
         format!("ip -4 route get {}", p.ip),
         "sudo journalctl -u wolfstack --since '15 minutes ago' | grep -i wolfnet".to_string(),
+        // For a peer that is gone for good, deliberately last and clearly
+        // labelled: `wolfnetctl purge` reloads the config and drops any peer
+        // no longer in it (see the wolfnet CLI's Purge subcommand), so the
+        // edit has to come first. The WolfNet page's remove button does both
+        // steps plus the subnet-route teardown, which is why the instructions
+        // point there first.
+        format!(
+            "# only if {} is decommissioned for good: delete its [[peers]] block first\n\
+             sudoedit /etc/wolfnet/config.toml && sudo wolfnetctl purge",
+            p.name,
+        ),
     ];
     if private_endpoint_mismatch {
         commands.insert(0, format!(
@@ -322,7 +333,15 @@ fn build_proposal(p: &PeerProbe, local_has_public_ip: bool, scope: &ProposalScop
          firewall change, verify the peer's public endpoint hasn't changed (CGNAT \
          renumber, dynamic IP), or confirm the kernel route for the WolfNet subnet \
          still points at wolfnet0. If the peer host is itself down, the finding \
-         will auto-resolve when it returns."
+         will auto-resolve when it returns.\
+         \n\nIf the host is gone for GOOD — decommissioned, rebuilt, moved out of \
+         the cluster — it is still a configured peer here, which is why this keeps \
+         being reported. Remove it — WolfNet page → Peers → the trash button on \
+         that row, which also tears down the subnet routes pointing at it — and \
+         the finding retires on the next analyzer pass. Deleting the node from the \
+         cluster evicts its peer entry automatically on every node that was \
+         online at the time; a node that was offline then keeps it until you \
+         remove it there."
             .to_string()
     };
 
@@ -519,5 +538,40 @@ mod tests {
         // to hand.
         let ep_evidence = out[0].evidence.iter().find(|e| e.label == "Endpoint").unwrap();
         assert_eq!(ep_evidence.value, "185.57.4.152:9605");
+    }
+    /// The decommissioned-peer path must be spelled out: this is the case
+    /// where the host never comes back, so "it'll auto-resolve when it
+    /// returns" is not an answer (klas 2026-09-09).
+    #[test]
+    fn a_permanently_gone_peer_is_told_how_to_retire_the_finding() {
+        let facts = WolfnetReachabilityFacts {
+            probes: vec![PeerProbe {
+                name: "old-node".into(),
+                ip: "10.100.10.30".into(),
+                reachable: false,
+                endpoint: "203.0.113.7:9630".into(),
+                endpoint_kind: EndpointKind::Public,
+            }],
+            scanned: true,
+            local_has_public_ip: true,
+        };
+        let out = analyze(
+            &Context::for_node("node-a"), &facts,
+            &AckStore::default(), &crate::predictive::proposal::ProposalStore::default(),
+        );
+        assert_eq!(out.len(), 1);
+        let RemediationPlan::Manual { instructions, commands } = &out[0].remediation else {
+            panic!("expected a manual remediation plan");
+        };
+        assert!(
+            instructions.contains("decommissioned"),
+            "instructions must cover the host that never returns: {}", instructions,
+        );
+        // The purge command only makes sense after the config edit, and must
+        // never read as a routine diagnostic step.
+        let purge = commands.iter().find(|c| c.contains("wolfnetctl purge"))
+            .expect("the removal path needs a command");
+        assert!(purge.contains("/etc/wolfnet/config.toml"), "purge alone drops nothing: {}", purge);
+        assert!(purge.starts_with("# only if"), "must be labelled conditional: {}", purge);
     }
 }

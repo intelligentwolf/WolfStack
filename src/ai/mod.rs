@@ -1665,8 +1665,12 @@ impl AiAgent {
                         crate::alerting::AlertCategory::Posture,
                     );
 
-                    // Send email if configured — include proposed actions
-                    if posture_allowed && config.email_enabled && !config.email_to.is_empty() {
+                    // Send email if configured AND the operator kept email among
+                    // their delivery paths — include proposed actions.
+                    if posture_allowed
+                        && alert_config.delivers_on(crate::alerting::Channel::Email)
+                        && config.email_enabled && !config.email_to.is_empty()
+                    {
                         let raw_subject = format!("[WolfStack {}] {} Alert on {}", severity.to_uppercase(), severity.to_uppercase(), hostname);
                         let mut email_body = clean_response.clone();
                         if !actions.is_empty() {
@@ -1691,9 +1695,9 @@ impl AiAgent {
                         // operators see which node fired this AI health alert.
                         let (subject, decorated_body) =
                             crate::alerting::decorate_local(&raw_subject, &email_body);
-                        if let Err(e) = send_alert_email(&config, &subject, &decorated_body) {
-                            warn!("Failed to send alert email: {}", e);
-                        }
+                        crate::alerting::send_alert_email_if_selected(
+                            &alert_config, &subject, &decorated_body,
+                        ).await;
                     }
 
                     // Also send to Discord/Telegram/Slack via the alerting system
@@ -1760,10 +1764,9 @@ impl AiAgent {
         // delivered the resolved notification.
         let (subject, body) = crate::alerting::decorate_local(&raw_subject, &raw_body);
 
-        if posture_allowed && config.email_enabled && !config.email_to.is_empty()
-            && let Err(e) = send_alert_email(&config, &subject, &body) {
-                warn!("Failed to send resolved email: {}", e);
-            }
+        if posture_allowed {
+            crate::alerting::send_alert_email_if_selected(&alert_config, &subject, &body).await;
+        }
 
         if alert_config.enabled && alert_config.has_channels() {
             // Webhook reuses the same decorated subject/body — single

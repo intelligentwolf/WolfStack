@@ -249,13 +249,30 @@ pub async fn tick(
     {
         let mut p = lock_write(proposals, "proposals");
         let pruned = p.prune_resolved_older_than(RESOLVED_RETENTION_DAYS);
+        // Orphan sweep: findings nothing evaluates any more (a WolfNet peer
+        // deleted from the config, a destroyed container, a node taken out of
+        // the cluster, this node rebuilt under a new node_id). `auto_resolve_
+        // cleared` can only clear what an analyzer COVERED this tick, so
+        // without this an orphan sat Pending for ever — klas, 2026-09-09:
+        // "Predictive inbox keeps raising issues with a node that is long gone
+        // from the cluster". Runs before the analyzers so anything that turns
+        // out to be real is re-emitted in this same tick.
+        let orphaned = p.resolve_orphaned(node_id, crate::predictive::proposal::ORPHAN_FUSE_DAYS);
+        if orphaned > 0 {
+            tracing::info!(
+                "predictive tick: resolved {} finding(s) whose resource is gone \
+                 (nothing has evaluated them in {}d)",
+                orphaned, crate::predictive::proposal::ORPHAN_FUSE_DAYS,
+            );
+        }
         if pruned > 0 {
             tracing::info!("predictive tick: pruned {} resolved proposal(s) older than {}d",
                 pruned, RESOLVED_RETENTION_DAYS);
-            if let Err(e) = p.save() {
-                tracing::warn!("predictive: failed to save proposals after prune: {}", e);
-            }
         }
+        if (pruned > 0 || orphaned > 0)
+            && let Err(e) = p.save() {
+                tracing::warn!("predictive: failed to save proposals after sweep: {}", e);
+            }
     }
 
     // 3. Snapshot the read-side stores under their own short locks.
@@ -416,6 +433,36 @@ pub async fn tick(
         .map(|p| (p.finding_type.clone(), p.scope.clone()))
         .collect();
 
+    // 5c. Findings whose RESOURCE is gone, for the analyzers that can say so
+    //     honestly: each enumerates its resource set and reports whether the
+    //     enumeration succeeded, so a previously-flagged resource missing from
+    //     a successful enumeration has been removed — not merely unobservable.
+    //     These are resolved as `ResourceGone` this tick rather than waiting
+    //     out the ORPHAN_FUSE_DAYS sweep. Analyzers whose samplers can't tell
+    //     "nothing there" from "couldn't look" are deliberately absent: for
+    //     them the fuse is the honest answer.
+    //
+    //     Belt and braces on `emitted`: a scope the analyzers emitted this
+    //     tick is live by definition and must never be retired, even though
+    //     `vanished_scopes` already excludes everything they covered.
+    let vanished: Vec<(String, crate::predictive::ProposalScope)> = {
+        use crate::predictive::proposal::vanished_scopes;
+        let mut v = vanished_scopes(
+            &[wolfnet_reachability::FINDING_TYPE],
+            wolfnet_reach_facts.scanned, &covered, &proposals_snap, &ctx.node_id,
+        );
+        v.extend(vanished_scopes(
+            &[missing_subnet_route::FINDING_TYPE],
+            missing_route_facts.scanned, &covered, &proposals_snap, &ctx.node_id,
+        ));
+        v.extend(vanished_scopes(
+            &[threshold::FINDING_SYSTEMD_FAILED],
+            failed_units.scanned, &covered, &proposals_snap, &ctx.node_id,
+        ));
+        v.retain(|key| !emitted.contains(key));
+        v
+    };
+
     // 6. Single write-lock window: upsert new proposals + auto-
     //    resolve cleared ones. Both must happen atomically because
     //    auto_resolve_cleared inspects status, and a fresh upsert
@@ -444,7 +491,9 @@ pub async fn tick(
     // flag from `touch_checked` into the save gate or these stamps won't survive
     // a restart.
     s.touch_checked(&covered);
-    let resolved = s.auto_resolve_cleared(&covered, &emitted);
+    let cleared = s.auto_resolve_cleared(&covered, &emitted);
+    let retired = s.resolve_vanished(&vanished);
+    let resolved = cleared + retired;
     // A standing condition re-emits the same proposals every tick — that's
     // a refresh, not news, and logging it 12x/hour is journal spam. INFO
     // only when something actually appeared or cleared; the steady-state
@@ -452,8 +501,9 @@ pub async fn tick(
     // so refreshed timestamps/evidence keep being saved.)
     if fresh > 0 || resolved > 0 {
         tracing::info!(
-            "predictive tick: {} new proposal(s), {} refreshed, auto-resolved {} cleared",
-            fresh, upserted - fresh, resolved,
+            "predictive tick: {} new proposal(s), {} refreshed, auto-resolved {} cleared, \
+             retired {} whose resource is gone",
+            fresh, upserted - fresh, cleared, retired,
         );
     } else if upserted > 0 {
         tracing::debug!(

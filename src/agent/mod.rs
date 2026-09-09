@@ -2934,10 +2934,13 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         // line — between the two, recipients have both
                         // observer and subject context.
                         let (subject, body) = crate::alerting::decorate_local(&raw_subject, &raw_body);
-                        if lifecycle_allowed
-                            && let Err(e) = crate::ai::send_alert_email(&config, &subject, &body) {
-                                warn!("Failed to send node-offline email for {}: {}", display_name, e);
-                            }
+                        if lifecycle_allowed {
+                            // Honours the operator's delivery-path selection, and
+                            // runs SMTP off the async worker (it used to block one).
+                            crate::alerting::send_alert_email_if_selected(
+                                &alert_config, &subject, &body,
+                            ).await;
+                        }
                         // Send to webhook channels
                         if alert_config.enabled && alert_config.alert_node_offline {
                             let ac = alert_config.clone();
@@ -2967,10 +2970,11 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         // Decorate with observer cluster + host — same shape as
                         // every other WolfStack alert.
                         let (subject, body) = crate::alerting::decorate_local(&raw_subject, &raw_body);
-                        if lifecycle_allowed
-                            && let Err(e) = crate::ai::send_alert_email(&config, &subject, &body) {
-                                warn!("Failed to send node-restored email for {}: {}", display_name, e);
-                            }
+                        if lifecycle_allowed {
+                            crate::alerting::send_alert_email_if_selected(
+                                &alert_config, &subject, &body,
+                            ).await;
+                        }
                         // Send to webhook channels
                         if alert_config.enabled && alert_config.alert_node_restored {
                             let ac = alert_config.clone();
