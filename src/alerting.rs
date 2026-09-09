@@ -272,6 +272,24 @@ pub struct AlertConfig {
     #[serde(default)]
     pub ntfy_token: String,
 
+    /// Which delivery paths alerts actually go out on.
+    ///
+    /// Configuring a channel used to BE the selection: every alert went to
+    /// every channel that had credentials, and email went out on top of that
+    /// from a setting on a different page entirely — so an operator with ntfy
+    /// and SMTP both set up got paged twice for one event with no way to
+    /// choose (klas, 2026-09-09: "please allow me to select notification
+    /// paths. Right now I get notifications from both ntfy and e-mail").
+    ///
+    /// Empty means "every configured channel", which is exactly the old
+    /// behaviour — so an existing config (where this field is absent) keeps
+    /// delivering as it did until the operator picks. This is a master
+    /// switch: a WolfNotify rule can name a subset of these
+    /// (`notify::NotifyRule::channels`) but can't widen past what's selected
+    /// here. See [`AlertConfig::narrow`].
+    #[serde(default)]
+    pub channels: Vec<Channel>,
+
     // ── Threshold rules ──
     #[serde(default = "default_cpu_threshold")]
     pub cpu_threshold: f32,     // percentage (0-100)
@@ -537,6 +555,7 @@ impl Default for AlertConfig {
             ntfy_server: default_ntfy_server(),
             ntfy_topic: String::new(),
             ntfy_token: String::new(),
+            channels: Vec::new(),
         }
     }
 }
@@ -611,12 +630,73 @@ impl AlertConfig {
             .unwrap_or(true)             // timezone parse fail → fail-open
     }
 
-    /// Check if any notification channel is configured
+    /// Is this push channel wired up — credentials present, whatever the
+    /// operator's selection says? [`Channel::Email`] is deliberately not
+    /// answerable here: its transport lives on `AiConfig`, and reading that
+    /// file on a per-alert hot path to answer a question only the email
+    /// branch asks would be wasted I/O. `send_alert_email_if_selected` owns
+    /// that check.
+    pub fn channel_configured(&self, ch: Channel) -> bool {
+        match ch {
+            Channel::Discord => !self.discord_webhook.is_empty(),
+            Channel::Slack => !self.slack_webhook.is_empty(),
+            Channel::Telegram =>
+                !self.telegram_bot_token.is_empty() && !self.telegram_chat_id.is_empty(),
+            Channel::Ntfy => !self.ntfy_topic.is_empty(),
+            Channel::Email => false,
+        }
+    }
+
+    /// Has the operator selected this delivery path? An empty selection means
+    /// "all of them" — see [`AlertConfig::channels`].
+    pub fn delivers_on(&self, ch: Channel) -> bool {
+        self.channels.is_empty() || self.channels.contains(&ch)
+    }
+
+    /// The operator's selection, with "empty means all" resolved.
+    pub fn resolved_channels(&self) -> Vec<Channel> {
+        if self.channels.is_empty() {
+            Channel::ALL.to_vec()
+        } else {
+            self.channels.clone()
+        }
+    }
+
+    /// Intersect a caller's requested channel list with the operator's
+    /// selection. The selection is a master switch, so a WolfNotify rule that
+    /// names Email while Email is switched off here delivers nowhere rather
+    /// than overriding the operator — narrowing is allowed, widening is not.
+    pub fn narrow(&self, requested: &[Channel]) -> Vec<Channel> {
+        requested.iter().copied().filter(|c| self.delivers_on(*c)).collect()
+    }
+
+    /// Is there anywhere at all for an alert to go — any selected push
+    /// channel with credentials, or email if that path is selected and SMTP is
+    /// set up?
+    ///
+    /// Use this (not `has_channels`) to gate a dispatch that fans out to BOTH
+    /// push and email, e.g. anything going through `send_local_alert`. Gating
+    /// those on `has_channels` alone meant an operator whose only delivery
+    /// path is email got no predictive, lifecycle or WolfNet-recovery alerts
+    /// at all — the email branch downstream was never reached.
+    ///
+    /// Reads `AiConfig` only when no push channel answers, so the common case
+    /// costs nothing.
+    pub fn has_delivery(&self) -> bool {
+        if self.has_channels() { return true; }
+        if !self.delivers_on(Channel::Email) { return false; }
+        let email_cfg = crate::ai::AiConfig::load();
+        email_cfg.email_enabled && !email_cfg.email_to.is_empty()
+    }
+
+    /// Check if any push notification channel is configured AND selected.
+    /// Email is not counted (see [`AlertConfig::channel_configured`]), so a
+    /// setup delivering by email alone answers false here — the email branch
+    /// in `send_node_alert` is gated separately and still fires.
     pub fn has_channels(&self) -> bool {
-        !self.discord_webhook.is_empty()
-            || !self.slack_webhook.is_empty()
-            || (!self.telegram_bot_token.is_empty() && !self.telegram_chat_id.is_empty())
-            || !self.ntfy_topic.is_empty()
+        [Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy]
+            .iter()
+            .any(|c| self.channel_configured(*c) && self.delivers_on(*c))
     }
 
     /// Return a JSON representation with secrets masked
@@ -634,6 +714,13 @@ impl AlertConfig {
             "ntfy_topic": mask_secret(&self.ntfy_topic),
             "has_ntfy": !self.ntfy_topic.is_empty(),
             "has_ntfy_token": !self.ntfy_token.is_empty(),
+            // Delivery-path selection. Sent as stored (empty = every
+            // configured channel) so the UI can tell "operator picked
+            // everything" from "operator hasn't picked", plus the resolved
+            // list so it doesn't have to re-implement that rule.
+            "channels": self.channels.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            "channels_effective": self.resolved_channels().iter()
+                .map(|c| c.as_str()).collect::<Vec<_>>(),
             "cpu_threshold": self.cpu_threshold,
             "memory_threshold": self.memory_threshold,
             "disk_threshold": self.disk_threshold,
@@ -792,18 +879,40 @@ pub async fn send_node_alert(
         send_alert(&alert_cfg, category, &full_title, &full_body).await;
     }
 
-    // Email — sync function, run on the blocking pool so we don't
-    // stall the async runtime over SMTP handshakes.
-    let email_cfg = crate::ai::AiConfig::load();
-    if email_cfg.email_enabled && !email_cfg.email_to.is_empty() {
-        let t = full_title.clone();
-        let b = full_body.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::ai::send_alert_email(&email_cfg, &t, &b) {
-                warn!("alert email failed: {}", e);
-            }
-        }).await.ok();
+    // Email — a separate transport (SMTP settings live on AiConfig), and only
+    // when the operator kept Email among their delivery paths.
+    send_alert_email_if_selected(&alert_cfg, &full_title, &full_body).await;
+}
+
+/// Deliver an alert by email, if — and only if — email is one of the
+/// operator's selected delivery paths AND SMTP is configured.
+///
+/// Every alert path that mails the operator goes through here. Before this
+/// existed, five separate call sites each re-implemented
+/// `if email_enabled && !email_to.is_empty() { send_alert_email(...) }`, which
+/// is why switching a path off had to be done in five places (and wasn't
+/// possible at all). Two of those sites also ran the blocking SMTP
+/// conversation directly on an async worker; this always uses the blocking
+/// pool.
+///
+/// Not for operator-initiated or transactional mail — abuse reports, password
+/// resets, the "send test email" button. Those are not alerts and are not
+/// gated by an alert-delivery preference.
+pub async fn send_alert_email_if_selected(config: &AlertConfig, title: &str, body: &str) {
+    if !config.delivers_on(Channel::Email) {
+        return;
     }
+    let email_cfg = crate::ai::AiConfig::load();
+    if !email_cfg.email_enabled || email_cfg.email_to.is_empty() {
+        return;
+    }
+    let t = title.to_string();
+    let b = body.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::ai::send_alert_email(&email_cfg, &t, &b) {
+            warn!("alert email failed: {}", e);
+        }
+    }).await.ok();
 }
 
 /// True if an alert of the given category should fire given the loaded
@@ -931,10 +1040,52 @@ pub enum Channel {
 impl Channel {
     pub const ALL: [Channel; 5] =
         [Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy, Channel::Email];
+
+    /// Wire name — matches the serde representation, so the frontend and the
+    /// config file speak the same strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Discord => "discord",
+            Channel::Slack => "slack",
+            Channel::Telegram => "telegram",
+            Channel::Ntfy => "ntfy",
+            Channel::Email => "email",
+        }
+    }
+
+    /// Parse a wire name. Unknown strings are ignored by the caller rather
+    /// than defaulted to a channel — silently adding a delivery path the
+    /// operator didn't pick is the failure mode this whole setting exists to
+    /// remove.
+    pub fn from_str_opt(s: &str) -> Option<Channel> {
+        Channel::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+
+    /// Parse an operator-supplied selection: trims each name, drops anything
+    /// unrecognised, and de-duplicates while preserving the order given.
+    /// Lives here rather than inline in the API handler so the rules are
+    /// testable without an HTTP request.
+    pub fn parse_list<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Channel> {
+        let mut picked: Vec<Channel> = Vec::new();
+        for name in names {
+            if let Some(ch) = Channel::from_str_opt(name.trim())
+                && !picked.contains(&ch)
+            {
+                picked.push(ch);
+            }
+        }
+        picked
+    }
 }
 
 /// Send to an explicit subset of channels. A channel with no credentials
 /// configured is skipped, exactly as in the send-to-everything path.
+///
+/// `channels` is intersected with the operator's delivery-path selection
+/// (`AlertConfig::channels`) before anything is sent, so no caller can
+/// deliver on a path the operator switched off — a rule can narrow the set,
+/// never widen it. That intersection lives HERE rather than at each call site
+/// precisely so a future caller can't forget it.
 pub async fn dispatch_to_selected(
     config: &AlertConfig,
     channels: &[Channel],
@@ -942,6 +1093,7 @@ pub async fn dispatch_to_selected(
     message: &str,
     ntfy_priority: u8,
 ) {
+    let channels = config.narrow(channels);
     if channels.contains(&Channel::Discord)
         && !config.discord_webhook.is_empty()
         && let Err(e) = send_discord(&config.discord_webhook, title, message).await
@@ -966,43 +1118,23 @@ pub async fn dispatch_to_selected(
     {
         warn!("ntfy alert failed: {}", e);
     }
-    // Email is a different transport entirely — SMTP via AiConfig, and
-    // blocking, so it goes to a blocking thread rather than stalling the
-    // async worker for the length of an SMTP conversation.
+    // Email is a different transport entirely — SMTP via AiConfig — so it goes
+    // through the one helper that owns that path (and its blocking-pool hop).
     if channels.contains(&Channel::Email) {
-        let email_cfg = crate::ai::AiConfig::load();
-        if email_cfg.email_enabled && !email_cfg.email_to.is_empty() {
-            let (t, b) = (title.to_string(), message.to_string());
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = crate::ai::send_alert_email(&email_cfg, &t, &b) {
-                    warn!("email alert failed: {}", e);
-                }
-            }).await;
-        }
+        send_alert_email_if_selected(config, title, message).await;
     }
 }
 
+/// Fan out to every push channel the operator selected — `dispatch_to_selected`
+/// applies the selection. Email is not part of this fan-out (different
+/// transport — see `send_alert_email_if_selected`), so it is not requested
+/// here even when the operator has it selected.
 async fn dispatch_to_channels(config: &AlertConfig, title: &str, message: &str, ntfy_priority: u8) {
-    if !config.discord_webhook.is_empty()
-        && let Err(e) = send_discord(&config.discord_webhook, title, message).await
-    {
-        warn!("Discord alert failed: {}", e);
-    }
-    if !config.slack_webhook.is_empty()
-        && let Err(e) = send_slack(&config.slack_webhook, title, message).await
-    {
-        warn!("Slack alert failed: {}", e);
-    }
-    if !config.telegram_bot_token.is_empty() && !config.telegram_chat_id.is_empty()
-        && let Err(e) = send_telegram(&config.telegram_bot_token, &config.telegram_chat_id, title, message).await
-    {
-        warn!("Telegram alert failed: {}", e);
-    }
-    if !config.ntfy_topic.is_empty()
-        && let Err(e) = send_ntfy(&config.ntfy_server, &config.ntfy_topic, &config.ntfy_token, title, message, ntfy_priority).await
-    {
-        warn!("ntfy alert failed: {}", e);
-    }
+    dispatch_to_selected(
+        config,
+        &[Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy],
+        title, message, ntfy_priority,
+    ).await;
 }
 
 /// Notify the configured channels that a status-page monitor changed
@@ -1016,47 +1148,100 @@ async fn dispatch_to_channels(config: &AlertConfig, title: &str, message: &str, 
 /// configured) vs 3 for the recovery ping. klas, 2026-07-15.
 pub async fn send_monitor_alert(title: &str, message: &str, down: bool) {
     let config = AlertConfig::load();
-    if !config.enabled || !config.has_channels() {
+    // `has_delivery`, not `has_channels`: this function delivers by email too,
+    // so an email-only setup must not be gated out here.
+    if !config.enabled || !config.has_delivery() {
         return;
     }
     let (t, b) = decorate_local(title, message);
     dispatch_to_channels(&config, &t, &b, if down { 5 } else { 3 }).await;
 
     // Email too, if configured — same fan-out as send_node_alert.
-    let email_cfg = crate::ai::AiConfig::load();
-    if email_cfg.email_enabled && !email_cfg.email_to.is_empty() {
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::ai::send_alert_email(&email_cfg, &t, &b) {
-                warn!("monitor alert email failed: {}", e);
-            }
-        }).await.ok();
-    }
+    send_alert_email_if_selected(&config, &t, &b).await;
 }
 
-/// Send a test notification to all configured channels
-pub async fn send_test(config: &AlertConfig) -> Vec<(String, Result<(), String>)> {
+/// Send a test notification down every path that a real alert would take.
+///
+/// Deliberately mirrors delivery rather than configuration: a channel the
+/// operator has switched off in their selection is reported as `skipped`
+/// instead of being sent to, so "Test" answers the question the operator is
+/// actually asking ("will I get this?") rather than "are these credentials
+/// valid?". Email is included — it is a delivery path like any other, and
+/// leaving it out of the test is why an operator could be receiving alert
+/// email without any WolfStack screen ever admitting it.
+pub async fn send_test(config: &AlertConfig) -> Vec<TestResult> {
     let mut results = Vec::new();
     let title = "🧪 WolfStack Test Alert";
     let message = "This is a test notification from WolfStack. If you received this, your alerting is configured correctly!";
 
-    if !config.discord_webhook.is_empty() {
-        let r = send_discord(&config.discord_webhook, title, message).await;
-        results.push(("discord".to_string(), r));
-    }
-    if !config.slack_webhook.is_empty() {
-        let r = send_slack(&config.slack_webhook, title, message).await;
-        results.push(("slack".to_string(), r));
-    }
-    if !config.telegram_bot_token.is_empty() && !config.telegram_chat_id.is_empty() {
-        let r = send_telegram(&config.telegram_bot_token, &config.telegram_chat_id, title, message).await;
-        results.push(("telegram".to_string(), r));
-    }
-    if !config.ntfy_topic.is_empty() {
-        let r = send_ntfy(&config.ntfy_server, &config.ntfy_topic, &config.ntfy_token, title, message, 3).await;
-        results.push(("ntfy".to_string(), r));
+    for ch in Channel::ALL {
+        // Email's credentials live on AiConfig, so `channel_configured` can't
+        // answer for it — resolve that here.
+        let email_cfg = (ch == Channel::Email).then(crate::ai::AiConfig::load);
+        let configured = match &email_cfg {
+            Some(cfg) => cfg.email_enabled && !cfg.email_to.is_empty(),
+            None => config.channel_configured(ch),
+        };
+        if !configured {
+            // Nothing set up on this path. Not a result worth showing — and
+            // reporting it as "not selected" would be misleading when there is
+            // nothing there to select.
+            continue;
+        }
+        if !config.delivers_on(ch) {
+            results.push(TestResult::skipped(ch));
+            continue;
+        }
+        let outcome = match ch {
+            Channel::Discord => send_discord(&config.discord_webhook, title, message).await,
+            Channel::Slack => send_slack(&config.slack_webhook, title, message).await,
+            Channel::Telegram => send_telegram(
+                &config.telegram_bot_token, &config.telegram_chat_id, title, message).await,
+            Channel::Ntfy => send_ntfy(
+                &config.ntfy_server, &config.ntfy_topic, &config.ntfy_token, title, message, 3).await,
+            Channel::Email => {
+                // SMTP is blocking — off the async worker, same as every other
+                // alert-email path.
+                let cfg = email_cfg.expect("email config resolved above");
+                let (t, b) = (title.to_string(), message.to_string());
+                tokio::task::spawn_blocking(move || crate::ai::send_alert_email(&cfg, &t, &b))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("email task failed: {}", e)))
+            }
+        };
+        results.push(TestResult { channel: ch, skipped: false, outcome: Some(outcome) });
     }
 
     results
+}
+
+/// One line of the test-notification report.
+#[derive(Debug)]
+pub struct TestResult {
+    pub channel: Channel,
+    /// Configured, but not one of the operator's selected delivery paths — so
+    /// nothing was sent, and a real alert wouldn't go here either.
+    pub skipped: bool,
+    /// `None` exactly when `skipped`.
+    pub outcome: Option<Result<(), String>>,
+}
+
+impl TestResult {
+    fn skipped(channel: Channel) -> Self {
+        Self { channel, skipped: true, outcome: None }
+    }
+
+    /// True only for a path that was actually sent to, successfully.
+    pub fn succeeded(&self) -> bool {
+        matches!(self.outcome, Some(Ok(())))
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match &self.outcome {
+            Some(Err(e)) => Some(e.as_str()),
+            _ => None,
+        }
+    }
 }
 
 // ── Discord webhook ──
@@ -1224,6 +1409,130 @@ mod tests {
         assert_eq!(j["ntfy_server"], "https://ntfy.sh");
         assert_ne!(j["ntfy_topic"], "wolfstack-secret-topic");
         assert!(j.get("ntfy_token").is_none(), "token must never reach the frontend");
+    }
+
+    // ── Delivery-path selection (klas 2026-09-09: ntfy AND email) ──
+
+    /// The back-compat contract: no selection stored = every configured
+    /// channel delivers, exactly as before the setting existed.
+    #[test]
+    fn an_empty_selection_delivers_everywhere() {
+        let cfg = AlertConfig::default();
+        assert!(cfg.channels.is_empty());
+        for ch in Channel::ALL {
+            assert!(cfg.delivers_on(ch), "{:?} must deliver by default", ch.as_str());
+        }
+        assert_eq!(cfg.resolved_channels(), Channel::ALL.to_vec());
+    }
+
+    /// A config written before this field existed must load with the field
+    /// absent — not with an accidentally-empty-meaning-nothing selection.
+    #[test]
+    fn channels_default_for_old_configs() {
+        let old = r#"{"enabled":true,"ntfy_topic":"t"}"#;
+        let cfg: AlertConfig = serde_json::from_str(old).unwrap();
+        assert!(cfg.channels.is_empty());
+        assert!(cfg.delivers_on(Channel::Email));
+        assert!(cfg.has_channels(), "the configured ntfy topic still delivers");
+    }
+
+    /// klas's case: ntfy and email both live, only ntfy wanted.
+    #[test]
+    fn selecting_ntfy_silences_email() {
+        let cfg = AlertConfig {
+            ntfy_topic: "wolfstack-topic".into(),
+            channels: vec![Channel::Ntfy],
+            ..Default::default()
+        };
+        assert!(cfg.delivers_on(Channel::Ntfy));
+        assert!(!cfg.delivers_on(Channel::Email));
+        assert!(!cfg.delivers_on(Channel::Discord));
+        assert!(cfg.has_channels());
+    }
+
+    /// A channel with credentials but deselected must not count as somewhere
+    /// to deliver — otherwise the push gate opens and dispatch finds nothing.
+    #[test]
+    fn a_deselected_channel_is_not_a_channel() {
+        let configured = AlertConfig {
+            discord_webhook: "https://discord.example/hook".into(),
+            ..Default::default()
+        };
+        assert!(configured.has_channels());
+        let deselected = AlertConfig { channels: vec![Channel::Email], ..configured };
+        assert!(!deselected.has_channels(), "discord is configured but switched off");
+        assert!(
+            deselected.channel_configured(Channel::Discord),
+            "credentials are still stored",
+        );
+    }
+
+    /// Email's transport lives on AiConfig, so `channel_configured` must not
+    /// pretend to answer for it — `send_alert_email_if_selected` and
+    /// `has_delivery` own that check.
+    #[test]
+    fn channel_configured_never_claims_email() {
+        let cfg = AlertConfig::default();
+        assert!(!cfg.channel_configured(Channel::Email));
+    }
+
+    /// A rule may narrow the operator's selection, never widen it.
+    #[test]
+    fn narrow_intersects_and_never_widens() {
+        let cfg = AlertConfig { channels: vec![Channel::Ntfy], ..Default::default() };
+        assert_eq!(cfg.narrow(&[Channel::Ntfy, Channel::Email]), vec![Channel::Ntfy]);
+        assert!(cfg.narrow(&[Channel::Email]).is_empty());
+        // No selection at all → the request passes through untouched.
+        let open = AlertConfig::default();
+        assert_eq!(open.narrow(&[Channel::Email]), vec![Channel::Email]);
+    }
+
+    /// The selection must survive a save/load cycle — it is stored in the
+    /// same JSON file as everything else, so serde is the whole mechanism.
+    #[test]
+    fn channels_survive_the_config_file_format() {
+        let cfg = AlertConfig { channels: vec![Channel::Ntfy], ..Default::default() };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"channels\":[\"ntfy\"]"), "unexpected encoding: {}", json);
+        let back: AlertConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.channels, vec![Channel::Ntfy]);
+        assert!(!back.delivers_on(Channel::Email));
+    }
+
+    /// What arrives from the UI: whitespace, unknown names, duplicates.
+    #[test]
+    fn parse_list_drops_unknown_and_duplicate_paths() {
+        assert_eq!(
+            Channel::parse_list([" ntfy ", "email", "ntfy", "sms", "", "Discord"]),
+            vec![Channel::Ntfy, Channel::Email],
+            "unknown names and case mismatches are dropped, duplicates collapse, order kept",
+        );
+        assert!(Channel::parse_list(["nope"]).is_empty());
+    }
+
+    /// Round-trip through the wire names the frontend and config file use.
+    #[test]
+    fn channel_names_round_trip() {
+        for ch in Channel::ALL {
+            assert_eq!(Channel::from_str_opt(ch.as_str()), Some(ch));
+        }
+        assert_eq!(Channel::from_str_opt("sms"), None, "unknown paths are dropped, not defaulted");
+        let cfg = AlertConfig {
+            channels: vec![Channel::Ntfy, Channel::Email],
+            ..Default::default()
+        };
+        let j = cfg.to_masked_json();
+        assert_eq!(j["channels"], serde_json::json!(["ntfy", "email"]));
+        assert_eq!(
+            j["channels_effective"], serde_json::json!(["ntfy", "email"]),
+            "an explicit selection is its own effective list",
+        );
+        let open = AlertConfig::default().to_masked_json();
+        assert_eq!(open["channels"], serde_json::json!([]));
+        assert_eq!(
+            open["channels_effective"],
+            serde_json::json!(["discord", "slack", "telegram", "ntfy", "email"]),
+        );
     }
 
     /// Golden rule: a config written before the ntfy fields existed

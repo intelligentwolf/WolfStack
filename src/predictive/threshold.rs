@@ -75,29 +75,48 @@ const LOAD_CRITICAL_MULT: f64 = 2.0; // load > 2 × cpu_count
 /// resource_id; per-unit systemd uses the unit name.
 const NODE_RESOURCE: &str = "host";
 
-/// Sample failed systemd units. Returns an empty Vec if `systemctl`
-/// errors or isn't present.
-pub fn sample_failed_systemd_units_now() -> Vec<String> {
+/// Failed systemd units, plus whether we actually got to ask.
+///
+/// The distinction matters for auto-resolve: an empty `units` with
+/// `scanned == true` means "systemd reports nothing failed", which lets a
+/// previously-flagged unit's finding clear (the operator fixed it, or ran
+/// `systemctl reset-failed`). An empty `units` with `scanned == false` means
+/// we never got an answer — no systemd (Unraid), `systemctl` missing, or the
+/// call timed out — and must NOT be read as "everything is fine now".
+/// Conflating the two left a repaired unit's finding in the inbox for ever,
+/// because `covered_scopes` only ever covered units that were *currently*
+/// failing.
+#[derive(Debug, Clone, Default)]
+pub struct FailedUnitsFacts {
+    pub units: Vec<String>,
+    pub scanned: bool,
+}
+
+/// Sample failed systemd units. `scanned` is false if `systemctl` errors or
+/// isn't present.
+pub fn sample_failed_systemd_units_now() -> FailedUnitsFacts {
     let out = match std::process::Command::new("systemctl")
         .args(["--failed", "--no-legend", "--plain"])
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        _ => return FailedUnitsFacts::default(),
     };
-    String::from_utf8_lossy(&out.stdout)
+    let units = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect();
+    FailedUnitsFacts { units, scanned: true }
 }
 
-/// Async timeout-bounded variant.
-pub async fn sample_failed_systemd_units_now_async(timeout: Duration) -> Vec<String> {
+/// Async timeout-bounded variant. A timeout yields `scanned == false` —
+/// stuck systemd is exactly the case where we must not conclude anything.
+pub async fn sample_failed_systemd_units_now_async(timeout: Duration) -> FailedUnitsFacts {
     let fut = tokio::task::spawn_blocking(sample_failed_systemd_units_now);
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(v)) => v,
-        _ => Vec::new(),
+        _ => FailedUnitsFacts::default(),
     }
 }
 
@@ -105,7 +124,7 @@ pub async fn sample_failed_systemd_units_now_async(timeout: Duration) -> Vec<Str
 pub fn analyze(
     ctx: &Context,
     metrics: &crate::monitoring::SystemMetrics,
-    failed_units: &[String],
+    failed_units: &FailedUnitsFacts,
     acks: &AckStore,
     proposals: &crate::predictive::proposal::ProposalStore,
 ) -> Vec<Proposal> {
@@ -135,20 +154,29 @@ pub fn analyze(
     // ── Load ──
     if let Some(p) = check_load(ctx, metrics, acks, proposals) { out.push(p); }
     // ── Failed systemd units ──
-    out.extend(check_failed_units(ctx, failed_units, acks, proposals));
+    out.extend(check_failed_units(ctx, &failed_units.units, acks, proposals));
 
     out
 }
 
 /// "Covered" scopes for auto-resolve. Threshold checks evaluate the
 /// same set every tick (CPU, memory, swap, load — node-scoped) plus
-/// every currently-mounted disk + every previously-emitted systemd
+/// every currently-mounted disk + every CURRENTLY-failing systemd
 /// unit. Without this, a CPU spike that subsides would leave its
 /// proposal stuck Pending until the 90-day prune.
+///
+/// Note what the systemd line does NOT cover: a unit that has stopped
+/// failing drops out of `failed_units`, so its finding is no longer covered
+/// here and `auto_resolve_cleared` can't clear it. (The comment here used to
+/// claim "every previously-emitted systemd unit", which was never true.)
+/// That case is closed by the orchestrator, which feeds
+/// `proposal::vanished_scopes` with `failed_units.scanned` — the flag
+/// that separates "systemd says nothing is failing" from "we never got an
+/// answer".
 pub fn covered_scopes(
     ctx: &Context,
     metrics: &crate::monitoring::SystemMetrics,
-    failed_units: &[String],
+    failed_units: &FailedUnitsFacts,
 ) -> Vec<(String, ProposalScope)> {
     let node_scope = || ProposalScope {
         node_id: ctx.node_id.clone(),
@@ -170,7 +198,7 @@ pub fn covered_scopes(
             },
         ));
     }
-    for unit in failed_units {
+    for unit in &failed_units.units {
         out.push((
             FINDING_SYSTEMD_FAILED.into(),
             ProposalScope {
@@ -569,14 +597,14 @@ mod tests {
     #[test]
     fn cpu_below_warn_silent() {
         let m = metrics(50.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         assert!(p.iter().all(|x| x.finding_type != FINDING_HOST_CPU));
     }
 
     #[test]
     fn cpu_warn_threshold() {
         let m = metrics(80.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let cpu = p.iter().find(|x| x.finding_type == FINDING_HOST_CPU).expect("cpu");
         assert_eq!(cpu.severity, Severity::Warn);
     }
@@ -584,7 +612,7 @@ mod tests {
     #[test]
     fn cpu_critical_threshold() {
         let m = metrics(95.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let cpu = p.iter().find(|x| x.finding_type == FINDING_HOST_CPU).expect("cpu");
         assert_eq!(cpu.severity, Severity::Critical);
     }
@@ -594,7 +622,7 @@ mod tests {
     #[test]
     fn disk_low_free_critical() {
         let m = metrics(10.0, 10.0, 1.0, 200.0); // 1 GB free
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
         assert_eq!(d.severity, Severity::Critical);
     }
@@ -602,7 +630,7 @@ mod tests {
     #[test]
     fn disk_low_free_warn() {
         let m = metrics(10.0, 10.0, 5.0, 200.0); // 5 GB free
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
         assert_eq!(d.severity, Severity::Warn);
     }
@@ -619,7 +647,7 @@ mod tests {
             available_bytes: 100_000_000,
             usage_percent: 90.0,
         });
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         // /boot never fires from the GENERIC check — the dedicated
         // boot_partition analyzer owns it.
         assert!(p.iter().all(|x|
@@ -643,7 +671,7 @@ mod tests {
             available_bytes: 0,
             usage_percent: 100.0,
         });
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         assert!(p.iter().all(|x|
             x.scope.resource_id.as_deref() != Some("/boot")
         ));
@@ -655,7 +683,7 @@ mod tests {
     fn load_critical_at_2x_cpus() {
         let mut m = metrics(10.0, 10.0, 100.0, 200.0);
         m.load_avg = LoadAverage { one: 9.0, five: 8.0, fifteen: 7.0 }; // 2.25× 4 CPUs
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let l = p.iter().find(|x| x.finding_type == FINDING_HOST_LOAD).expect("load");
         assert_eq!(l.severity, Severity::Critical);
     }
@@ -675,7 +703,7 @@ mod tests {
             "compile box, expected to peg CPU",
             "paul", None,
         ));
-        let p = analyze(&ctx(), &m, &[], &acks, &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &acks, &ProposalStore::default());
         assert!(p.iter().all(|x| x.finding_type != FINDING_HOST_CPU),
             "ack must silence the CPU finding");
     }
@@ -684,7 +712,10 @@ mod tests {
     #[test]
     fn one_finding_per_failed_unit() {
         let m = metrics(10.0, 10.0, 100.0, 200.0);
-        let units = vec!["wolfstack.service".to_string(), "broken.timer".to_string()];
+        let units = FailedUnitsFacts {
+            units: vec!["wolfstack.service".to_string(), "broken.timer".to_string()],
+            scanned: true,
+        };
         let p = analyze(&ctx(), &m, &units, &AckStore::default(), &ProposalStore::default());
         let failed: Vec<_> = p.iter().filter(|x| x.finding_type == FINDING_SYSTEMD_FAILED).collect();
         assert_eq!(failed.len(), 2);
@@ -697,7 +728,7 @@ mod tests {
     #[test]
     fn covered_scopes_covers_all_node_metrics() {
         let m = metrics(10.0, 10.0, 100.0, 200.0);
-        let cov = covered_scopes(&ctx(), &m, &[]);
+        let cov = covered_scopes(&ctx(), &m, &FailedUnitsFacts::default());
         let types: Vec<&str> = cov.iter().map(|(t, _)| t.as_str()).collect();
         assert!(types.contains(&FINDING_HOST_CPU));
         assert!(types.contains(&FINDING_HOST_MEMORY));
@@ -710,7 +741,59 @@ mod tests {
     #[test]
     fn analyzer_can_stay_quiet() {
         let m = metrics(10.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &[], &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         assert!(p.is_empty());
+    }
+    /// A unit the operator has fixed must stop being reported. It drops out of
+    /// `systemctl --failed`, so `covered_scopes` no longer covers it and
+    /// `auto_resolve_cleared` structurally cannot clear it — the orchestrator
+    /// closes that gap by feeding `vanished_scopes` the `scanned` flag. This
+    /// test pins that composition; without the wiring the finding is immortal.
+    #[test]
+    fn a_repaired_systemd_unit_retires_when_the_scan_succeeded() {
+        use crate::predictive::proposal::{
+            ApprovalOutcome, ProposalStatus, ProposalSource, RemediationPlan, vanished_scopes,
+        };
+        let m = metrics(10.0, 10.0, 100.0, 200.0);
+        let scope = ProposalScope {
+            node_id: "node-a".into(),
+            resource_id: Some("broken.timer".into()),
+        };
+        let mut store = crate::predictive::proposal::ProposalStore::default();
+        store.upsert(Proposal::new(
+            FINDING_SYSTEMD_FAILED, ProposalSource::Rule, Severity::Warn,
+            "Systemd unit 'broken.timer' failed", "why", vec![],
+            RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
+            scope.clone(),
+        ));
+
+        // systemctl answered, and nothing is failing any more.
+        let repaired = FailedUnitsFacts { units: vec![], scanned: true };
+        let covered = covered_scopes(&ctx(), &m, &repaired);
+        let vanished = vanished_scopes(
+            &[FINDING_SYSTEMD_FAILED], repaired.scanned, &covered, &store, "node-a",
+        );
+        assert_eq!(vanished.len(), 1, "the repaired unit must be recognised as gone");
+        assert_eq!(store.resolve_vanished(&vanished), 1);
+        match &store.proposals[0].status {
+            ProposalStatus::Approved { outcome: ApprovalOutcome::ResourceGone { .. }, .. } => {}
+            other => panic!("expected ResourceGone, got {:?}", other),
+        }
+
+        // Now the safety case: systemd never answered (no systemd, timeout).
+        // Identical empty unit list, but the finding must survive.
+        let mut store2 = crate::predictive::proposal::ProposalStore::default();
+        store2.upsert(Proposal::new(
+            FINDING_SYSTEMD_FAILED, ProposalSource::Rule, Severity::Warn,
+            "Systemd unit 'broken.timer' failed", "why", vec![],
+            RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
+            scope.clone(),
+        ));
+        let unknown = FailedUnitsFacts::default();
+        let covered2 = covered_scopes(&ctx(), &m, &unknown);
+        assert!(vanished_scopes(
+            &[FINDING_SYSTEMD_FAILED], unknown.scanned, &covered2, &store2, "node-a",
+        ).is_empty());
+        assert!(matches!(store2.proposals[0].status, ProposalStatus::Pending));
     }
 }

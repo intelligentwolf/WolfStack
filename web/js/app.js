@@ -54920,11 +54920,89 @@ async function loadAlertingConfig() {
         if (c.has_slack) channels.push('\u2705 Slack');
         if (c.has_telegram) channels.push('\u2705 Telegram');
         if (c.has_ntfy) channels.push('\u2705 ntfy');
+        if (c.has_email) channels.push('\u2705 Email');
         const statusEl = document.getElementById('alerting-channel-status');
         statusEl.innerHTML = channels.length
             ? `<span style="color:var(--success);">${channels.join(' &nbsp;\u00b7&nbsp; ')}</span>`
             : '<span style="color:var(--text-muted);">No channels configured yet</span>';
+        renderAlertingDelivery(c);
     } catch (e) { /* ignore */ }
+}
+
+// Per-channel state for the "Deliver alerts to" picker, cached between the
+// config load and the summary so ticking a box doesn't need a refetch.
+let _alertingChannelState = null;
+
+// Which paths are set up, keyed the same way the backend names them.
+// `has_email` comes from AiConfig (different page), which is exactly why the
+// hint tells the operator where to configure it.
+function alertingChannelState(c) {
+    return {
+        discord:  { label: 'Discord',  configured: !!c.has_discord,  where: 'Discord Webhook URL above' },
+        slack:    { label: 'Slack',    configured: !!c.has_slack,    where: 'Slack Webhook URL above' },
+        telegram: { label: 'Telegram', configured: !!c.has_telegram, where: 'Telegram bot token + chat ID above' },
+        ntfy:     { label: 'ntfy',     configured: !!c.has_ntfy,     where: 'ntfy topic above' },
+        email:    { label: 'Email',    configured: !!c.has_email,    where: 'Settings \u2192 AI \u2192 Email alerts' },
+    };
+}
+
+// Paint the "Deliver alerts to" picker from the saved config.
+//
+// An empty `channels` array means "every configured path" (the behaviour
+// before this setting existed), so the boxes are pre-ticked from
+// `channels_effective` — what the server will actually do — and the summary
+// spells out which of those are live. Ticking nothing and saving is treated
+// as "all", not "none": silence is never what a Save meant.
+function renderAlertingDelivery(c) {
+    const boxes = document.querySelectorAll('.alerting-delivery-channel');
+    if (!boxes.length) return;
+    const state = alertingChannelState(c);
+    const effective = Array.isArray(c.channels_effective) && c.channels_effective.length
+        ? c.channels_effective
+        : ['discord', 'slack', 'telegram', 'ntfy', 'email'];
+    boxes.forEach(box => {
+        box.checked = effective.indexOf(box.value) !== -1;
+        box.onchange = updateAlertingDeliverySummary;
+    });
+    document.querySelectorAll('.alerting-delivery-hint').forEach(el => {
+        const st = state[el.dataset.channel];
+        if (!st) return;
+        el.textContent = st.configured
+            ? '\u2014 configured'
+            : '\u2014 not configured (' + st.where + ')';
+    });
+    // Cache for the summary, which re-runs on every tick without a refetch.
+    _alertingChannelState = state;
+    updateAlertingDeliverySummary();
+}
+
+// Live answer to "so what will I actually get?" — the question the two
+// simultaneous notifications raised in the first place.
+function updateAlertingDeliverySummary() {
+    const el = document.getElementById('alerting-delivery-summary');
+    if (!el) return;
+    const state = _alertingChannelState || {};
+    const picked = Array.from(document.querySelectorAll('.alerting-delivery-channel'))
+        .filter(b => b.checked)
+        .map(b => b.value);
+    if (!picked.length) {
+        el.innerHTML = '<span style="color:var(--warning,#fbbf24);">\u26a0 Nothing ticked \u2014 saving this keeps every configured path enabled. Untick the ones you don\u2019t want.</span>';
+        return;
+    }
+    const label = ch => escapeHtml((state[ch] && state[ch].label) || ch);
+    const live = picked.filter(ch => state[ch] && state[ch].configured);
+    const idle = picked.filter(ch => !state[ch] || !state[ch].configured);
+    let html = live.length
+        ? 'Alerts go to <strong>' + live.map(label).join('</strong>, <strong>') + '</strong>.'
+        : '<span style="color:var(--warning,#fbbf24);">\u26a0 None of the ticked paths is configured yet \u2014 no alert can be delivered.</span>';
+    // Only worth naming the unconfigured picks when something else IS working
+    // — otherwise the "none of these is configured" line above already said it.
+    if (idle.length && live.length) {
+        html += ' <span style="color:var(--text-muted);">' + idle.map(label).join(', ') +
+                ' ticked but not configured \u2014 nothing sent there until you set it up.</span>';
+    }
+    html += ' <span style="color:var(--text-muted);">WolfNotify rules can narrow this further, never widen it.</span>';
+    el.innerHTML = html;
 }
 
 async function saveAlertingConfig(skipBtnState) {
@@ -54971,6 +55049,16 @@ async function saveAlertingConfig(skipBtnState) {
     if (ntfyTopic) payload.ntfy_topic = ntfyTopic;
     if (ntfyToken) payload.ntfy_token = ntfyToken;
     payload.ntfy_server = ntfyServer;
+    // Delivery paths. All five ticked is sent as [] — "every configured
+    // channel" — so the stored config keeps meaning the same thing if a
+    // channel is added later, instead of pinning today's list.
+    const deliveryBoxes = Array.from(document.querySelectorAll('.alerting-delivery-channel'));
+    let noDeliveryPicked = false;
+    if (deliveryBoxes.length) {
+        const picked = deliveryBoxes.filter(b => b.checked).map(b => b.value);
+        payload.channels = (picked.length === deliveryBoxes.length) ? [] : picked;
+        noDeliveryPicked = picked.length === 0;
+    }
 
     try {
         const resp = await fetch('/api/alerts/config', {
@@ -54980,6 +55068,11 @@ async function saveAlertingConfig(skipBtnState) {
         });
         if (resp.ok) {
             showToast('Alerting settings saved ', 'success');
+            // Empty selection = "every configured path" server-side. Say so
+            // rather than letting the operator believe they muted everything.
+            if (noDeliveryPicked) {
+                showToast('No delivery path was ticked, so every configured path stays enabled. To stop all notifications, untick "Enable Alerting".', 'warning', 9000);
+            }
             if (btn) {
                 btn.innerHTML = 'Saved!';
                 btn.style.background = 'var(--success)';
@@ -55016,15 +55109,26 @@ async function testAlerting() {
     try {
         const resp = await fetch('/api/alerts/test', { method: 'POST' });
         const data = await resp.json();
-        const details = (data.results || []).map(r => `${r.channel}: ${r.success ? '\u2705' : '\u274c ' + (r.error || 'failed')}`).join(', ');
+        // A path that is configured but not selected is reported as skipped,
+        // not as a failure: nothing was sent there because a real alert
+        // wouldn't go there either.
+        const results = data.results || [];
+        const details = results.map(r => {
+            if (r.skipped) return `${r.channel}: \u2014 not selected`;
+            return `${r.channel}: ${r.success ? '\u2705' : '\u274c ' + (r.error || 'failed')}`;
+        }).join(', ');
+        const attempted = results.filter(r => !r.skipped);
         if (data.sent > 0) {
             showToast(`Test sent to ${data.sent} channel(s): ${details}`, 'success');
-        } else if (data.results && data.results.length > 0) {
-            // Channels ARE configured \u2014 they all failed. Show the real
-            // errors, never the misleading "no channels" message.
+        } else if (attempted.length > 0) {
+            // Paths WERE tried \u2014 they all failed. Show the real errors,
+            // never the misleading "no channels" message.
             showToast(`Test failed \u2014 ${details}`, 'error');
+        } else if (results.length > 0) {
+            // Everything configured is deselected in "Deliver alerts to".
+            showToast(`Nothing sent \u2014 every configured path is unticked in "Deliver alerts to" (${details})`, 'error');
         } else {
-            showToast('No channels configured \u2014 add a Discord, Slack, Telegram, or ntfy channel first', 'error');
+            showToast('No channels configured \u2014 add a Discord, Slack, Telegram, ntfy or email channel first', 'error');
         }
     } catch (e) {
         showToast('Test failed: ' + e.message, 'error');

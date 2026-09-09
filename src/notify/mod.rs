@@ -178,7 +178,9 @@ pub struct NotifyRule {
     #[serde(default, rename = "match")]
     pub match_spec: MatchSpec,
     /// Channels this rule routes to. Empty means "every configured channel",
-    /// so a rule written before routing existed still delivers.
+    /// so a rule written before routing existed still delivers. Intersected
+    /// with the operator's global delivery-path selection
+    /// (`AlertConfig::channels`) at dispatch: a rule can narrow, never widen.
     #[serde(default)]
     pub channels: Vec<Channel>,
     /// Seconds of silence per (rule, object) after firing. Per-OBJECT, not per
@@ -606,6 +608,9 @@ pub async fn handle_event(
         // Recovery is informational; a failure should be able to cut through
         // a phone's do-not-disturb, which is what ntfy priority 5 is for.
         let priority = if event.kind.is_recovery() { 3 } else { 5 };
+        // The rule's channels are intersected with the operator's global
+        // delivery-path selection inside `dispatch_to_selected` — a rule picks
+        // from the paths they chose, it can't reinstate one they switched off.
         crate::alerting::dispatch_to_selected(
             &cfg, &rule.resolved_channels(), &title, &body, priority,
         ).await;

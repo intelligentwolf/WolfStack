@@ -6668,6 +6668,46 @@
                                     </small>
                                 </div>
 
+                                <!-- Delivery-path selection. Configuring a channel used to BE
+                                     the selection: every alert went to every channel with
+                                     credentials, and email went out on top from a setting on
+                                     another page — so ntfy + SMTP meant two pages per event with
+                                     no way to choose (klas 2026-09-09). Nothing ticked = every
+                                     configured path, i.e. the old behaviour. -->
+                                <fieldset id="alerting-delivery"
+                                    style="margin:16px 0; padding:14px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px;">
+                                    <legend style="font-size:14px; color:var(--accent-light); padding:0 6px;">Deliver alerts to</legend>
+                                    <div style="display:grid; gap:10px;">
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="checkbox" class="alerting-delivery-channel" value="discord"
+                                                style="width:16px;height:16px;margin-top:2px;">
+                                            <span>Discord <span class="alerting-delivery-hint" data-channel="discord" style="color:var(--text-muted);"></span></span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="checkbox" class="alerting-delivery-channel" value="slack"
+                                                style="width:16px;height:16px;margin-top:2px;">
+                                            <span>Slack <span class="alerting-delivery-hint" data-channel="slack" style="color:var(--text-muted);"></span></span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="checkbox" class="alerting-delivery-channel" value="telegram"
+                                                style="width:16px;height:16px;margin-top:2px;">
+                                            <span>Telegram <span class="alerting-delivery-hint" data-channel="telegram" style="color:var(--text-muted);"></span></span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="checkbox" class="alerting-delivery-channel" value="ntfy"
+                                                style="width:16px;height:16px;margin-top:2px;">
+                                            <span>ntfy push <span class="alerting-delivery-hint" data-channel="ntfy" style="color:var(--text-muted);"></span></span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="checkbox" class="alerting-delivery-channel" value="email"
+                                                style="width:16px;height:16px;margin-top:2px;">
+                                            <span>Email <span class="alerting-delivery-hint" data-channel="email" style="color:var(--text-muted);"></span></span>
+                                        </label>
+                                    </div>
+                                    <div id="alerting-delivery-summary" role="status" aria-live="polite"
+                                        style="font-size:12px; color:var(--text-muted); margin-top:10px; line-height:1.5;"></div>
+                                </fieldset>
+
                                 <div id="alerting-channel-status"
                                     style="font-size:12px;color:var(--text-muted);padding:8px 0;"></div>
                             </div>

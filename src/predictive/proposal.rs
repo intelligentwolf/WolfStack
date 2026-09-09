@@ -155,6 +155,14 @@ pub enum ApprovalOutcome {
     /// Distinguished from `Applied` so the audit trail keeps the
     /// closed-loop signal honest.
     ConditionCleared,
+    /// The thing the finding was about no longer exists — a WolfNet peer
+    /// removed from the config, a container destroyed, a node taken out
+    /// of the cluster, a systemd unit `reset-failed`. The condition was
+    /// never "fixed"; the resource went away, so nothing can re-evaluate
+    /// it. Kept distinct from `ConditionCleared` because the audit trail
+    /// must not claim the analyzer watched a problem resolve when what
+    /// actually happened is that it lost sight of it.
+    ResourceGone { reason: String },
 }
 
 /// One inbox entry.
@@ -230,6 +238,52 @@ pub struct ProposalStore {
     /// HashMap iteration order would shuffle entries on every save.
     #[serde(default)]
     pub proposals: Vec<Proposal>,
+}
+
+/// How long a `Pending` finding may go un-evaluated before
+/// [`ProposalStore::resolve_orphaned`] resolves it as
+/// [`ApprovalOutcome::ResourceGone`].
+///
+/// Sized against the worst *legitimate* blind spot: a data source an operator
+/// leaves down over a long weekend (docker stopped, an unmounted array, a peer
+/// powered off for a hardware swap) must not lose its findings. A week covers
+/// that with room to spare, and the analyzer re-emits within one tick if the
+/// resource comes back — so the cost of being wrong is one re-notification,
+/// while the cost of no fuse at all is a permanent inbox entry the operator
+/// can only dismiss by hand.
+pub const ORPHAN_FUSE_DAYS: i64 = 7;
+
+/// Pending findings whose resource is absent from a *successful* enumeration
+/// — i.e. the resource has been removed, so the finding can be retired now
+/// rather than waiting out the [`ORPHAN_FUSE_DAYS`] fuse. Feed the result to
+/// [`ProposalStore::resolve_vanished`].
+///
+/// The precondition is the whole point, and it is the caller's to prove:
+/// `enumerated` must mean "this analyzer listed every resource of its kind
+/// that exists, and the listing succeeded". An analyzer whose sampler returns
+/// an empty list on failure cannot claim that — pass `false` and let the fuse
+/// handle it. Claiming it falsely resolves live findings.
+///
+/// `covered` is the set the analyzers built for this tick; anything in it is
+/// being evaluated normally (and will re-emit or auto-resolve on its own), so
+/// it is left alone. Only pending findings owned by THIS node are considered,
+/// for the same reason `resolve_orphaned` treats a foreign scope separately.
+pub fn vanished_scopes(
+    finding_types: &[&str],
+    enumerated: bool,
+    covered: &[(String, ProposalScope)],
+    store: &ProposalStore,
+    node_id: &str,
+) -> Vec<(String, ProposalScope)> {
+    if !enumerated { return Vec::new(); }
+    store.proposals.iter()
+        .filter(|p| matches!(p.status, ProposalStatus::Pending))
+        .filter(|p| p.scope.node_id == node_id)
+        .filter(|p| finding_types.contains(&p.finding_type.as_str()))
+        .filter(|p| !covered.iter()
+            .any(|(ft, sc)| ft == &p.finding_type && sc == &p.scope))
+        .map(|p| (p.finding_type.clone(), p.scope.clone()))
+        .collect()
 }
 
 /// File location for the proposal store. Top-level fn so tests can
@@ -394,6 +448,115 @@ impl ProposalStore {
                 p.updated_at = Utc::now();
                 count += 1;
             }
+        }
+        count
+    }
+
+    /// Resolve `Pending` findings that nothing is evaluating any more, so a
+    /// finding whose *resource* has disappeared can't sit in the inbox for
+    /// ever.
+    ///
+    /// Two independent cases, both of which produced permanent ghost entries
+    /// before this existed (klas, 2026-09-09: "Predictive inbox keeps raising
+    /// issues with a node that is long gone from the cluster"):
+    ///
+    /// 1. **Wrong owner.** Every analyzer scopes its findings to
+    ///    `ctx.node_id`, which is this node's `/etc/wolfstack/node_id`, so a
+    ///    proposal in the LOCAL store carrying a different `node_id` can never
+    ///    be re-evaluated by anything. That happens when a node is rebuilt (new
+    ///    id) or the file is replaced. Resolved immediately — there is no fuse
+    ///    to wait out, because no future tick can ever cover that scope.
+    ///
+    /// 2. **Vanished resource.** `auto_resolve_cleared` only clears a finding
+    ///    whose scope the analyzers *covered* this tick, deliberately: a
+    ///    finding that stops being covered usually means the data source went
+    ///    away (hung NFS, dead docker socket), and clearing on that would erase
+    ///    live problems. But a resource that is genuinely gone — a WolfNet peer
+    ///    deleted from the config, a destroyed container, a `reset-failed`
+    ///    systemd unit — also stops being covered, and then nothing ever clears
+    ///    it. The fuse resolves those, and is deliberately long (see
+    ///    [`ORPHAN_FUSE_DAYS`]) so a data source that is merely down for a while
+    ///    doesn't lose real findings.
+    ///
+    /// Self-correcting either way: an orphan that was actually still real
+    /// re-emits on the next tick that covers it (`upsert` flips it straight
+    /// back to `Pending` — `ResourceGone` carries no suppression grace).
+    ///
+    /// "Last evidence this finding is alive" is `max(updated_at,
+    /// last_checked_at)`: `upsert` re-stamps `updated_at` on every tick a
+    /// standing condition re-fires, and `touch_checked` stamps
+    /// `last_checked_at` on every tick the scope is merely covered. So a
+    /// finding that is either still firing or still being looked at can never
+    /// trip the fuse, regardless of which of the two paths is keeping it alive.
+    ///
+    /// Snoozed and Dismissed entries are left alone — those are operator
+    /// decisions, not analyzer state. Returns the number resolved.
+    pub fn resolve_orphaned(&mut self, node_id: &str, fuse_days: i64) -> usize {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(fuse_days);
+        let mut count = 0;
+        for p in &mut self.proposals {
+            if !matches!(p.status, ProposalStatus::Pending) { continue; }
+            // An empty node_id means we failed to establish an identity this
+            // start (see main.rs) — every scope would look foreign, so don't
+            // use ownership as a signal at all.
+            let reason = if !node_id.is_empty() && p.scope.node_id != node_id {
+                format!(
+                    "finding belongs to node {}, which this node is not — nothing here can re-evaluate it",
+                    p.scope.node_id,
+                )
+            } else {
+                let last_alive = p.last_checked_at.unwrap_or(p.updated_at).max(p.updated_at);
+                if last_alive >= cutoff { continue; }
+                // Worded as the inference it is: the fuse concludes the
+                // resource is gone, it doesn't observe it. The immediate path
+                // (`resolve_vanished`) is the one with proof.
+                format!(
+                    "nothing has evaluated this finding since {}, past the {}-day fuse — \
+                     treating the resource it refers to as gone",
+                    last_alive.format("%Y-%m-%d %H:%M UTC"), fuse_days,
+                )
+            };
+            p.status = ProposalStatus::Approved {
+                applied_at: now,
+                outcome: ApprovalOutcome::ResourceGone { reason },
+            };
+            p.updated_at = now;
+            count += 1;
+        }
+        count
+    }
+
+    /// Resolve pending findings whose resource an analyzer has positively
+    /// established is gone — see [`vanished_scopes`], which computes the list
+    /// and owns the "positively" part.
+    ///
+    /// Separate from `auto_resolve_cleared` because the two say different
+    /// things: that one means "the analyzer looked and the problem is no
+    /// longer there" (`ConditionCleared`), this one means "there is nothing
+    /// left to look at" (`ResourceGone`). Routing these through the covered
+    /// set would have recorded the wrong one, and would also have stamped
+    /// `last_checked_at` on scopes nothing checked.
+    ///
+    /// Returns the number resolved.
+    pub fn resolve_vanished(&mut self, vanished: &[(String, ProposalScope)]) -> usize {
+        if vanished.is_empty() { return 0; }
+        let now = Utc::now();
+        let mut count = 0;
+        for p in &mut self.proposals {
+            if !matches!(p.status, ProposalStatus::Pending) { continue; }
+            if !vanished.iter().any(|(ft, sc)| ft == &p.finding_type && sc == &p.scope) {
+                continue;
+            }
+            p.status = ProposalStatus::Approved {
+                applied_at: now,
+                outcome: ApprovalOutcome::ResourceGone {
+                    reason: "the resource this finding is about is no longer present \
+                             on this node".to_string(),
+                },
+            };
+            p.updated_at = now;
+            count += 1;
         }
         count
     }
@@ -832,5 +995,178 @@ mod tests {
         assert_eq!(s.approved, 1);
         assert_eq!(s.pending, 1);
         assert_eq!(s.dismiss_reasons, vec!["false positive".to_string()]);
+    }
+    // ── Orphan sweep (klas 2026-09-09: findings for a node long gone) ──
+
+    /// Backdate a proposal's liveness stamps so the fuse can be exercised
+    /// without sleeping the suite.
+    fn backdate(store: &mut ProposalStore, idx: usize, days: i64) {
+        let then = Utc::now() - Duration::days(days);
+        store.proposals[idx].updated_at = then;
+        store.proposals[idx].last_checked_at = Some(then);
+    }
+
+    #[test]
+    fn orphan_sweep_resolves_a_finding_no_analyzer_still_evaluates() {
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal(
+            "wolfnet_peer_unreachable", Severity::High,
+            scope("n", Some("wolfnet-peer:10.100.10.30")),
+        ));
+        backdate(&mut store, 0, ORPHAN_FUSE_DAYS + 1);
+
+        assert_eq!(store.resolve_orphaned("n", ORPHAN_FUSE_DAYS), 1);
+        match &store.proposals[0].status {
+            ProposalStatus::Approved { outcome: ApprovalOutcome::ResourceGone { reason }, .. } => {
+                assert!(reason.contains("fuse"), "reason was: {}", reason);
+            }
+            other => panic!("expected ResourceGone, got {:?}", other),
+        }
+        assert!(store.inbox().is_empty(), "a resolved orphan leaves the inbox");
+    }
+
+    #[test]
+    fn orphan_sweep_spares_a_finding_still_being_checked() {
+        // The whole safety property: a data source that is merely quiet still
+        // COVERS its scopes, so `touch_checked` keeps the stamp fresh and the
+        // fuse must never fire.
+        let mut store = ProposalStore::default();
+        let s = scope("n", Some("/var"));
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Critical, s.clone()));
+        backdate(&mut store, 0, ORPHAN_FUSE_DAYS + 30);
+        store.touch_checked(&[("disk_fill_eta".to_string(), s.clone())]);
+
+        assert_eq!(store.resolve_orphaned("n", ORPHAN_FUSE_DAYS), 0);
+        assert!(matches!(store.proposals[0].status, ProposalStatus::Pending));
+    }
+
+    #[test]
+    fn orphan_sweep_spares_a_still_firing_finding_with_no_check_stamp() {
+        // Proposals written before `last_checked_at` existed deserialise with
+        // None. A standing condition still re-stamps `updated_at` on every
+        // upsert, so that alone must keep it alive.
+        let mut store = ProposalStore::default();
+        let s = scope("n", Some("/var"));
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Critical, s.clone()));
+        backdate(&mut store, 0, ORPHAN_FUSE_DAYS + 5);
+        store.proposals[0].last_checked_at = None;
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Critical, s.clone()));
+
+        assert_eq!(store.resolve_orphaned("n", ORPHAN_FUSE_DAYS), 0);
+        assert!(matches!(store.proposals[0].status, ProposalStatus::Pending));
+    }
+
+    #[test]
+    fn orphan_sweep_resolves_a_foreign_scope_immediately() {
+        // A rebuilt node gets a new node_id; the findings the old identity
+        // left behind can never be covered again, so they don't wait the fuse.
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal(
+            "host_cpu_high", Severity::Critical, scope("ws-oldnode", Some("host")),
+        ));
+        assert_eq!(store.resolve_orphaned("ws-newnode", ORPHAN_FUSE_DAYS), 1);
+        match &store.proposals[0].status {
+            ProposalStatus::Approved { outcome: ApprovalOutcome::ResourceGone { reason }, .. } => {
+                assert!(reason.contains("ws-oldnode"), "reason was: {}", reason);
+            }
+            other => panic!("expected ResourceGone, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_foreign_scopes_when_identity_is_unknown() {
+        // Empty node_id = we couldn't establish an identity this start. Every
+        // scope would look foreign; resolving them all would wipe the inbox.
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal(
+            "host_cpu_high", Severity::Critical, scope("ws-real", Some("host")),
+        ));
+        assert_eq!(store.resolve_orphaned("", ORPHAN_FUSE_DAYS), 0);
+        assert!(matches!(store.proposals[0].status, ProposalStatus::Pending));
+    }
+
+    #[test]
+    fn orphan_sweep_leaves_operator_decisions_alone() {
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal("d", Severity::Warn, scope("n", Some("/a"))));
+        store.upsert(fake_proposal("d", Severity::Warn, scope("n", Some("/b"))));
+        backdate(&mut store, 0, ORPHAN_FUSE_DAYS + 1);
+        backdate(&mut store, 1, ORPHAN_FUSE_DAYS + 1);
+        let snoozed = store.proposals[0].id.clone();
+        let dismissed = store.proposals[1].id.clone();
+        store.snooze(&snoozed, Utc::now() + Duration::hours(4)).unwrap();
+        store.dismiss(&dismissed, "not a real issue").unwrap();
+
+        assert_eq!(store.resolve_orphaned("n", ORPHAN_FUSE_DAYS), 0);
+    }
+
+    #[test]
+    fn a_resolved_orphan_re_surfaces_if_the_resource_returns() {
+        // Self-correction: being wrong costs one re-notification, not a lost
+        // finding. `ResourceGone` must carry no suppression grace.
+        let mut store = ProposalStore::default();
+        let s = scope("n", Some("wolfnet-peer:10.100.10.30"));
+        store.upsert(fake_proposal("wolfnet_peer_unreachable", Severity::High, s.clone()));
+        backdate(&mut store, 0, ORPHAN_FUSE_DAYS + 1);
+        assert_eq!(store.resolve_orphaned("n", ORPHAN_FUSE_DAYS), 1);
+
+        assert!(!store.is_suppressed("wolfnet_peer_unreachable", &s));
+        store.upsert(fake_proposal("wolfnet_peer_unreachable", Severity::High, s.clone()));
+        assert!(matches!(store.proposals[0].status, ProposalStatus::Pending));
+        assert_eq!(store.proposals.len(), 1, "re-emission must not duplicate the entry");
+    }
+
+    #[test]
+    fn vanished_resource_is_covered_so_it_resolves_this_tick() {
+        // A peer deleted from /etc/wolfnet/config.toml: the enumeration
+        // succeeded and no longer lists it, so it clears now rather than
+        // waiting out the fuse.
+        let mut store = ProposalStore::default();
+        let gone = scope("n", Some("wolfnet-peer:10.100.10.30"));
+        let live = scope("n", Some("wolfnet-peer:10.100.10.31"));
+        store.upsert(fake_proposal("wolfnet_peer_unreachable", Severity::High, gone.clone()));
+        store.upsert(fake_proposal("wolfnet_peer_unreachable", Severity::High, live.clone()));
+
+        let covered = vec![("wolfnet_peer_unreachable".to_string(), live.clone())];
+        let vanished = vanished_scopes(
+            &["wolfnet_peer_unreachable"], true, &covered, &store, "n",
+        );
+        assert_eq!(vanished, vec![("wolfnet_peer_unreachable".to_string(), gone.clone())]);
+
+        assert_eq!(store.resolve_vanished(&vanished), 1);
+        let g = store.proposals.iter().find(|p| p.scope == gone).unwrap();
+        match &g.status {
+            ProposalStatus::Approved { outcome: ApprovalOutcome::ResourceGone { .. }, .. } => {}
+            other => panic!("a vanished resource must not read as condition_cleared: {:?}", other),
+        }
+        // The peer that IS still configured stays open — it's covered, so the
+        // normal auto-resolve path owns it.
+        let l = store.proposals.iter().find(|p| p.scope == live).unwrap();
+        assert!(matches!(l.status, ProposalStatus::Pending));
+    }
+
+    #[test]
+    fn a_failed_enumeration_covers_nothing() {
+        // `scanned == false` (config unreadable, systemctl absent, docker
+        // socket down) must never be treated as "the resource is gone".
+        let mut store = ProposalStore::default();
+        let s = scope("n", Some("wolfnet-peer:10.100.10.30"));
+        store.upsert(fake_proposal("wolfnet_peer_unreachable", Severity::High, s));
+        assert!(vanished_scopes(
+            &["wolfnet_peer_unreachable"], false, &[], &store, "n",
+        ).is_empty());
+    }
+
+    #[test]
+    fn vanished_coverage_ignores_other_finding_types_and_other_nodes() {
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Warn, scope("n", Some("/var"))));
+        store.upsert(fake_proposal(
+            "wolfnet_peer_unreachable", Severity::High,
+            scope("other-node", Some("wolfnet-peer:10.0.0.9")),
+        ));
+        assert!(vanished_scopes(
+            &["wolfnet_peer_unreachable"], true, &[], &store, "n",
+        ).is_empty());
     }
 }

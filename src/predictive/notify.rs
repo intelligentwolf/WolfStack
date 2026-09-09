@@ -67,7 +67,10 @@ pub fn find_first_appearance_alerts<'a>(
 pub fn dispatch_alerts(proposals: Vec<Proposal>) {
     if proposals.is_empty() { return; }
     let cfg = crate::alerting::AlertConfig::load();
-    if !cfg.enabled || !cfg.has_channels() {
+    // `has_delivery` covers email as well as the push channels: `send_local_alert`
+    // below fans out to both, so gating on push alone silently dropped every
+    // predictive page for an operator whose only delivery path is email.
+    if !cfg.enabled || !cfg.has_delivery() {
         // Operator hasn't configured notifications — inbox only.
         // This is the common case and shouldn't log noise.
         return;
