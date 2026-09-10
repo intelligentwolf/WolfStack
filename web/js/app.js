@@ -28239,6 +28239,14 @@ function renderWolfNetPage(wn, config, localInfo, fullStatus) {
     const connectedEl = document.getElementById('wn-connected-val');
     const totalPeersEl = document.getElementById('wn-total-peers-val');
 
+    // The Actions card's buttons are static HTML; they can only act on an
+    // installed WolfNet, so grey them out otherwise rather than let a click
+    // land on an error.
+    for (const id of ['wn-btn-start', 'wn-btn-restart', 'wn-btn-stop']) {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = !wn.installed;
+    }
+
     if (!wn.installed) {
         if (statusEl) statusEl.textContent = 'Not Installed';
         if (statusIcon) { statusIcon.style.background = 'var(--danger-bg)'; statusIcon.style.color = 'var(--danger)'; }
@@ -28715,6 +28723,12 @@ async function saveWolfNetConfig() {
 }
 
 async function wolfnetServiceAction(action) {
+    // Hold every action button while one request is in flight: a stop or
+    // restart can take several seconds, and a second click racing the
+    // first is exactly what the server must not receive.
+    const buttons = ['wn-btn-start', 'wn-btn-restart', 'wn-btn-stop']
+        .map(id => document.getElementById(id)).filter(Boolean);
+    buttons.forEach(b => { b.disabled = true; });
     try {
         const resp = await fetch(apiUrl('/api/networking/wolfnet/action'), {
             method: 'POST',
@@ -28723,10 +28737,12 @@ async function wolfnetServiceAction(action) {
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || 'Failed');
-        showToast(`WolfNet ${action}: success`, 'success');
+        showToast(data.message || `WolfNet ${action}: success`, 'success');
         setTimeout(loadWolfNet, 2000);
     } catch (e) {
         showModal('WolfNet error: ' + e.message);
+    } finally {
+        buttons.forEach(b => { b.disabled = false; });
     }
 }
 
