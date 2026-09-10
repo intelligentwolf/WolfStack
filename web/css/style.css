@@ -5527,3 +5527,9 @@ body.learn-drawer-open #task-log-footer { right: var(--learn-drawer-w) !importan
     padding: 0; margin: -1px; overflow: hidden;
     clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
+
+/* Read-only (viewer-role) badge in the top bar. `display` lives here, not
+   inline, so the `hidden` attribute (UA rule, not !important) can still
+   hide it — an inline display would beat it and show the badge to admins. */
+#ws-readonly-badge { display: inline-flex; }
+#ws-readonly-badge[hidden] { display: none; }

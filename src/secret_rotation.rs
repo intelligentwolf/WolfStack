@@ -399,10 +399,14 @@ pub async fn api_rotate_propose(
     state: web::Data<crate::api::AppState>,
 ) -> HttpResponse {
     // Require session auth (operator); reject pure-cluster-secret callers.
+    // validate_info, not validate: these gates read the cookie directly
+    // instead of going through api::require_auth, so they must apply the
+    // read-only (viewer) refusal themselves.
     let cookie_user = match req.cookie("wolfstack_session")
-        .and_then(|c| state.sessions.validate(c.value()))
+        .and_then(|c| state.sessions.validate_info(c.value()))
     {
-        Some(u) => u,
+        Some(s) if s.read_only => return crate::api::read_only_forbidden("rotating the cluster secret"),
+        Some(s) => s.username,
         None => {
             return HttpResponse::Unauthorized().json(serde_json::json!({
                 "error": "secret rotation must be initiated by an operator session"
@@ -731,9 +735,10 @@ pub async fn api_coordinated_rotate(
     state: web::Data<crate::api::AppState>,
 ) -> HttpResponse {
     let operator = match req.cookie("wolfstack_session")
-        .and_then(|c| state.sessions.validate(c.value()))
+        .and_then(|c| state.sessions.validate_info(c.value()))
     {
-        Some(u) => u,
+        Some(s) if s.read_only => return crate::api::read_only_forbidden("rotating the cluster secret"),
+        Some(s) => s.username,
         None => {
             return HttpResponse::Unauthorized().json(serde_json::json!({
                 "error": "coordinated rotation must be initiated by an operator session"
@@ -1190,9 +1195,10 @@ pub async fn api_migrate_at_rest_credentials(
     state: web::Data<crate::api::AppState>,
 ) -> HttpResponse {
     let operator = match req.cookie("wolfstack_session")
-        .and_then(|c| state.sessions.validate(c.value()))
+        .and_then(|c| state.sessions.validate_info(c.value()))
     {
-        Some(u) => u,
+        Some(s) if s.read_only => return crate::api::read_only_forbidden("migrating at-rest credentials"),
+        Some(s) => s.username,
         None => return HttpResponse::Unauthorized().json(serde_json::json!({
             "error": "at-rest credential migration must be initiated by an operator session"
         })),
