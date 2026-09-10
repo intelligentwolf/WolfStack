@@ -6984,8 +6984,13 @@ pub async fn pve_test_connection(req: HttpRequest, state: web::Data<AppState>, p
 /// GET /api/components — status of all components on this node
 pub async fn get_components(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let status = installer::get_all_status();
-    HttpResponse::Ok().json(status)
+    // web::block: ~35 systemctl/which subprocesses per call.
+    match web::block(installer::get_all_status).await {
+        Ok(status) => HttpResponse::Ok().json(status),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("component status worker failed: {}", e)
+        })),
+    }
 }
 
 /// GET /api/components/{name}/detail — detailed component info with config and logs
@@ -7238,6 +7243,20 @@ pub async fn service_action(
             };
         }
         return HttpResponse::Ok().json(serde_json::json!({ "message": format!("wolfproxy stopped{}", note) }));
+    }
+
+    // WolfNet on Unraid has no systemd unit — the agent supervises the
+    // daemon, so the Components card's Start/Stop/Restart go to the same
+    // supervisor path the WolfNet page uses (klas, 2026-09-10).
+    if service == "wolfnet" && installer::unraid_tools::is_unraid() {
+        let action = body.action.clone();
+        return match web::block(move || networking::wolfnet_service_action(&action)).await {
+            Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+            Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("WolfNet action worker failed: {}", e)
+            })),
+        };
     }
 
     let result = match body.action.as_str() {
@@ -18671,7 +18690,14 @@ pub async fn net_set_dns(
 /// GET /api/networking/wolfnet — get WolfNet overlay status
 pub async fn net_get_wolfnet(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    HttpResponse::Ok().json(networking::get_wolfnet_status())
+    // web::block: systemctl subprocesses on systemd hosts, a /proc scan on
+    // Unraid — sync work either way.
+    match web::block(networking::get_wolfnet_status).await {
+        Ok(status) => HttpResponse::Ok().json(status),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("WolfNet status worker failed: {}", e)
+        })),
+    }
 }
 
 /// GET /api/networking/wolfnet/config — get raw WolfNet config
@@ -18856,9 +18882,16 @@ pub async fn net_wolfnet_action(req: HttpRequest, state: web::Data<AppState>, bo
     if !allowed.contains(&body.action.as_str()) {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid action"}));
     }
-    match networking::wolfnet_service_action(&body.action) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({"message": msg})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    // web::block: systemctl is a subprocess, and the Unraid supervisor path
+    // waits up to five seconds for a clean daemon exit on stop/restart —
+    // neither belongs on an actix worker thread.
+    let action = body.action.clone();
+    match web::block(move || networking::wolfnet_service_action(&action)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("WolfNet action worker failed: {}", e)
+        })),
     }
 }
 

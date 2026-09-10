@@ -4600,7 +4600,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                         restart_failed = true;
                                         let ai_suggestion = wolfnet_ai.analyze_issue(
                                             "WolfNet overlay network service is down and an automatic restart failed. \
-                                             The service did not come up after 'systemctl restart wolfnet'. \
+                                             The service did not come up after a WolfNet service restart. \
                                              What should the admin check and how can they fix this?"
                                         ).await.unwrap_or_default();
                                         let config = alerting::AlertConfig::load();
@@ -4637,8 +4637,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     restart_failed = true;
                                     let ai_suggestion = wolfnet_ai.analyze_issue(
                                         &format!(
-                                            "WolfNet overlay network service is down. The 'systemctl restart wolfnet' \
-                                             command failed with error: {}. What should the admin check?", e
+                                            "WolfNet overlay network service is down. The WolfNet service restart \
+                                             failed with error: {}. What should the admin check?", e
                                         )
                                     ).await.unwrap_or_default();
                                     let config = alerting::AlertConfig::load();

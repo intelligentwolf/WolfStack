@@ -706,25 +706,35 @@ pub fn get_wolfnet_status() -> WolfNetStatus {
         ip: None,
         peers: Vec::new(),
     };
-    // No systemd on this host → WolfNet service can't exist here.
-    let Some(systemctl) = systemctl_bin() else { return not_installed(); };
+    let (installed, running) = if crate::installer::unraid_tools::is_unraid() {
+        // Unraid has no systemd: the agent bundles and supervises the
+        // daemon itself (installer::unraid_tools), so ask the supervisor.
+        // Before this the page said "Not Installed" on every Unraid node
+        // while the daemon was running (klas, 2026-09-10).
+        crate::installer::unraid_tools::wolfnet_state()
+    } else {
+        // No systemd on this host → WolfNet service can't exist here.
+        let Some(systemctl) = systemctl_bin() else { return not_installed(); };
 
-    // Check if wolfnet service exists
-    let installed = Command::new(&systemctl)
-        .args(["cat", "wolfnet"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        // Check if wolfnet service exists
+        let installed = Command::new(&systemctl)
+            .args(["cat", "wolfnet"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let running = installed
+            && Command::new(&systemctl)
+                .args(["is-active", "wolfnet"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+                .unwrap_or(false);
+        (installed, running)
+    };
 
     if !installed {
         return not_installed();
     }
-
-    let running = Command::new(&systemctl)
-        .args(["is-active", "wolfnet"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false);
 
     // Try to get WolfNet IP from the tun interface
     let mut wn_interface = None;
@@ -2144,6 +2154,12 @@ fn reload_or_restart_wolfnet() {
 
 /// Restart or start WolfNet service
 pub fn wolfnet_service_action(action: &str) -> Result<String, String> {
+    // Unraid: no systemd, the agent is the supervisor — every verb has a
+    // supervisor equivalent there (klas, 2026-09-10: the WolfNet page's
+    // Start button answered "systemctl isn't available").
+    if crate::installer::unraid_tools::is_unraid() {
+        return crate::installer::unraid_tools::wolfnet_service_action(action);
+    }
     let systemctl = systemctl_bin().ok_or_else(|| {
         "systemd (systemctl) isn't available on this host, so the WolfNet \
          service can't be managed here.".to_string()

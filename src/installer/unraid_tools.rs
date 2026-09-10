@@ -19,7 +19,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 /// Tools we ensure: (binary name, release asset name). Unraid is x86_64-only
@@ -81,6 +81,14 @@ pub fn ensure_unraid_tools() {
     for (bin, asset) in TOOLS {
         ensure_tool(bin, asset, RELEASE_BASE);
     }
+    // The operator's "disable" is the systemd `is-enabled` equivalent: it
+    // decides whether the daemon comes up with the agent. Read it once here,
+    // before the first ensure, so a disabled node boots with WolfNet off
+    // exactly like a disabled unit would.
+    if wolfnet_disabled_marker().exists() {
+        WOLFNET_STOPPED.store(true, Ordering::Relaxed);
+        info!("unraid wolfnet: disabled by the operator ({}) — not starting the daemon", wolfnet_disabled_marker().display());
+    }
     ensure_unraid_wolfnet();
     // Supervision tick: Unraid has no systemd, so the agent keeps the
     // wolfnet daemon alive. 60s matches how fast a mesh outage becomes
@@ -102,12 +110,38 @@ pub fn ensure_unraid_wolfnet() {
     if !is_unraid() || std::env::consts::ARCH != "x86_64" {
         return;
     }
+    let _serial = wolfnet_control_lock();
+    ensure_unraid_wolfnet_locked();
+}
+
+/// The ensure pass proper. Caller MUST hold `wolfnet_control_lock()`:
+/// the spawn decision in `start_wolfnet_if_configured` is three separate
+/// checks, and only this lock makes them one atomic decision between the
+/// supervision tick and an operator's Start/Restart.
+fn ensure_unraid_wolfnet_locked() {
     for (bin, asset) in WOLFNET_TOOLS {
         ensure_tool(bin, asset, WOLFNET_RELEASE_BASE);
     }
     persist_wolfnet_etc();
     generate_wolfnet_config_if_missing();
     start_wolfnet_if_configured();
+}
+
+/// Serialises everything that may spawn, signal or reap the wolfnet
+/// daemon: the 60 s supervision tick and every operator action. Without
+/// it two Restart clicks (each on its own web::block thread) or a Start
+/// racing the tick could both pass the "not running" checks and spawn
+/// twice, or one could reap-and-respawn while the other was still
+/// waiting on the old daemon and then `wait()` on the NEW one forever
+/// (review finding, 2026-09-10). Never held across an await; held for
+/// the length of one ensure pass or one action, which may include the
+/// five-second stop grace.
+fn wolfnet_control_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match LOCK.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
 }
 
 // ─── First-run WolfNet configuration ─────────────────────────────────
@@ -396,6 +430,11 @@ fn start_wolfnet_if_configured() {
     if !Path::new(WOLFNET_APPDATA).join("config.toml").exists() {
         return; // not configured — nothing to run
     }
+    // The operator pressed Stop (or the node is disabled): the supervisor
+    // must not undo that on its next tick. Cleared by Start/Restart.
+    if WOLFNET_STOPPED.load(Ordering::Relaxed) {
+        return;
+    }
     // 1. A daemon WE started and that is still alive is authoritative —
     //    no probe involved. This is the check that makes a spawn storm
     //    impossible.
@@ -516,17 +555,283 @@ fn now_secs() -> u64 {
 /// Runs once per supervision tick (60s), so this is not a hot scan —
 /// see tests/resource_safety.rs for the scans that must stay cached.
 fn wolfnet_running_externally() -> Option<bool> {
+    wolfnet_pids().map(|pids| !pids.is_empty())
+}
+
+/// Every `wolfnet` daemon PID on the host, from `/proc/<pid>/comm` (the
+/// same probe as `wolfnet_running_externally`, which is defined on top of
+/// this). `None` means /proc could not be read at all — "couldn't tell".
+/// The agent's own PID is never `wolfnet`, so this never lists ourselves.
+fn wolfnet_pids() -> Option<Vec<u32>> {
     let entries = std::fs::read_dir("/proc").ok()?;
+    let mut pids = Vec::new();
     for ent in entries.flatten() {
         let name = ent.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
         // A process can exit mid-scan; a missing comm is not an error.
         if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid))
             && comm.trim() == "wolfnet" {
-                return Some(true);
+                pids.push(pid);
             }
     }
-    Some(false)
+    Some(pids)
+}
+
+// ─── Operator service control (the systemctl stand-in) ───────────────
+//
+// On every other platform WolfStack drives WolfNet through systemd:
+// `systemctl start|stop|restart|enable|disable wolfnet`
+// (src/networking/mod.rs `wolfnet_service_action`). Unraid has no systemd
+// and this agent IS the supervisor, so the WolfNet page's Start/Stop/
+// Restart buttons landed on "systemd (systemctl) isn't available on this
+// host" (klas, Unraid, 2026-09-10). These functions give each systemctl
+// verb its supervisor equivalent:
+//
+//   start    → clear the stop latch + backoff, run the ensure pass (which
+//              fetches, persists, configures and spawns), verify it lives
+//   stop     → set the stop latch (so the 60s tick does not undo it),
+//              SIGTERM the daemon, SIGKILL after a grace period
+//   restart  → stop without latching, then start
+//   enable   → remove the persisted disable marker
+//   disable  → write the persisted disable marker (honoured at the next
+//              agent start; like `systemctl disable`, it does not stop
+//              a running daemon)
+//
+// Like `systemctl stop`, the stop latch is process state: it lasts until
+// Start, an agent restart, or a reboot. Only Disable persists.
+
+/// Operator asked for the daemon to stay down (Stop, or a disabled node).
+static WOLFNET_STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// Persisted "do not start WolfNet with the agent" marker — lives on the
+/// array next to config.toml so it survives reboots, which RAM /etc and
+/// /var do not.
+fn wolfnet_disabled_marker() -> std::path::PathBuf {
+    Path::new(WOLFNET_APPDATA).join("disabled")
+}
+
+/// (installed, running) the way `get_wolfnet_status` reports it on a
+/// systemd host: installed = the bundled binary is present (the agent's
+/// equivalent of "the unit exists"), running = a daemon is alive — either
+/// the child this process owns or one started before an agent restart.
+pub fn wolfnet_state() -> (bool, bool) {
+    let installed = Path::new(LINK_DIR).join("wolfnet").exists()
+        || Path::new(TOOLS_DIR).join("wolfnet").exists();
+    (installed, wolfnet_daemon_running())
+}
+
+/// `systemctl is-enabled` equivalent: no persisted disable marker.
+pub fn wolfnet_enabled() -> bool {
+    !wolfnet_disabled_marker().exists()
+}
+
+/// Is any wolfnet daemon alive right now? Checks the owned child first
+/// (authoritative, and reaps it if it has exited), then the procfs scan.
+/// Uncertainty from the scan counts as "not running" HERE because this
+/// answers a status question, not a spawn decision — the spawn path keeps
+/// its own "never spawn on uncertainty" rule in `start_wolfnet_if_configured`.
+fn wolfnet_daemon_running() -> bool {
+    {
+        let mut owned = wolfnet_child();
+        if let Some(child) = owned.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return true,
+                Ok(Some(_)) => *owned = None,
+                Err(_) => {}
+            }
+        }
+    }
+    wolfnet_running_externally() == Some(true)
+}
+
+/// Start/stop/restart/enable/disable WolfNet on an Unraid node. Returns
+/// the operator-facing message on success. Errors when the host is not
+/// Unraid (callers dispatch on `is_unraid()` first), the verb is unknown,
+/// or the daemon does not come up.
+pub fn wolfnet_service_action(action: &str) -> Result<String, String> {
+    if !is_unraid() {
+        return Err("Not an Unraid host — WolfNet is managed through systemd here.".to_string());
+    }
+    let _serial = wolfnet_control_lock();
+    match action {
+        "start" => {
+            WOLFNET_STOPPED.store(false, Ordering::Relaxed);
+            if wolfnet_daemon_running() {
+                return Ok("WolfNet is already running".to_string());
+            }
+            start_wolfnet_now()?;
+            Ok("WolfNet started".to_string())
+        }
+        "stop" => {
+            WOLFNET_STOPPED.store(true, Ordering::Relaxed);
+            let stopped = stop_wolfnet_daemon()?;
+            Ok(if stopped == 0 {
+                "WolfNet was not running; the agent will keep it stopped until Start".to_string()
+            } else {
+                "WolfNet stopped; the agent will keep it stopped until Start (or a reboot — use Disable to keep it off)".to_string()
+            })
+        }
+        "restart" => {
+            WOLFNET_STOPPED.store(false, Ordering::Relaxed);
+            stop_wolfnet_daemon()?;
+            start_wolfnet_now()?;
+            Ok("WolfNet restarted".to_string())
+        }
+        "enable" => {
+            match std::fs::remove_file(wolfnet_disabled_marker()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Failed to enable WolfNet: {}", e)),
+            }
+            Ok("WolfNet enabled — it will start with the agent from its next start or a reboot; press Start to run it now".to_string())
+        }
+        "disable" => {
+            std::fs::write(
+                wolfnet_disabled_marker(),
+                concat!(
+                    "WolfStack: WolfNet will not be started with the agent while this file exists.\n",
+                    "Remove it, or press Enable on the WolfNet page.\n",
+                ),
+            )
+            .map_err(|e| format!("Failed to disable WolfNet: {}", e))?;
+            Ok("WolfNet disabled — it will not start with the agent (Stop it to bring it down now)".to_string())
+        }
+        other => Err(format!("Unknown WolfNet action: {}", other)),
+    }
+}
+
+/// Run the ensure pass immediately (ignoring any failure backoff — the
+/// operator asked) and confirm the daemon is alive half a second later,
+/// the same settle time `reload_or_restart_wolfnet` gives a SIGHUP.
+/// Caller holds `wolfnet_control_lock()`.
+fn start_wolfnet_now() -> Result<(), String> {
+    WOLFNET_RETRY_AFTER.store(0, Ordering::Relaxed);
+    WOLFNET_RETRY_BACKOFF.store(WOLFNET_RETRY_BASE_SECS, Ordering::Relaxed);
+    ensure_unraid_wolfnet_locked();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if wolfnet_daemon_running() {
+        return Ok(());
+    }
+    let config = Path::new(WOLFNET_APPDATA).join("config.toml");
+    if !Path::new(LINK_DIR).join("wolfnet").exists() {
+        return Err(format!(
+            "WolfNet binary is not installed and could not be downloaded to {} — check the agent log and the node's internet access",
+            TOOLS_DIR
+        ));
+    }
+    if !config.exists() {
+        return Err(format!(
+            "WolfNet has no configuration and the agent could not write one at {} — check the agent log",
+            config.display()
+        ));
+    }
+    Err(format!(
+        "WolfNet did not stay running — see {}/wolfnet.log",
+        WOLFNET_APPDATA
+    ))
+}
+
+/// SIGTERM every wolfnet daemon (the owned child and any external one),
+/// wait up to five seconds for a clean exit, SIGKILL whatever is left,
+/// and reap the owned child. Returns how many daemons were signalled.
+fn stop_wolfnet_daemon() -> Result<usize, String> {
+    let mut pids: Vec<u32> = Vec::new();
+    let mut owned_pid: Option<u32> = None;
+    {
+        let mut owned = wolfnet_child();
+        if let Some(child) = owned.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {
+                    owned_pid = Some(child.id());
+                    pids.push(child.id());
+                }
+                _ => *owned = None, // already gone — nothing to signal
+            }
+        }
+    }
+    match wolfnet_pids() {
+        Some(external) => {
+            for pid in external {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+        // /proc unreadable: we can still stop the daemon we own — its PID
+        // came from the Child handle, not from the scan.
+        None if owned_pid.is_some() => {
+            warn!("unraid wolfnet: cannot read /proc — stopping only the daemon this agent started");
+        }
+        None => return Err("cannot read /proc to find the WolfNet daemon".to_string()),
+    }
+    if pids.is_empty() {
+        return Ok(0);
+    }
+    for &pid in &pids {
+        // SAFETY: kill(2) with a PID we just read from /proc and a fixed
+        // signal has no memory-safety preconditions.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+    }
+    // Grace period: wolfnet tears down its TUN device and status file on
+    // SIGTERM; give it the time systemd's default stop would.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if pids.iter().all(|pid| !pid_is_live_wolfnet(*pid)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for &pid in &pids {
+        // Re-checked by name right before the kill: a PID that exited
+        // during the grace window and was recycled by something else
+        // must never be the one we SIGKILL.
+        if pid_is_live_wolfnet(pid) {
+            warn!("unraid wolfnet: pid {} ignored SIGTERM for 5s — sending SIGKILL", pid);
+            // SAFETY: as above.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+        }
+    }
+    // Reap the child WE signalled so it does not linger as a zombie and
+    // the next start does not see a stale handle. The slot is compared by
+    // PID: with the control lock held nobody can have replaced it, and
+    // the check keeps a mismatch from ever turning into a wait() on a
+    // live daemon.
+    {
+        let mut owned = wolfnet_child();
+        if let Some(child) = owned.as_mut()
+            && Some(child.id()) == owned_pid
+        {
+            let _ = child.wait();
+            *owned = None;
+        }
+    }
+    info!("unraid wolfnet: stopped {} daemon(s) on operator request", pids.len());
+    Ok(pids.len())
+}
+
+/// Is `pid` still a running (non-zombie) process whose comm is `wolfnet`?
+/// False for an exited PID, a reaped-and-recycled PID now belonging to
+/// something else, and an exited-but-unreaped zombie (only our own child
+/// can be one, and stop reaps it right after).
+fn pid_is_live_wolfnet(pid: u32) -> bool {
+    let is_wolfnet = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|c| c.trim() == "wolfnet")
+        .unwrap_or(false);
+    is_wolfnet && !zombie(pid)
+}
+
+/// An exited-but-unreaped process still has a /proc entry; treat it as
+/// gone for the purposes of the stop wait.
+fn zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid))
+        .map(|s| {
+            // "<pid> (<comm>) <state> ..." — comm may contain spaces, so
+            // take the field after the LAST ')'.
+            s.rsplit(')').next()
+                .map(|rest| rest.trim_start().starts_with('Z'))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 fn ensure_tool(bin: &str, asset: &str, base: &str) {
@@ -666,5 +971,66 @@ mod wolfnet_supervision_tests {
             ensure_unraid_wolfnet();
             assert!(wolfnet_child().is_none(), "no daemon may be owned on a non-Unraid host");
         }
+    }
+
+    #[test]
+    fn service_control_refuses_off_unraid() {
+        // The systemctl stand-in must never signal or spawn anything on a
+        // host that is not Unraid — callers dispatch on is_unraid() and
+        // this is the belt to that brace. Every verb, including unknown
+        // ones, is an Err there and leaves the stop latch untouched.
+        if !is_unraid() {
+            let before = WOLFNET_STOPPED.load(Ordering::Relaxed);
+            for verb in ["start", "stop", "restart", "enable", "disable", "bogus"] {
+                assert!(wolfnet_service_action(verb).is_err(), "{} must refuse off Unraid", verb);
+            }
+            assert_eq!(WOLFNET_STOPPED.load(Ordering::Relaxed), before);
+            assert!(wolfnet_child().is_none());
+        }
+    }
+
+    #[test]
+    fn kill_target_check_never_matches_a_foreign_process() {
+        // SIGKILL is only ever sent to a PID that is STILL a live wolfnet.
+        // This process is not wolfnet, and a PID that does not exist is
+        // not one either — both must read false, or a recycled PID could
+        // be killed.
+        assert!(!pid_is_live_wolfnet(std::process::id()));
+        assert!(!pid_is_live_wolfnet(u32::MAX));
+        if let Some(p) = wolfnet_pids() {
+            assert!(!p.contains(&std::process::id()), "the agent itself is never a wolfnet daemon");
+        }
+    }
+
+    #[test]
+    fn control_lock_is_not_reentrant_by_construction() {
+        // ensure_unraid_wolfnet() takes the lock and calls the _locked
+        // variant; wolfnet_service_action takes it and calls the _locked
+        // variant too. Re-entering through the public fn from inside an
+        // action would self-deadlock (std::sync::Mutex), so the only
+        // legal pattern is take → drop → take again, in sequence. This
+        // pins that the guard type is a plain droppable MutexGuard.
+        let g = wolfnet_control_lock();
+        drop(g);
+        let _g2 = wolfnet_control_lock();
+    }
+
+    #[test]
+    fn zombie_parser_reads_state_after_last_paren() {
+        // /proc/<pid>/stat: "<pid> (<comm>) <state> ..." — comm can hold
+        // spaces and parentheses, so the state is after the LAST ')'.
+        // Our own process is alive, never a zombie.
+        assert!(!zombie(std::process::id()));
+        // A PID that does not exist is not a zombie either.
+        assert!(!zombie(u32::MAX));
+    }
+
+    #[test]
+    fn disabled_marker_lives_beside_the_config() {
+        // The marker must persist across reboots, so it has to be on the
+        // array with config.toml — not in RAM-backed /etc or /var.
+        let marker = wolfnet_disabled_marker();
+        assert_eq!(marker.parent().unwrap(), Path::new(WOLFNET_APPDATA));
+        assert!(WOLFNET_APPDATA.starts_with("/mnt/user/appdata/"));
     }
 }

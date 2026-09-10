@@ -488,7 +488,16 @@ pub fn get_component_version(component: Component) -> Option<String> {
 /// Get status of all components
 pub fn get_all_status() -> Vec<ComponentStatus> {
     Component::all().iter().map(|comp| {
-        let (installed, mut running, enabled) = check_service(comp.service_name());
+        // Unraid has no systemd; the agent bundles and supervises WolfNet
+        // itself, so the Components card asks the supervisor instead of a
+        // systemctl that is not there (klas, 2026-09-10).
+        let (installed, mut running, enabled) =
+            if matches!(comp, Component::WolfNet) && unraid_tools::is_unraid() {
+                let (installed, running) = unraid_tools::wolfnet_state();
+                (installed, running, unraid_tools::wolfnet_enabled())
+            } else {
+                check_service(comp.service_name())
+            };
         let bin_exists = binary_exists(comp.service_name());
         // WolfProxy daemonizes, so its unit can read "inactive" while a forked
         // worker is still serving — an orphan systemd lost track of. If a
