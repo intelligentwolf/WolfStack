@@ -812,8 +812,9 @@ pub fn detect_mysql_containers() -> Vec<serde_json::Value> {
 fn scan_wolfnet_mysql() -> Vec<(String, String)> {
     use std::net::{TcpStream, SocketAddr};
 
-    let prefix = match crate::containers::wolfnet_subnet_prefix() {
-        Some(p) => format!("{}.", p),
+    // The real WolfNet network, so a /16's other third octets are scanned too.
+    let net = match crate::containers::wolfnet_network() {
+        Some(n) => n,
         None => return vec![],
     };
 
@@ -829,7 +830,7 @@ fn scan_wolfnet_mysql() -> Vec<(String, String)> {
     let mut ips_to_scan: Vec<String> = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let ip = match line.split_whitespace().next() {
-            Some(ip) if ip.starts_with(&prefix) && !ip.contains('/') => ip,
+            Some(ip) if !ip.contains('/') && net.contains(ip) => ip,
             _ => continue,
         };
         if !ips_to_scan.contains(&ip.to_string()) {

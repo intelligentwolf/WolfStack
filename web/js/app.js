@@ -38346,21 +38346,73 @@ function renderEditFolderList() {
     const note = document.getElementById('schedule-folder-summary');
     if (!note || !_editFolderTargets) return;
     note.style.display = '';
-    const rows = _editFolderTargets.map((t, i) => `
-        <div style="display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid var(--border);">
-            <code style="flex:1; font-size:12px; color:var(--text-primary); overflow-wrap:anywhere;">${escapeHtml(t.system_path || t.name)}</code>
-            ${t.exclude_mounts && t.exclude_mounts.length ? `<span style="font-size:10px; color:var(--text-muted);">excludes: ${escapeHtml(t.exclude_mounts.join(', '))}</span>` : ''}
-            <button type="button" class="btn btn-sm btn-danger" style="font-size:11px; padding:1px 8px;"
-                onclick="removeEditFolderTarget(${i})" title="Remove this folder from the schedule">&times;</button>
-        </div>`).join('');
+    // Each folder's exclusions are an editable field, not a read-only note
+    // (Mancolt 2026-09-10: the only way to change an exclusion after
+    // creation was to recreate the whole schedule). Same comma-separated
+    // format as the create form's "Exclude sub-paths" field, and the
+    // backend applies the same rule (classify_folder_excludes): a path must
+    // be INSIDE its folder — absolute, or relative to it.
+    const rows = _editFolderTargets.map((t, i) => {
+        const folder = t.system_path || t.name || '';
+        const excl = Array.isArray(t.exclude_mounts) ? t.exclude_mounts.join(', ') : '';
+        return `
+        <div style="padding:6px 0; border-bottom:1px solid var(--border);">
+            <div style="display:flex; align-items:center; gap:8px;">
+                <code style="flex:1; font-size:12px; color:var(--text-primary); overflow-wrap:anywhere;">${escapeHtml(folder)}</code>
+                <button type="button" class="btn btn-sm btn-danger" style="font-size:11px; padding:1px 8px;"
+                    onclick="removeEditFolderTarget(${i})" title="Remove this folder from the schedule">&times;</button>
+            </div>
+            <input type="text" class="form-control" value="${escapeHtml(excl)}"
+                placeholder="Exclude sub-paths inside this folder (comma-separated), e.g. ${escapeHtml(folder.replace(/\/+$/, ''))}/cache, venv"
+                aria-label="Sub-paths excluded from ${escapeHtml(folder)}"
+                onchange="setEditFolderExcludes(${i}, this.value)"
+                style="margin-top:4px; font-size:11px; font-family:var(--font-mono);">
+        </div>`;
+    }).join('');
     note.innerHTML = `
         <div style="font-weight:600; font-size:12px; color:var(--text-primary); margin-bottom:4px;">Folders in this schedule</div>
         ${rows || '<div style="color:var(--danger); font-size:12px; padding:4px 0;">No folders left — add one below or the schedule cannot be saved.</div>'}
-        <div style="display:flex; gap:8px; margin-top:8px;">
-            <input type="text" class="form-control" id="edit-folder-add-path" placeholder="/absolute/path/to/add"
-                style="flex:1; font-size:12px;" aria-label="Folder path to add to this schedule">
-            <button type="button" class="btn btn-sm" onclick="addEditFolderTarget()">Add folder</button>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
+            <div style="display:flex; gap:8px;">
+                <input type="text" class="form-control" id="edit-folder-add-path" placeholder="/absolute/path/to/add"
+                    style="flex:1; font-size:12px;" aria-label="Folder path to add to this schedule">
+                <button type="button" class="btn btn-sm" onclick="addEditFolderTarget()">Add folder</button>
+            </div>
+            <input type="text" class="form-control" id="edit-folder-add-excludes"
+                placeholder="Optional: sub-paths of the new folder to exclude (comma-separated)"
+                aria-label="Sub-paths to exclude from the folder being added"
+                style="font-size:11px; font-family:var(--font-mono);">
         </div>`;
+}
+
+// Parse a comma-separated exclusion field — the same split the create form
+// uses in parseSystemFolderTargets, so both paths store identical values.
+function parseFolderExcludes(raw) {
+    return String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// Exclusions the backend will silently DROP: an absolute path that is not
+// under the folder (or is the folder itself). Mirrors folder_exclude_pattern
+// in src/backup/mod.rs — absolute excludes must start with "<folder>/";
+// relative ones are always taken as inside the folder.
+function folderExcludesOutside(folder, excludes) {
+    const src = String(folder || '').replace(/\/+$/, '');
+    if (!src) return [];
+    return excludes.filter(ex => {
+        const e = ex.replace(/\/+$/, '');
+        return e.startsWith('/') && (e === src || !e.startsWith(src + '/'));
+    });
+}
+
+function setEditFolderExcludes(index, raw) {
+    if (!_editFolderTargets || !_editFolderTargets[index]) return;
+    const t = _editFolderTargets[index];
+    const excludes = parseFolderExcludes(raw);
+    if (excludes.length) t.exclude_mounts = excludes; else delete t.exclude_mounts;
+    const outside = folderExcludesOutside(t.system_path || '', excludes);
+    if (outside.length) {
+        showToast(`These exclusions are not inside ${t.system_path} and will be ignored by the backup: ${outside.join(', ')}`, 'error');
+    }
 }
 
 function addEditFolderTarget() {
@@ -38374,11 +38426,21 @@ function addEditFolderTarget() {
         showToast('That folder is already in the schedule', 'error');
         return;
     }
-    _editFolderTargets.push({
+    const target = {
         type: 'systempath',
         name: path.split('/').filter(Boolean).pop() || 'folder',
         system_path: path,
-    });
+    };
+    const exclInput = document.getElementById('edit-folder-add-excludes');
+    const excludes = parseFolderExcludes(exclInput && exclInput.value);
+    if (excludes.length) {
+        target.exclude_mounts = excludes;
+        const outside = folderExcludesOutside(path, excludes);
+        if (outside.length) {
+            showToast(`These exclusions are not inside ${path} and will be ignored by the backup: ${outside.join(', ')}`, 'error');
+        }
+    }
+    _editFolderTargets.push(target);
     renderEditFolderList();
 }
 
