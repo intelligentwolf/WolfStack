@@ -2897,12 +2897,15 @@ impl VmManager {
                 let _ = Command::new("ip")
                     .args(["route", "del", &format!("{}/32", old)])
                     .output();
-                let parts: Vec<&str> = old.split('.').collect();
-                if parts.len() == 4 {
-                    let wn_subnet = format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]);
-                    let _ = Command::new("iptables")
-                        .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", old),
-                               "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+                // The rule may carry the real network or, if written by a
+                // version before v25.26.1 on a non-/24 WolfNet, the VM
+                // address's /24 — remove whichever exists.
+                if let Some(net) = crate::containers::wolfnet_network_or_slash24(old) {
+                    for wn_subnet in std::iter::once(net.cidr()).chain(net.legacy_slash24()) {
+                        let _ = Command::new("iptables")
+                            .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", old),
+                                   "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+                    }
                 }
             }
 
@@ -4138,13 +4141,14 @@ impl VmManager {
             let _ = Command::new("ip")
                 .args(["route", "del", &format!("{}/32", ip)])
                 .output();
-            // Remove the NAT MASQUERADE rule we added.
-            let parts: Vec<&str> = ip.split('.').collect();
-            if parts.len() == 4 {
-                let wn_subnet = format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]);
-                let _ = Command::new("iptables")
-                    .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", ip),
-                           "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+            // Remove the NAT MASQUERADE rule we added — in the real-network
+            // form, and in the /24 form versions before v25.26.1 wrote.
+            if let Some(net) = crate::containers::wolfnet_network_or_slash24(ip) {
+                for wn_subnet in std::iter::once(net.cidr()).chain(net.legacy_slash24()) {
+                    let _ = Command::new("iptables")
+                        .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", ip),
+                               "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+                }
             }
         }
 
@@ -4370,16 +4374,18 @@ impl VmManager {
         // Exclude WolfNet-destined traffic so the VM appears as its own WolfNet IP,
         // not the host's IP, when communicating with other WolfNet nodes.
         // Remove old overly-broad rule if it exists, then add the correct one.
-        let wn_subnet = {
-            let parts: Vec<&str> = wolfnet_ip.split('.').collect();
-            if parts.len() == 4 {
-                format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2])
-            } else {
-                crate::containers::wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
-            }
-        };
+        // The real WolfNet network, not the address's /24: on a wider
+        // WolfNet the /24 form masqueraded this VM towards every other
+        // third octet, so peers there saw the host's address, not the VM's.
+        let wn_net = crate::containers::wolfnet_network_or_slash24(wolfnet_ip);
+        let wn_subnet = wn_net.map(|n| n.cidr()).unwrap_or_default();
         let _ = Command::new("iptables")
             .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "-j", "MASQUERADE"]).output();
+        // ...and the /24 form a version before v25.26.1 left behind.
+        if let Some(legacy) = wn_net.and_then(|n| n.legacy_slash24()) {
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "!", "-d", &legacy, "-j", "MASQUERADE"]).output();
+        }
         if !wn_subnet.is_empty() {
             let check_nat = Command::new("iptables")
                 .args(["-t", "nat", "-C", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();

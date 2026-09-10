@@ -157,8 +157,20 @@ pub fn setup_wolfnet_forwarding() {
     // Containers without a WolfNet IP (using Docker IPs like 172.x) need source NAT
     // so remote peers can route replies back. Containers WITH WolfNet IPs are not
     // masqueraded — they keep their WolfNet IP as source.
-    if let Some(pfx) = wolfnet_subnet_prefix() {
-        let wn_subnet = format!("{}.0/24", pfx);
+    if let Some(net) = wolfnet_network() {
+        let wn_subnet = net.cidr();
+        // Versions before v25.26.1 wrote this rule with the node's /24.
+        // On a wider WolfNet that rule MASQUERADEs every workload outside
+        // the node's own third octet (klas: 10.100.20.x containers left
+        // the node as 10.100.10.20), and because it precedes the corrected
+        // rule it keeps doing so until removed.
+        if let Some(legacy) = net.legacy_slash24() {
+            let _ = Command::new("iptables").args([
+                "-t", "nat", "-D", "POSTROUTING",
+                "!", "-s", &legacy, "-o", "wolfnet0",
+                "-j", "MASQUERADE"
+            ]).output();
+        }
         let check = Command::new("iptables").args([
             "-t", "nat", "-C", "POSTROUTING",
             "!", "-s", &wn_subnet, "-o", "wolfnet0",
@@ -1396,8 +1408,9 @@ const WOLFNET_CT_COMMENT: &str = "wolfstack-wolfnet-container";
 
 /// For an `iptables -S` line, return the DNAT destination-match IP (the `-d`
 /// address) IFF the line is a container→WolfNet exposure DNAT rule we own.
-/// Ownership signature: it is a DNAT whose `-d` is a WolfNet IP (starts with
-/// `wolfnet_prefix`, e.g. `"10.10.10."`) and whose `--to-destination` is a
+/// Ownership signature: it is a DNAT whose `-d` is a WolfNet IP (inside
+/// `net`, the real network — not a three-octet prefix, see `WolfNetNetwork`)
+/// and whose `--to-destination` is a
 /// container bridge IP OUTSIDE the WolfNet subnet. That last condition is what
 /// separates our rules from an `IpMapping` DNAT (`public_ip → wolfnet_ip`,
 /// where `--to` IS inside WolfNet), so we can never sweep a legitimate IP
@@ -1405,14 +1418,14 @@ const WOLFNET_CT_COMMENT: &str = "wolfstack-wolfnet-container";
 /// vip-map and standard ip-map comment tags are also excluded defensively.
 /// Returns the bare `-d` IP without the `/32`. Pure — unit-tested — so the
 /// accumulation/orphan matching can't regress.
-fn container_dnat_dst_ip(line: &str, wolfnet_prefix: &str) -> Option<String> {
-    container_dnat_rule_parts(line, wolfnet_prefix).map(|(dip, _)| dip)
+fn container_dnat_dst_ip(line: &str, net: &WolfNetNetwork) -> Option<String> {
+    container_dnat_rule_parts(line, net).map(|(dip, _)| dip)
 }
 
 /// Both halves of a container→WolfNet DNAT rule: `(wolfnet_ip, bridge_ip)`.
 /// Same shape test as `container_dnat_dst_ip` — which is now a thin wrapper,
 /// so the "which rules are ours" rule lives in exactly one place.
-fn container_dnat_rule_parts(line: &str, wolfnet_prefix: &str) -> Option<(String, String)> {
+fn container_dnat_rule_parts(line: &str, net: &WolfNetNetwork) -> Option<(String, String)> {
     if !line.contains("DNAT")
         || line.contains("wolfstack-vip-map")
         || line.contains("wolfstack-ip-map")
@@ -1424,12 +1437,12 @@ fn container_dnat_rule_parts(line: &str, wolfnet_prefix: &str) -> Option<(String
     if line[..dpos].ends_with('!') { return None; }
     let dcidr = line[dpos + 4..].split_whitespace().next()?;
     let dip = dcidr.split('/').next()?;
-    if !dip.starts_with(wolfnet_prefix) { return None; }
+    if !net.contains(dip) { return None; }
     // --to-destination must be a bridge IP OUTSIDE the WolfNet subnet.
     let tpos = line.find("--to-destination ")?;
     let tdest = line[tpos + 17..].split_whitespace().next()?;
     let tip = tdest.split(':').next()?; // strip :port if present
-    if tip.starts_with(wolfnet_prefix) { return None; }
+    if net.contains(tip) { return None; }
     Some((dip.to_string(), tip.to_string()))
 }
 
@@ -1502,14 +1515,14 @@ fn stopped_dnat_is_misdirected(
 
 /// Every `(wolfnet_ip, bridge_ip)` pair our container DNAT rules carry,
 /// from one listing per chain.
-fn container_dnat_pairs(wolfnet_prefix: &str) -> Vec<(String, String)> {
+fn container_dnat_pairs(net: &WolfNetNetwork) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for chain in ["PREROUTING", "OUTPUT"] {
         if let Ok(o) = Command::new("iptables").args(["-t", "nat", "-S", chain]).output()
             && o.status.success()
         {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
-                if let Some(p) = container_dnat_rule_parts(line, wolfnet_prefix) {
+                if let Some(p) = container_dnat_rule_parts(line, net) {
                     out.push(p);
                 }
             }
@@ -1522,9 +1535,9 @@ fn container_dnat_pairs(wolfnet_prefix: &str) -> Vec<(String, String)> {
 /// different WolfNet IP than `keep_ip`. Called when a container starts
 /// and takes a bridge address: that is the exact moment a stopped
 /// container's leftover rule stops being harmless.
-fn purge_foreign_dnat_pointing_at(addr: &str, keep_ip: &str, wolfnet_prefix: &str) {
-    if addr.is_empty() || wolfnet_prefix.is_empty() { return; }
-    let stale: std::collections::BTreeSet<String> = container_dnat_pairs(wolfnet_prefix)
+fn purge_foreign_dnat_pointing_at(addr: &str, keep_ip: &str, net: &WolfNetNetwork) {
+    if addr.is_empty() { return; }
+    let stale: std::collections::BTreeSet<String> = container_dnat_pairs(net)
         .into_iter()
         .filter(|(wn, target)| target == addr && wn != keep_ip)
         .map(|(wn, _)| wn)
@@ -1532,7 +1545,7 @@ fn purge_foreign_dnat_pointing_at(addr: &str, keep_ip: &str, wolfnet_prefix: &st
     for wn in stale {
         warn!("WolfNet: {} now holds bridge address {}; dropping the stale DNAT that still sent {} there", keep_ip, addr, wn);
         for chain in ["PREROUTING", "OUTPUT"] {
-            purge_container_dnat_for_ip(chain, &wn, wolfnet_prefix);
+            purge_container_dnat_for_ip(chain, &wn, net);
         }
     }
 }
@@ -1543,7 +1556,7 @@ mod container_dnat_ownership_tests {
 
     #[test]
     fn rule_parts_returns_both_halves_and_ignores_foreign_rules() {
-        let p = "10.10.10.";
+        let p = &WolfNetNetwork::parse("10.10.10.1/24").unwrap();
         assert_eq!(
             container_dnat_rule_parts(
                 "-A PREROUTING -d 10.10.10.150/32 -j DNAT --to-destination 172.18.0.5 -m comment --comment wolfstack-wolfnet-container", p),
@@ -1585,25 +1598,65 @@ mod container_dnat_ownership_tests {
     }
 }
 
+/// Pure: is `chain`'s listing (`iptables -t nat -S <chain>` lines) already
+/// exactly right for `label` — ONE rule of ours for that WolfNet IP, tagged,
+/// pointing at `docker_ip` — so the reconcile has nothing to do?
+///
+/// "The correct rule exists" used to be tested with `iptables -C` and was
+/// taken as steady state. It is not: a stale rule for the same WolfNet IP
+/// that sits AHEAD of the correct one is the rule iptables applies, and
+/// the -C check could not see it. klas's paperless container had three
+/// (→ .5, → .6, → .4; only .6 was current) and the first one won — the
+/// WolfNet IP answered ping from the wrong container and refused port
+/// 8000. Steady state is exactly one rule, and it is the right one.
+fn chain_dnat_is_exactly<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    label: &str,
+    docker_ip: &str,
+    net: &WolfNetNetwork,
+) -> bool {
+    let mut ours = 0usize;
+    let mut correct = false;
+    for line in lines {
+        let Some((wn, target)) = container_dnat_rule_parts(line, net) else { continue };
+        if wn != label { continue; }
+        ours += 1;
+        if target == docker_ip && line.contains(WOLFNET_CT_COMMENT) {
+            correct = true;
+        }
+    }
+    ours == 1 && correct
+}
+
 /// DNAT WolfNet IP → the container's CURRENT Docker IP, on both PREROUTING
-/// (host-forwarded) and OUTPUT (host-local). Idempotent via -C: steady
-/// state makes NO change, so there is no reachability gap on the
-/// reconcile tick. Only when the correct tagged rule is absent (fresh, or
-/// the container was redeployed onto a new Docker IP) do we first purge
-/// EVERY DNAT for this WolfNet IP — clearing stale rules that point at a
-/// previous Docker IP (the accumulation Gary hit: 10.10.10.3 → .2/.3/.4)
-/// plus any legacy comment-less rule — then add the fresh, tagged one.
+/// (host-forwarded) and OUTPUT (host-local). Idempotent: when the chain
+/// already holds exactly one rule for this WolfNet IP and it is the
+/// correct tagged one (`chain_dnat_is_exactly`), NO change is made, so
+/// there is no reachability gap on the reconcile tick. Otherwise — fresh
+/// container, redeployed onto a new Docker IP, or stale rules for this IP
+/// still present from earlier deployments (the accumulation Gary hit:
+/// 10.10.10.3 → .2/.3/.4, and klas's 10.100.20.1 → .5/.6/.4 that the
+/// three-octet prefix could not see) — purge EVERY DNAT for this WolfNet
+/// IP, legacy comment-less ones included, then add the fresh, tagged one.
 /// Called from the 60 s reconcile and, so a started container does not
 /// wait a tick for it, from docker_connect_wolfnet.
-fn ensure_container_dnat(label: &str, docker_ip: &str, prefix: &str) {
+fn ensure_container_dnat(label: &str, docker_ip: &str, net: &WolfNetNetwork) {
     for chain in ["PREROUTING", "OUTPUT"] {
-        let correct = Command::new("iptables").args([
-            "-t", "nat", "-C", chain, "-d", label,
-            "-j", "DNAT", "--to-destination", docker_ip,
-            "-m", "comment", "--comment", WOLFNET_CT_COMMENT,
-        ]).output().map(|o| o.status.success()).unwrap_or(false);
-        if correct { continue; }
-        purge_container_dnat_for_ip(chain, label, prefix);
+        let listing = Command::new("iptables").args(["-t", "nat", "-S", chain]).output();
+        if let Ok(o) = &listing && o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if chain_dnat_is_exactly(text.lines(), label, docker_ip, net) { continue; }
+            let stale: Vec<String> = text.lines()
+                .filter_map(|l| container_dnat_rule_parts(l, net))
+                .filter(|(wn, target)| wn == label && target != docker_ip)
+                .map(|(_, target)| target)
+                .collect();
+            if !stale.is_empty() {
+                warn!("WolfNet: {} DNAT for {} pointed at {} — replacing every rule for it with → {}",
+                    chain, label, stale.join(", "), docker_ip);
+            }
+        }
+        purge_container_dnat_for_ip(chain, label, net);
         let _ = Command::new("iptables").args([
             "-t", "nat", "-A", chain, "-d", label,
             "-j", "DNAT", "--to-destination", docker_ip,
@@ -1612,18 +1665,68 @@ fn ensure_container_dnat(label: &str, docker_ip: &str, prefix: &str) {
     }
 }
 
-/// The `10.10.10.` style prefix of a WolfNet IP, for the DNAT matchers.
-fn wolfnet_prefix_of(ip: &str) -> String {
-    ip.rsplit_once('.').map(|(p, _)| format!("{}.", p)).unwrap_or_default()
+#[cfg(test)]
+mod chain_dnat_steady_state_tests {
+    use super::*;
+
+    /// ninni's PREROUTING, verbatim from klas's 2026-09-10 diagnostic
+    /// (WolfNet 10.100.10.20/16). Three rules for 10.100.20.1; iptables
+    /// applied the first, → 192.168.12.5, a container with no :8000.
+    const KLAS: &str = "\
+-P PREROUTING ACCEPT
+-A PREROUTING -d 10.100.30.2/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 172.18.0.4
+-A PREROUTING -d 10.100.20.1/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 192.168.12.5
+-A PREROUTING -d 10.100.10.26/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 172.19.0.2
+-A PREROUTING -d 10.100.20.1/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 192.168.12.6
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A PREROUTING -d 10.100.20.1/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 192.168.12.4
+-A PREROUTING -d 10.100.10.24/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 192.168.5.4";
+
+    #[test]
+    fn klas_three_rules_are_not_steady_state_even_though_the_correct_one_exists() {
+        let net = WolfNetNetwork::parse("10.100.10.20/16").unwrap();
+        assert!(!chain_dnat_is_exactly(KLAS.lines(), "10.100.20.1", "192.168.12.6", &net));
+        // The single-rule neighbours ARE steady state.
+        assert!(chain_dnat_is_exactly(KLAS.lines(), "10.100.10.24", "192.168.5.4", &net));
+        assert!(chain_dnat_is_exactly(KLAS.lines(), "10.100.30.2", "172.18.0.4", &net));
+    }
+
+    /// The defect itself: with the old three-octet prefix of the NODE
+    /// (10.100.10.) none of the 10.100.20.1 rules were even recognised as
+    /// ours, so nothing could ever purge them.
+    #[test]
+    fn a_slash16_rule_is_ours_under_the_network_but_was_invisible_to_the_node_prefix() {
+        let net = WolfNetNetwork::parse("10.100.10.20/16").unwrap();
+        let line = "-A PREROUTING -d 10.100.20.1/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 192.168.12.5";
+        assert_eq!(container_dnat_rule_parts(line, &net),
+            Some(("10.100.20.1".into(), "192.168.12.5".into())));
+        assert!(!"10.100.20.1".starts_with("10.100.10."), "the old prefix test misses it");
+        let only_the_node_slash24 = WolfNetNetwork::parse("10.100.10.20/24").unwrap();
+        assert_eq!(container_dnat_rule_parts(line, &only_the_node_slash24), None,
+            "a genuine /24 network must still not claim addresses outside it");
+    }
+
+    #[test]
+    fn steady_state_needs_the_tag_and_the_current_target() {
+        let net = WolfNetNetwork::parse("10.10.10.1/24").unwrap();
+        let ok = ["-A OUTPUT -d 10.10.10.3/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 172.18.0.2"];
+        assert!(chain_dnat_is_exactly(ok, "10.10.10.3", "172.18.0.2", &net));
+        assert!(!chain_dnat_is_exactly(ok, "10.10.10.3", "172.18.0.9", &net), "redeployed onto a new address");
+        let untagged = ["-A OUTPUT -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.2"];
+        assert!(!chain_dnat_is_exactly(untagged, "10.10.10.3", "172.18.0.2", &net), "legacy rule gets re-tagged");
+        assert!(!chain_dnat_is_exactly(std::iter::empty(), "10.10.10.3", "172.18.0.2", &net));
+        // Another IP's rules never count towards this one.
+        let other = ["-A OUTPUT -d 10.10.10.4/32 -m comment --comment wolfstack-wolfnet-container -j DNAT --to-destination 172.18.0.2"];
+        assert!(!chain_dnat_is_exactly(other, "10.10.10.3", "172.18.0.2", &net));
+    }
 }
 
 /// Remove this WolfNet IP's container DNAT from both chains (container
 /// stopped or its IP changed).
 pub fn purge_container_dnat_for_wolfnet_ip(ip: &str) {
-    let prefix = wolfnet_prefix_of(ip);
-    if prefix.is_empty() { return; }
+    let Some(net) = wolfnet_network_or_slash24(ip) else { return };
     for chain in ["PREROUTING", "OUTPUT"] {
-        purge_container_dnat_for_ip(chain, ip, &prefix);
+        purge_container_dnat_for_ip(chain, ip, &net);
     }
 }
 
@@ -1633,14 +1736,14 @@ pub fn purge_container_dnat_for_wolfnet_ip(ip: &str) {
 /// nft-safe and position-independent. Used to clear stale/accumulated rules:
 /// a container's Docker IP changes on redeploy, so the old delete (keyed on
 /// the *current* Docker IP) left the previous rule behind and they piled up.
-fn purge_container_dnat_for_ip(chain: &str, ip: &str, wolfnet_prefix: &str) {
+fn purge_container_dnat_for_ip(chain: &str, ip: &str, net: &WolfNetNetwork) {
     let out = match Command::new("iptables").args(["-t", "nat", "-S", chain]).output() {
         Ok(o) if o.status.success() => o,
         _ => return,
     };
     let add_prefix = format!("-A {} ", chain);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if container_dnat_dst_ip(line, wolfnet_prefix).as_deref() != Some(ip) { continue; }
+        if container_dnat_dst_ip(line, net).as_deref() != Some(ip) { continue; }
         let spec = match line.strip_prefix(&add_prefix) { Some(s) => s, None => continue };
         let mut argv: Vec<&str> = vec!["-t", "nat", "-D", chain];
         argv.extend(spec.split_whitespace());
@@ -1732,23 +1835,23 @@ mod coalesced_probe_tests {
 
 #[cfg(test)]
 mod container_dnat_tests {
-    use super::container_dnat_dst_ip;
-    const P: &str = "10.10.10.";
+    use super::{container_dnat_dst_ip, WolfNetNetwork};
+    fn p() -> WolfNetNetwork { WolfNetNetwork::parse("10.10.10.1/24").unwrap() }
 
     #[test]
     fn matches_container_dnat_and_extracts_dst() {
         assert_eq!(
-            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.4", P),
+            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.4", &p()),
             Some("10.10.10.3".to_string()));
         assert_eq!(
-            container_dnat_dst_ip("-A OUTPUT -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.2 -m comment --comment wolfstack-wolfnet-container", P),
+            container_dnat_dst_ip("-A OUTPUT -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.2 -m comment --comment wolfstack-wolfnet-container", &p()),
             Some("10.10.10.3".to_string()));
     }
 
     #[test]
     fn does_not_confuse_similar_prefix_ips() {
         assert_eq!(
-            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.30/32 -j DNAT --to-destination 172.18.0.9", P),
+            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.30/32 -j DNAT --to-destination 172.18.0.9", &p()),
             Some("10.10.10.30".to_string()));
     }
 
@@ -1756,10 +1859,10 @@ mod container_dnat_tests {
     fn skips_vip_map_ip_map_and_non_dnat() {
         // WolfRun VIP-map LB rules are protected.
         assert_eq!(
-            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.3/32 -m statistic --mode nth --every 2 --packet 0 -j DNAT --to-destination 10.0.0.5 -m comment --comment wolfstack-vip-map-abc", P),
+            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.3/32 -m statistic --mode nth --every 2 --packet 0 -j DNAT --to-destination 10.0.0.5 -m comment --comment wolfstack-vip-map-abc", &p()),
             None);
-        assert_eq!(container_dnat_dst_ip("-A POSTROUTING ! -s 10.10.10.0/24 -o wolfnet0 -j MASQUERADE", P), None);
-        assert_eq!(container_dnat_dst_ip("-A FORWARD -d 10.10.10.3/32 -j ACCEPT", P), None);
+        assert_eq!(container_dnat_dst_ip("-A POSTROUTING ! -s 10.10.10.0/24 -o wolfnet0 -j MASQUERADE", &p()), None);
+        assert_eq!(container_dnat_dst_ip("-A FORWARD -d 10.10.10.3/32 -j ACCEPT", &p()), None);
     }
 
     #[test]
@@ -1767,11 +1870,11 @@ mod container_dnat_tests {
         // An IpMapping DNAT whose -d is (unusually) a WolfNet IP but whose
         // --to-destination is a WolfNet IP must NOT be treated as ours.
         assert_eq!(
-            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.3/32 -p tcp -m tcp --dport 80 -j DNAT --to-destination 10.10.10.50:80", P),
+            container_dnat_dst_ip("-A PREROUTING -d 10.10.10.3/32 -p tcp -m tcp --dport 80 -j DNAT --to-destination 10.10.10.50:80", &p()),
             None);
         // A negated -d is not a destination match.
         assert_eq!(
-            container_dnat_dst_ip("-A PREROUTING ! -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.4", P),
+            container_dnat_dst_ip("-A PREROUTING ! -d 10.10.10.3/32 -j DNAT --to-destination 172.18.0.4", &p()),
             None);
     }
 }
@@ -1779,8 +1882,11 @@ mod container_dnat_tests {
 pub fn cleanup_stale_wolfnet_routes() {
     let local_ips: std::collections::HashSet<String> = wolfnet_used_ips_cached().into_iter().collect();
 
-    let prefix = match wolfnet_subnet_prefix() {
-        Some(p) => format!("{}.", p),
+    // The REAL network (address + prefix length), not the node's first
+    // three octets: every membership test and every "WolfNet subnet" CIDR
+    // below is wrong on anything wider than a /24 otherwise (klas, /16).
+    let wn_net = match wolfnet_network() {
+        Some(n) => n,
         None => return, // WolfNet not configured
     };
 
@@ -1793,7 +1899,7 @@ pub fn cleanup_stale_wolfnet_routes() {
 
     for line in text.lines() {
         let ip = match line.split_whitespace().next() {
-            Some(ip) if ip.starts_with(&prefix) && !ip.contains('/') => ip,
+            Some(ip) if !ip.contains('/') && wn_net.contains(ip) => ip,
             _ => continue,
         };
 
@@ -1832,7 +1938,7 @@ pub fn cleanup_stale_wolfnet_routes() {
     // One listing per chain for the whole pass: the stopped-container
     // check below is then a lookup rather than two iptables invocations
     // per stopped container per tick.
-    let dnat_pairs = container_dnat_pairs(&prefix);
+    let dnat_pairs = container_dnat_pairs(&wn_net);
     // Built at most once per tick, and only if a stopped labelled
     // container actually has rules to judge.
     let mut addr_owners: Option<std::collections::HashMap<String, String>> = None;
@@ -1875,7 +1981,7 @@ pub fn cleanup_stale_wolfnet_routes() {
                     if stopped_dnat_is_misdirected(name, &targets, owners) {
                         warn!("WolfNet: {} is stopped and its DNAT for {} now points at an address another container holds; removing it", name, label);
                         for chain in ["PREROUTING", "OUTPUT"] {
-                            purge_container_dnat_for_ip(chain, &label, &prefix);
+                            purge_container_dnat_for_ip(chain, &label, &wn_net);
                         }
                     }
                 }
@@ -1910,7 +2016,7 @@ pub fn cleanup_stale_wolfnet_routes() {
 
             // Ensure container can route WolfNet subnet via its network's gateway
             // with src hint so the container uses its WolfNet IP as source
-            let wn_subnet = format!("{}.0/24", prefix.trim_end_matches('.'));
+            let wn_subnet = wn_net.cidr();
             let _ = Command::new("nsenter")
                 .args(["--target", &pid_out, "--net", "ip", "route", "replace", &wn_subnet, "via", &gw, "src", &label])
                 .output();
@@ -1929,7 +2035,7 @@ pub fn cleanup_stale_wolfnet_routes() {
                 // was rejected, so the container had NO DNAT at all.
                 let docker_ip = net.ip.clone();
                 if !docker_ip.is_empty() && docker_ip != label {
-                    ensure_container_dnat(&label, &docker_ip, &prefix);
+                    ensure_container_dnat(&label, &docker_ip, &wn_net);
                 }
             }
         }
@@ -1949,7 +2055,7 @@ pub fn cleanup_stale_wolfnet_routes() {
         for chain in ["PREROUTING", "OUTPUT"] {
             if let Ok(out) = Command::new("iptables").args(["-t", "nat", "-S", chain]).output() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Some(ip) = container_dnat_dst_ip(line, &prefix) {
+                    if let Some(ip) = container_dnat_dst_ip(line, &wn_net) {
                         present.insert(ip);
                     }
                 }
@@ -1957,8 +2063,8 @@ pub fn cleanup_stale_wolfnet_routes() {
         }
         for ip in present {
             if !claimed_ips.contains(&ip) {
-                purge_container_dnat_for_ip("PREROUTING", &ip, &prefix);
-                purge_container_dnat_for_ip("OUTPUT", &ip, &prefix);
+                purge_container_dnat_for_ip("PREROUTING", &ip, &wn_net);
+                purge_container_dnat_for_ip("OUTPUT", &ip, &wn_net);
             }
         }
     }
@@ -1996,7 +2102,7 @@ pub fn cleanup_stale_wolfnet_routes() {
 
             // Only act when the container's IP falls in WolfNet's range.
             // Other subnets aren't this loop's concern.
-            if !cip.starts_with(&prefix) { continue; }
+            if !wn_net.contains(&cip) { continue; }
             // Belt-and-braces: don't fight the labelled path if we
             // somehow disagree about what's a wolfnet IP.
             if local_ips.contains(&cip) { continue; }
@@ -2028,7 +2134,7 @@ pub fn cleanup_stale_wolfnet_routes() {
         // LXC has to sanitise its own.
         let Some(cip) = first_reportable_ip(&c.ip_address) else { continue };
         let cip = cip.as_str();
-        if !cip.starts_with(&prefix) { continue; }
+        if !wn_net.contains(cip) { continue; }
         if local_ips.contains(cip) { continue; }
         // The WolfNet-IP-labelled / lxcbr0 path is repaired elsewhere.
         if lxc_get_wolfnet_ip(&c.name).is_some() { continue; }
@@ -2052,7 +2158,7 @@ pub fn cleanup_stale_wolfnet_routes() {
         .args(["ps", "--format", "{{.Names}}"])
         .output()
     {
-        let wn_subnet = format!("{}.0/24", prefix.trim_end_matches('.'));
+        let wn_subnet = wn_net.cidr();
         let text = String::from_utf8_lossy(&output.stdout);
         for name in text.lines().filter(|l| !l.is_empty()) {
             let pid_out = Command::new("docker")
@@ -2100,9 +2206,145 @@ pub fn cleanup_stale_wolfnet_routes() {
 
 // ─── WolfNet Integration ───
 
-/// Detect the WolfNet subnet prefix (e.g. "10.100.10") from the live wolfnet0
-/// interface or /etc/wolfnet/config.toml.  Never hardcode "10.10.10" — users
-/// choose their own subnet when they set up WolfNet.
+/// The WolfNet network this node is on: its own address plus the prefix
+/// length wolfnet configured on wolfnet0 (`ip addr add <address>/<subnet>`
+/// in wolfnet's `tun.rs`). This — not the first three octets — is what
+/// decides whether an address is a WolfNet address.
+///
+/// WolfNet's default is a /24, and until v25.26.1 every membership test
+/// and every "the WolfNet subnet" CIDR in WolfStack was built from the
+/// node's first three octets. On a /16 (klas: nodes on 10.100.10.x,
+/// containers on 10.100.20.x/30.x) that made every 10.100.20.x DNAT rule
+/// invisible to the code that purges stale ones: each container
+/// recreation appended a fresh rule BEHIND the old one, iptables took the
+/// first match, and the WolfNet IP was delivered to whatever container now
+/// held the old bridge address — which answered ping and refused the port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WolfNetNetwork {
+    /// This node's own WolfNet address (host bits kept).
+    pub addr: std::net::Ipv4Addr,
+    /// Prefix length, 0..=32.
+    pub prefix: u8,
+}
+
+impl WolfNetNetwork {
+    /// Parse `"10.100.10.20/16"`. A bare address has no prefix and is
+    /// rejected — callers must never invent one.
+    pub fn parse(cidr: &str) -> Option<Self> {
+        let (a, p) = cidr.trim().split_once('/')?;
+        let addr: std::net::Ipv4Addr = a.parse().ok()?;
+        let prefix: u8 = p.parse().ok()?;
+        if prefix > 32 { return None; }
+        Some(Self { addr, prefix })
+    }
+
+    fn mask(&self) -> u32 {
+        if self.prefix == 0 { 0 } else { (!0u32).checked_shl(32 - self.prefix as u32).unwrap_or(0) }
+    }
+
+    /// Is `ip` (a bare dotted quad; anything else is "no") inside this network?
+    pub fn contains(&self, ip: &str) -> bool {
+        match ip.trim().parse::<std::net::Ipv4Addr>() {
+            Ok(a) => (u32::from(a) & self.mask()) == (u32::from(self.addr) & self.mask()),
+            Err(_) => false,
+        }
+    }
+
+    /// The network in CIDR form with host bits cleared: `"10.100.0.0/16"`.
+    pub fn cidr(&self) -> String {
+        let net = std::net::Ipv4Addr::from(u32::from(self.addr) & self.mask());
+        format!("{}/{}", net, self.prefix)
+    }
+
+    /// The `/24` CIDR older WolfStack versions wrote for this node
+    /// (`<first three octets>.0/24`), when it differs from the real
+    /// network. Used to remove the rules those versions left behind; None
+    /// on a /24, where the old and new forms are the same rule.
+    pub fn legacy_slash24(&self) -> Option<String> {
+        if self.prefix == 24 { return None; }
+        let o = self.addr.octets();
+        Some(format!("{}.{}.{}.0/24", o[0], o[1], o[2]))
+    }
+}
+
+/// This node's WolfNet network, from the live wolfnet0 address (which
+/// wolfnet writes as `<address>/<subnet>`), else from
+/// /etc/wolfnet/config.toml (`address` + `subnet`, default 24 exactly as
+/// wolfnet's own `default_subnet()`). None when WolfNet is not configured.
+pub fn wolfnet_network() -> Option<WolfNetNetwork> {
+    if let Ok(out) = Command::new("ip").args(["-4", "addr", "show", "wolfnet0"]).output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(cidr) = text.lines()
+            .find(|l| l.trim_start().starts_with("inet "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            && let Some(net) = WolfNetNetwork::parse(cidr)
+        {
+            return Some(net);
+        }
+    }
+    crate::networking::get_local_wolfnet_subnet()
+        .map(|(addr, prefix)| WolfNetNetwork { addr, prefix })
+}
+
+/// The WolfNet network for routing/NAT rules that name a workload's WolfNet
+/// address: the real network when this node knows it, otherwise the
+/// address's own /24 — the only thing older versions ever used, kept solely
+/// so a node whose wolfnet0 is down AND whose config.toml is unreadable
+/// still installs/removes the same rule it always did.
+pub fn wolfnet_network_or_slash24(ip: &str) -> Option<WolfNetNetwork> {
+    wolfnet_network().or_else(|| WolfNetNetwork::parse(&format!("{}/24", ip.trim())))
+}
+
+/// `wolfnet_network_or_slash24(ip).cidr()`, or "" when `ip` is not even an
+/// address — for the `ip route` / iptables argument lists.
+pub fn wolfnet_cidr_for(ip: &str) -> String {
+    wolfnet_network_or_slash24(ip).map(|n| n.cidr()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod wolfnet_network_tests {
+    use super::WolfNetNetwork;
+
+    #[test]
+    fn parses_and_masks() {
+        let n = WolfNetNetwork::parse("10.100.10.20/16").unwrap();
+        assert_eq!(n.cidr(), "10.100.0.0/16");
+        assert_eq!(n.legacy_slash24().as_deref(), Some("10.100.10.0/24"));
+        let n24 = WolfNetNetwork::parse("10.10.10.1/24").unwrap();
+        assert_eq!(n24.cidr(), "10.10.10.0/24");
+        assert_eq!(n24.legacy_slash24(), None, "on a /24 the old and new rule are identical");
+        assert_eq!(WolfNetNetwork::parse("10.10.10.1"), None, "a prefix is never invented");
+        assert_eq!(WolfNetNetwork::parse("10.10.10.1/33"), None);
+        assert_eq!(WolfNetNetwork::parse("0.0.0.0/0").unwrap().cidr(), "0.0.0.0/0");
+    }
+
+    /// klas's network: nodes on 10.100.10.x, containers on 10.100.20.x.
+    #[test]
+    fn membership_follows_the_prefix_not_the_third_octet() {
+        let n = WolfNetNetwork::parse("10.100.10.20/16").unwrap();
+        assert!(n.contains("10.100.10.30"));
+        assert!(n.contains("10.100.20.1"), "a /16 spans every third octet");
+        assert!(n.contains("10.100.255.254"));
+        assert!(!n.contains("10.101.0.1"));
+        assert!(!n.contains("192.168.12.5"), "a Docker bridge address is never WolfNet");
+        assert!(!n.contains("10.100.20.1/32"), "only bare addresses");
+        assert!(!n.contains(""));
+        let n24 = WolfNetNetwork::parse("10.10.10.1/24").unwrap();
+        assert!(n24.contains("10.10.10.200"));
+        assert!(!n24.contains("10.10.11.1"));
+    }
+}
+
+/// The node's own /24 slice as `"10.100.10"`, from wolfnet0 or
+/// /etc/wolfnet/config.toml. Never hardcode "10.10.10" — users choose their
+/// own subnet when they set up WolfNet.
+///
+/// This is the range the IP ALLOCATORS hand addresses out of (the node's
+/// own third octet, hosts 2..=254), and only that. It is NOT a membership
+/// test and NOT "the WolfNet subnet": on a WolfNet wider than /24 both of
+/// those are wrong here — use `wolfnet_network()`.
 pub fn wolfnet_subnet_prefix() -> Option<String> {
     // Primary: read wolfnet0 interface IP
     if let Ok(out) = Command::new("ip").args(["addr", "show", "wolfnet0"]).output()
@@ -2164,14 +2406,15 @@ pub fn wolfnet_status(extra_used: &[u8]) -> WolfNetStatus {
                 .unwrap_or("")
                 .to_string();
 
+            // The real network wolfnet configured (the same `ip addr show`
+            // carries the prefix length), not the address's /24.
             let subnet = if !ip.is_empty() {
-                // Derive subnet from IP (e.g., x.x.x.0/24)
-                let parts: Vec<&str> = ip.split('.').collect();
-                if parts.len() == 4 {
-                    format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2])
-                } else {
-                    wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
-                }
+                text.lines()
+                    .find(|l| l.trim_start().starts_with("inet "))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(WolfNetNetwork::parse)
+                    .map(|n| n.cidr())
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
@@ -2967,12 +3210,7 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
         // Add route to WolfNet subnet via gateway so container can reach other WolfNet hosts.
         // The `src` hint ensures the kernel uses the WolfNet IP as source, not the
         // Docker bridge IP — critical for cross-node connectivity.
-        let ip_parts: Vec<&str> = ip.split('.').collect();
-        let subnet = if ip_parts.len() == 4 {
-            format!("{}.{}.{}.0/24", ip_parts[0], ip_parts[1], ip_parts[2])
-        } else {
-            wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
-        };
+        let subnet = wolfnet_cidr_for(ip);
         if !subnet.is_empty() {
             let _ = Command::new("nsenter")
                 .args(["--target", &container_pid, "--net", "ip", "route", "replace", &subnet, "via", &gateway, "src", ip])
@@ -3029,8 +3267,10 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
 
     // 6b. Custom bridge: the DNAT the reconcile would otherwise add up to
     //     60 s from now — a freshly started container is reachable at once.
-    if bridge_dev != "docker0" && container_bridge_ip != ip {
-        ensure_container_dnat(ip, &container_bridge_ip, &wolfnet_prefix_of(ip));
+    if bridge_dev != "docker0" && container_bridge_ip != ip
+        && let Some(net) = wolfnet_network_or_slash24(ip)
+    {
+        ensure_container_dnat(ip, &container_bridge_ip, &net);
     }
 
     // 7. Route traffic for this WolfNet IP to the container's bridge
@@ -4101,13 +4341,8 @@ fn lxc_apply_wolfnet(container: &str) {
         let is_pve = is_proxmox();
         let _wolfnet_iface = if is_pve { "wn0" } else { "eth0" };
 
-        // Derive WolfNet subnet from the container's WolfNet IP
-        let wn_parts: Vec<&str> = ip.split('.').collect();
-        let wn_subnet = if wn_parts.len() == 4 {
-            format!("{}.{}.{}.0/24", wn_parts[0], wn_parts[1], wn_parts[2])
-        } else {
-            wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
-        };
+        // The WolfNet network (real prefix length; see wolfnet_network)
+        let wn_subnet = wolfnet_cidr_for(ip);
 
         if is_pve {
             // Proxmox: wn0 is on lxcbr0 with NO IP/gateway in pct config.
@@ -4584,9 +4819,7 @@ fn assign_container_bridge_ip(container: &str) -> String {
 
 /// Build the WolfNet /24 subnet from a /32 WolfNet IP — `10.10.20.5` → `10.10.20.0/24`.
 fn wolfnet_subnet_from_ip(ip: &str) -> Option<String> {
-    let parts: Vec<&str> = ip.split('.').collect();
-    if parts.len() != 4 { return None; }
-    Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
+    Some(wolfnet_cidr_for(ip)).filter(|s| !s.is_empty())
 }
 
 // ─── Per-container DNS ───────────────────────────────────────────────────
@@ -7344,8 +7577,9 @@ pub fn docker_start(container: &str) -> Result<String, String> {
     let net = docker_bridge_info(container);
     if !net.ip.is_empty() {
         let own = docker_effective_wolfnet_ip(container).unwrap_or_default();
-        let prefix = wolfnet_subnet_prefix().map(|p| format!("{}.", p)).unwrap_or_default();
-        purge_foreign_dnat_pointing_at(&net.ip, &own, &prefix);
+        if let Some(wn) = wolfnet_network() {
+            purge_foreign_dnat_pointing_at(&net.ip, &own, &wn);
+        }
     }
 
     // WolfUSB: re-attach any USB devices assigned to this container

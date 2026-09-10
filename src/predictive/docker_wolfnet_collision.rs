@@ -83,15 +83,12 @@ pub async fn sample_now_async(_timeout: Duration) -> DockerWolfnetCollisionFacts
 }
 
 fn sample_blocking() -> DockerWolfnetCollisionFacts {
-    let prefix = match crate::containers::wolfnet_subnet_prefix() {
-        Some(p) => p,
+    // The real network wolfnet configured — a /16 WolfNet collides with a
+    // 10.100.x.0/24 Docker network the node's own /24 would have missed.
+    let wolfnet_cidr = match crate::containers::wolfnet_network() {
+        Some(n) => n.cidr(),
         None => return DockerWolfnetCollisionFacts::default(),
     };
-    // We currently treat WolfNet's subnet as the conventional /24 the
-    // codebase uses everywhere else (`wolfnet_subnet_prefix` returns the
-    // first three octets). If the WolfNet config later supports custom
-    // prefix lengths, plumb the actual prefix here.
-    let wolfnet_cidr = format!("{}.0/24", prefix);
     let (wn_net, wn_prefix) = match parse_cidr(&wolfnet_cidr) {
         Some(t) => t,
         None => return DockerWolfnetCollisionFacts::default(),

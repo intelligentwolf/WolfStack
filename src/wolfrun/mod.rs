@@ -1500,10 +1500,10 @@ pub async fn reconcile(
                     let found = containers.iter().find(|c| c.name == inst.container_name);
                     if let Some(c) = found {
                         // Extract wolfnet IP from ip_address field (format: "x.x.x.5 (wolfnet)" or "192.168.1.1, x.x.x.5 (wolfnet)")
-                        let wn_prefix = crate::containers::wolfnet_subnet_prefix().map(|p| format!("{}.", p));
+                        let wn_net = crate::containers::wolfnet_network();
                         let wolfnet_ip = c.ip_address.split(',')
                             .map(|s| s.trim())
-                            .find(|s| s.contains("wolfnet") || wn_prefix.as_ref().map(|p| s.starts_with(p.as_str())).unwrap_or(false))
+                            .find(|s| s.contains("wolfnet") || wn_net.is_some_and(|n| n.contains(s.split_whitespace().next().unwrap_or("").split('/').next().unwrap_or(""))))
                             .map(|s| s.replace(" (wolfnet)", "").trim().to_string())
                             .filter(|s| !s.is_empty());
                         // Fallback: use bridge IP (10.0.3.x) if no wolfnet IP
@@ -1581,10 +1581,10 @@ pub async fn reconcile(
                                                 .unwrap_or("unknown");
                                             // Extract wolfnet IP from ip_address field (same as local path)
                                             let ip_addr = c["ip_address"].as_str().unwrap_or("");
-                                            let wn_pfx = crate::containers::wolfnet_subnet_prefix().map(|p| format!("{}.", p));
+                                            let wn_net = crate::containers::wolfnet_network();
                                             let wolfnet_ip = ip_addr.split(',')
                                                 .map(|s| s.trim())
-                                                .find(|s| s.contains("wolfnet") || wn_pfx.as_ref().map(|p| s.starts_with(p.as_str())).unwrap_or(false))
+                                                .find(|s| s.contains("wolfnet") || wn_net.is_some_and(|n| n.contains(s.split_whitespace().next().unwrap_or("").split('/').next().unwrap_or(""))))
                                                 .map(|s| s.replace(" (wolfnet)", "").trim().to_string())
                                                 .filter(|s| !s.is_empty())
                                                 .or_else(|| {
