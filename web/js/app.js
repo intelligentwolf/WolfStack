@@ -66912,7 +66912,8 @@ async function loadComposeStacks() {
                 ? iconBtn(`composeAction('${nm}', 'up')`, 'play', 'Up', { primary: true, tip: upTip })
                 : iconBtn(`composeAction('${nm}', 'down')`, 'stop', 'Down') +
                   iconBtn(`composeAction('${nm}', 'restart')`, 'restart', 'Restart') +
-                  iconBtn(`composeAction('${nm}', 'up')`, 'play', 'Up', { primary: true, tip: upTip });
+                  iconBtn(`composeAction('${nm}', 'up')`, 'play', 'Up', { primary: true, tip: upTip }) +
+                  iconBtn(`composeAction('${nm}', 'recreate')`, 'refresh-cw', 'Recreate', { tip: "Recreate (docker compose up -d --force-recreate): rebuild EVERY container in the stack from the compose file, changed or not — for a container that has drifted at runtime (lost network, stuck state) where Up sees nothing to do. Volumes are kept; the containers are new." });
 
             return `<tr>
                 <td><strong>${escapeHtml(s.name)}</strong></td>
@@ -67342,7 +67343,7 @@ async function secretsImportRun() {
 }
 
 async function composeAction(name, action) {
-    const actionLabels = { up: 'Starting', down: 'Stopping', pull: 'Pulling images for', restart: 'Restarting' };
+    const actionLabels = { up: 'Starting', down: 'Stopping', pull: 'Pulling images for', restart: 'Restarting', recreate: 'Recreating every container in' };
     showToast(`${actionLabels[action] || action} "${name}"...`, 'info');
 
     try {
@@ -67356,9 +67357,11 @@ async function composeAction(name, action) {
                 detail = 'Updated: ' + data.updated.map(u => u.image).join(', ');
             } else if (action === 'up' && Array.isArray(data.started) && data.started.length) {
                 detail = 'New image applied to: ' + data.started.join(', ');
+            } else if (action === 'recreate' && Array.isArray(data.started) && data.started.length) {
+                detail = 'Recreated: ' + data.started.join(', ');
             }
             const msg = data.message || `${action} complete`;
-            if (action === 'up' && Array.isArray(data.unset_variables) && data.unset_variables.length) {
+            if ((action === 'up' || action === 'recreate') && Array.isArray(data.unset_variables) && data.unset_variables.length) {
                 // Compose substituted a blank string for these ${KEY}
                 // references (not in this host's Secrets Manager or .env):
                 // the stack is up but degraded. Stays until dismissed.

@@ -40857,6 +40857,41 @@ async fn compose_up(
     }
 }
 
+/// `docker compose up -d --force-recreate --remove-orphans`: every
+/// container in the stack is recreated whether or not compose thinks it
+/// changed. `Up` alone recreates only what differs from the compose file,
+/// so a container that has drifted at runtime (a lost network alias, a
+/// half-applied restart, state compose cannot see) stays as it is; this
+/// is the button for that case (klas 2026-09-10). Same report as `Up`.
+async fn compose_recreate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = compose_file_in(&dir);
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let out = match web::block(move || run_compose_up_with(&dir, true)).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    };
+    if out.success {
+        let mut report = compose_up_report(&out);
+        report["message"] = serde_json::Value::String("Stack recreated".to_string());
+        HttpResponse::Ok().json(report)
+    } else {
+        HttpResponse::BadRequest().json(serde_json::json!({ "error": out.stderr, "output": out.stdout }))
+    }
+}
+
 /// What `docker compose up -d` left behind, for the report below.
 struct ComposeUpOutcome {
     success: bool,
@@ -40869,10 +40904,20 @@ struct ComposeUpOutcome {
 /// Shared by the Compose page and a stack received from a peer, so the two
 /// can never run `up` differently.
 fn run_compose_up(dir: &std::path::Path) -> Result<ComposeUpOutcome, String> {
+    run_compose_up_with(dir, false)
+}
+
+/// `run_compose_up`, optionally with `--force-recreate` (see
+/// `compose_recreate`). One place builds the command so the two can only
+/// ever differ by that flag.
+fn run_compose_up_with(dir: &std::path::Path, force_recreate: bool) -> Result<ComposeUpOutcome, String> {
     let compose_file = compose_file_in(dir);
     let mut c = crate::containers::compose_cmd()?;
+    let file = compose_file.to_string_lossy();
+    let mut args: Vec<&str> = vec!["-f", &file, "up", "-d", "--remove-orphans"];
+    if force_recreate { args.push("--force-recreate"); }
     let out = c
-        .args(["-f", &compose_file.to_string_lossy(), "up", "-d", "--remove-orphans"])
+        .args(&args)
         .envs(compose_secrets_env())
         .current_dir(dir)
         .output()
@@ -48855,6 +48900,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/compose/stacks/{name}/down", web::post().to(compose_down))
         .route("/api/compose/stacks/{name}/pull", web::post().to(compose_pull))
         .route("/api/compose/stacks/{name}/restart", web::post().to(compose_restart))
+        .route("/api/compose/stacks/{name}/recreate", web::post().to(compose_recreate))
         .route("/api/compose/stacks/{name}/logs", web::get().to(compose_logs))
         .route("/api/compose/stacks/{name}/validate", web::post().to(compose_validate))
         .route("/api/compose/stacks/{name}/deploy", web::post().to(compose_deploy))
