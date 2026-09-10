@@ -146,19 +146,19 @@ async fn require_admin_auth(
     req: actix_web::dev::ServiceRequest,
     next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
-    let authed = req
-        .app_data::<web::Data<crate::api::AppState>>()
-        .map(|state| crate::api::require_auth(req.request(), state).is_ok())
-        .unwrap_or(false);
-    if authed {
-        Ok(next.call(req).await?.map_into_boxed_body())
-    } else {
-        Ok(req
-            .into_response(
-                actix_web::HttpResponse::Unauthorized()
-                    .json(serde_json::json!({ "error": "Not authenticated" })),
-            )
-            .map_into_boxed_body())
+    // Keep require_auth's OWN response rather than collapsing every failure
+    // to a generic 401: a read-only (viewer) session is refused with a 403
+    // that carries X-WolfStack-Role, which the dashboard turns into a
+    // visible explanation; an expired session carries the header the
+    // dashboard bounces to the login page on.
+    let verdict = match req.app_data::<web::Data<crate::api::AppState>>() {
+        Some(state) => crate::api::require_auth(req.request(), state).map(|_| ()),
+        None => Err(actix_web::HttpResponse::Unauthorized()
+            .json(serde_json::json!({ "error": "Not authenticated" }))),
+    };
+    match verdict {
+        Ok(()) => Ok(next.call(req).await?.map_into_boxed_body()),
+        Err(resp) => Ok(req.into_response(resp).map_into_boxed_body()),
     }
 }
 

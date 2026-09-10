@@ -656,6 +656,29 @@ pub fn validate_cluster_secret(provided: &str, expected: &str) -> bool {
 struct Session {
     username: String,
     created: Instant,
+    /// Read-only (viewer-role) session. Decided ONCE at login from the
+    /// role the authenticating store reported — see `role_is_read_only`
+    /// — and enforced centrally by `api::require_auth`, so a role change
+    /// in users.json takes effect at the user's next login, never
+    /// mid-session. (VolkSec report, 2026-09-09.)
+    read_only: bool,
+}
+
+/// What `SessionManager::validate_info` hands back for a live session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub username: String,
+    pub read_only: bool,
+}
+
+/// The ONE definition of which WolfStack user role is read-only.
+///
+/// `WolfUser::role` is documented as `"admin"` or `"viewer"` and the docs
+/// promise viewer = read-only. Anything that is not literally `"admin"`
+/// is treated as read-only so a mistyped or unknown role fails CLOSED —
+/// the same rule `session_user_is_admin` applies.
+pub fn role_is_read_only(role: &str) -> bool {
+    role != "admin"
 }
 
 /// Session manager
@@ -670,13 +693,20 @@ impl SessionManager {
         }
     }
 
-    /// Create a new session for a user, returns the session token
-    pub fn create_session(&self, username: &str) -> String {
+    /// Create a new session for a user, returns the session token.
+    ///
+    /// `read_only` is the caller's verdict on the authenticated identity
+    /// (`role_is_read_only(&user.role)` for a WolfStack-store or OIDC
+    /// user; `false` for a Linux account, which has no role). It is
+    /// deliberately a required argument rather than a defaulted builder
+    /// so no login path can forget to decide it.
+    pub fn create_session(&self, username: &str, read_only: bool) -> String {
         let token = uuid::Uuid::new_v4().to_string();
         let mut sessions = self.sessions.write().unwrap();
         sessions.insert(token.clone(), Session {
             username: username.to_string(),
             created: Instant::now(),
+            read_only,
         });
 
         token
@@ -684,10 +714,21 @@ impl SessionManager {
 
     /// Validate a session token, returns the username if valid
     pub fn validate(&self, token: &str) -> Option<String> {
+        self.validate_info(token).map(|s| s.username)
+    }
+
+    /// Validate a session token, returning the username AND whether the
+    /// session is read-only. Every mutation gate that reads the cookie
+    /// directly (instead of through `api::require_auth`) must use this
+    /// and refuse `read_only` sessions.
+    pub fn validate_info(&self, token: &str) -> Option<SessionInfo> {
         let sessions = self.sessions.read().unwrap();
         if let Some(session) = sessions.get(token)
             && session.created.elapsed() < SESSION_LIFETIME {
-                return Some(session.username.clone());
+                return Some(SessionInfo {
+                    username: session.username.clone(),
+                    read_only: session.read_only,
+                });
             }
         None
     }
@@ -714,6 +755,35 @@ impl SessionManager {
     pub fn cleanup(&self) {
         let mut sessions = self.sessions.write().unwrap();
         sessions.retain(|_, s| s.created.elapsed() < SESSION_LIFETIME);
+    }
+}
+
+#[cfg(test)]
+mod read_only_session_tests {
+    use super::{role_is_read_only, SessionInfo, SessionManager};
+
+    #[test]
+    fn only_the_literal_admin_role_is_not_read_only() {
+        assert!(!role_is_read_only("admin"));
+        assert!(role_is_read_only("viewer"));
+        // Unknown / mistyped roles fail closed.
+        assert!(role_is_read_only("Admin"));
+        assert!(role_is_read_only("operator"));
+        assert!(role_is_read_only(""));
+    }
+
+    #[test]
+    fn session_carries_the_read_only_verdict_it_was_created_with() {
+        let mgr = SessionManager::new();
+        let admin = mgr.create_session("alice", false);
+        let viewer = mgr.create_session("bob", true);
+        assert_eq!(mgr.validate_info(&admin),
+                   Some(SessionInfo { username: "alice".into(), read_only: false }));
+        assert_eq!(mgr.validate_info(&viewer),
+                   Some(SessionInfo { username: "bob".into(), read_only: true }));
+        // The username-only accessor still works for read-side callers.
+        assert_eq!(mgr.validate(&viewer).as_deref(), Some("bob"));
+        assert_eq!(mgr.validate_info("no-such-token"), None);
     }
 }
 

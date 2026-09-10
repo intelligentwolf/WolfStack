@@ -32,6 +32,22 @@ fn require_tui_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
     }
 }
 
+/// Auth for the two TUI routes that CHANGE something (container start /
+/// stop / restart). They are plain GET links, so the method rule in
+/// `api::require_auth` cannot cover them; refuse read-only sessions here.
+fn require_tui_operator(req: &HttpRequest, state: &web::Data<AppState>) -> Result<String, HttpResponse> {
+    let user = require_tui_auth(req, state)?;
+    if crate::api::session_is_read_only(req, state) {
+        return Err(HttpResponse::Forbidden()
+            .insert_header((crate::api::READ_ONLY_HEADER, "read-only"))
+            .content_type("text/html; charset=utf-8")
+            .body("<html><body style=\"font-family:monospace;background:#181a20;color:#e74c3c;padding:40px;\">\
+                   <h1>Read-only account</h1><p>Your account is a viewer: container actions are not available.</p>\
+                   <p><a href=\"/tui\" style=\"color:#ef4444;\">Back</a></p></body></html>"));
+    }
+    Ok(user)
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -206,7 +222,8 @@ pub async fn tui_login_submit(
 
     if crate::auth::authenticate_user(&username, &password) {
         state.login_limiter.clear(&client_ip);
-        let token = state.sessions.create_session(&username);
+        // TUI login is Linux-account only (no WolfStack role): full access.
+        let token = state.sessions.create_session(&username, false);
         let mut cookie = actix_web::cookie::Cookie::build("wolfstack_session", &token)
             .path("/")
             .http_only(true)
@@ -988,7 +1005,7 @@ pub async fn tui_docker_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String, String)>,
 ) -> HttpResponse {
-    let _username = match require_tui_auth(&req, &state) {
+    let _username = match require_tui_operator(&req, &state) {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -1023,7 +1040,7 @@ pub async fn tui_lxc_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String, String)>,
 ) -> HttpResponse {
-    let _username = match require_tui_auth(&req, &state) {
+    let _username = match require_tui_operator(&req, &state) {
         Ok(u) => u,
         Err(resp) => return resp,
     };

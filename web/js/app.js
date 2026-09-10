@@ -74,11 +74,31 @@
         window.location.replace('/login.html');
     };
 
+    // A 403 stamped X-WolfStack-Role: read-only means the server refused
+    // the action because this account has the viewer role. Every button in
+    // the dashboard is still rendered for a viewer, so without this the
+    // refusal would surface only as whatever each caller does with a
+    // failed response — often nothing visible. One toast per second at
+    // most: a refused save can fan out into several refused requests.
+    let lastReadOnlyToast = 0;
+    window.wsReadOnlyRefused = function () {
+        const now = Date.now();
+        if (now - lastReadOnlyToast < 1000) return;
+        lastReadOnlyToast = now;
+        if (typeof showToast === 'function') {
+            showToast('Your account is read-only (viewer role): that change was not made. '
+                + 'Ask an administrator to make it or to change your role.', 'error', 0, 'ws-readonly-toast');
+        }
+    };
+
     window.fetch = function (input, init) {
         return nativeFetch(input, init).then(function (resp) {
             if (resp.status === 401
                 && resp.headers.get('X-WolfStack-Session') === 'expired') {
                 window.wsSessionExpired();
+            } else if (resp.status === 403
+                && resp.headers.get('X-WolfStack-Role') === 'read-only') {
+                window.wsReadOnlyRefused();
             }
             return resp;
         });
@@ -2077,6 +2097,10 @@ async function refreshTrustFooter() {
                     wrap.style.display = '';
                 }
             }
+            // Viewer-role accounts see a permanent badge in the top bar so
+            // the first refused action is not a surprise.
+            const badge = document.getElementById('ws-readonly-badge');
+            if (badge) badge.hidden = !(d.authenticated && d.read_only === true);
         }
     } catch (_) {}
 }

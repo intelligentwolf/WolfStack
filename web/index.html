@@ -299,6 +299,11 @@
                 <h2 id="page-title">Dashboard</h2>
             </div>
             <div class="top-bar-actions" style="display:flex; align-items:center; gap:12px;">
+                <span id="ws-readonly-badge" hidden role="status"
+                    title="Your account has the viewer role. You can look at everything but not change anything. Ask an administrator to make changes or to change your role."
+                    style="align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:600; letter-spacing:0.02em; background:rgba(251,191,36,0.16); color:var(--warning, #fbbf24); border:1px solid rgba(251,191,36,0.45); white-space:nowrap;">
+                    <span aria-hidden="true">&#128065;</span> Read-only viewer
+                </span>
                 <div class="global-search-wrap" style="position:relative;">
                     <input id="global-search-input" type="text" role="combobox"
                         placeholder="Search VMs, containers, networking…" autocomplete="off" spellcheck="false"

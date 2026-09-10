@@ -583,6 +583,151 @@ mod session_expired_response_tests {
     }
 }
 
+// ─── Read-only (viewer-role) sessions ────────────────────────────────
+//
+// WolfStack users carry a role, "admin" or "viewer", and the docs promise
+// viewer = read-only. Until 2026-09-09 that promise was enforced on only
+// three endpoints (user management, cluster access, diagnostics); every
+// other mutation — package installs, container/VM lifecycle, backups,
+// settings, API-key minting — accepted any authenticated session.
+// Reported by VolkSec against POST /api/system/install-package (CWE-862).
+//
+// The fix lives at the ONE auth chokepoint rather than on 680 routes: a
+// session created for a non-admin role is flagged read-only at login
+// (`SessionManager::create_session`), and `require_auth` refuses it any
+// request that is not a safe method, except the small self-service set
+// below. Console / command sinks are GETs (WebSocket upgrades), so
+// `require_operator_auth` refuses read-only sessions regardless of method,
+// and `node_proxy` tells the far node when the actor it is forwarding is
+// read-only so the same refusal happens across the cluster.
+
+/// Response header stamped on every 403 that means "your account is
+/// read-only". The dashboard's fetch interceptor keys on it to show a
+/// visible explanation instead of a bare failed action.
+pub const READ_ONLY_HEADER: &str = "X-WolfStack-Role";
+
+/// Request header `node_proxy` adds when the operator it is forwarding
+/// for holds a read-only session. `require_operator_auth` on the far node
+/// refuses the forwarded call when it is present. Set only by our own
+/// proxy from server-side session state — a browser cannot remove it.
+pub const PROXIED_ACTOR_ROLE_HEADER: &str = "X-WolfStack-Actor-Role";
+
+/// The 403 every read-only refusal returns.
+pub fn read_only_forbidden(what: &str) -> HttpResponse {
+    HttpResponse::Forbidden()
+        .insert_header((READ_ONLY_HEADER, "read-only"))
+        .json(serde_json::json!({
+            "error": format!("Your account is read-only (viewer role): {}. \
+                              Ask an administrator to make the change or to \
+                              change your role.", what),
+            "read_only": true,
+        }))
+}
+
+/// May a read-only session make THIS request?
+///
+/// Safe methods (GET / HEAD / OPTIONS) always. Otherwise only the
+/// self-service account operations a viewer needs to keep their own
+/// login working — every one of them already scopes itself to the
+/// calling user (`require_admin_or_self`, passkey ownership checks,
+/// per-user preference storage), so the path match here is the gate on
+/// WHICH actions, not on WHOSE account.
+pub fn read_only_session_may(method: &actix_web::http::Method, path: &str, username: &str) -> bool {
+    use actix_web::http::Method;
+    if method.is_safe() {
+        return true;
+    }
+    match (method, path) {
+        // Ending the session, and per-user UI preferences.
+        (&Method::POST, "/api/auth/logout") => true,
+        (&Method::POST | &Method::PATCH, "/api/user/preferences") => true,
+        // Own passkeys — the handlers bind the credential to the caller.
+        (&Method::POST, "/api/auth/passkey/register/start")
+        | (&Method::POST, "/api/auth/passkey/register/finish") => true,
+        (&Method::DELETE, p) if p.starts_with("/api/auth/passkeys/") => true,
+        // Own password / email / 2FA — the target segment must be the caller.
+        (&Method::POST, p) => {
+            let Some(rest) = p.strip_prefix("/api/auth/users/") else { return false };
+            let Some((target, action)) = rest.split_once('/') else { return false };
+            target == username
+                && matches!(action, "password" | "email" | "2fa/setup" | "2fa/confirm" | "2fa/disable")
+        }
+        _ => false,
+    }
+}
+
+/// Is the request carrying a live read-only session cookie? Used where a
+/// handler's request is a safe method (GET WebSocket upgrades, GET proxy
+/// calls) yet the operation behind it is not read-only.
+pub fn session_is_read_only(req: &HttpRequest, state: &web::Data<AppState>) -> bool {
+    get_session_token(req)
+        .and_then(|t| state.sessions.validate_info(&t))
+        .map(|s| s.read_only)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod read_only_gate_tests {
+    use super::{read_only_forbidden, read_only_session_may, READ_ONLY_HEADER};
+    use actix_web::http::Method;
+
+    #[test]
+    fn safe_methods_are_always_allowed() {
+        assert!(read_only_session_may(&Method::GET, "/api/containers", "bob"));
+        assert!(read_only_session_may(&Method::GET, "/api/system-check", "bob"));
+        assert!(read_only_session_may(&Method::HEAD, "/api/status", "bob"));
+        assert!(read_only_session_may(&Method::OPTIONS, "/api/status", "bob"));
+    }
+
+    #[test]
+    fn the_reported_endpoint_and_other_mutations_are_refused() {
+        // VolkSec, 2026-09-09: viewer could reach the package installer.
+        assert!(!read_only_session_may(&Method::POST, "/api/system/install-package", "bob"));
+        assert!(!read_only_session_may(&Method::POST, "/api/system/prepare-install-package", "bob"));
+        // A viewer must not mint an API key either — keys have no owner
+        // role, so a write-scoped key would be a standing bypass.
+        assert!(!read_only_session_may(&Method::POST, "/api/tokens", "bob"));
+        assert!(!read_only_session_may(&Method::POST, "/api/containers/docker/x/start", "bob"));
+        assert!(!read_only_session_may(&Method::DELETE, "/api/backups/x", "bob"));
+        assert!(!read_only_session_may(&Method::PUT, "/api/settings", "bob"));
+        assert!(!read_only_session_may(&Method::PATCH, "/api/anything", "bob"));
+        assert!(!read_only_session_may(&Method::POST, "/api/auth/users", "bob"));
+        assert!(!read_only_session_may(&Method::PUT, "/api/auth/users/bob/clusters", "bob"));
+    }
+
+    #[test]
+    fn self_service_account_operations_are_allowed_for_self_only() {
+        assert!(read_only_session_may(&Method::POST, "/api/auth/logout", "bob"));
+        assert!(read_only_session_may(&Method::POST, "/api/user/preferences", "bob"));
+        assert!(read_only_session_may(&Method::PATCH, "/api/user/preferences", "bob"));
+        assert!(read_only_session_may(&Method::POST, "/api/auth/passkey/register/start", "bob"));
+        assert!(read_only_session_may(&Method::POST, "/api/auth/passkey/register/finish", "bob"));
+        assert!(read_only_session_may(&Method::DELETE, "/api/auth/passkeys/abc", "bob"));
+        for action in ["password", "email", "2fa/setup", "2fa/confirm", "2fa/disable"] {
+            let own = format!("/api/auth/users/bob/{}", action);
+            let other = format!("/api/auth/users/alice/{}", action);
+            assert!(read_only_session_may(&Method::POST, &own, "bob"), "{}", own);
+            assert!(!read_only_session_may(&Method::POST, &other, "bob"), "{}", other);
+        }
+        // Prefix look-alikes are not self-service.
+        assert!(!read_only_session_may(&Method::POST, "/api/auth/users/bob/clusters", "bob"));
+        assert!(!read_only_session_may(&Method::POST, "/api/auth/users/bob", "bob"));
+        assert!(!read_only_session_may(&Method::POST, "/api/auth/logout-all", "bob"));
+    }
+
+    #[actix_web::test]
+    async fn refusal_is_a_403_the_dashboard_can_recognise() {
+        let resp = read_only_forbidden("installing packages");
+        assert_eq!(resp.status().as_u16(), 403);
+        assert_eq!(resp.headers().get(READ_ONLY_HEADER).and_then(|v| v.to_str().ok()),
+                   Some("read-only"));
+        let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["read_only"], true);
+        assert!(v["error"].as_str().unwrap().contains("installing packages"));
+    }
+}
+
 /// Cluster-secret-ONLY gate for peer-to-peer endpoints an operator never
 /// calls directly. Unlike `require_auth` there is no session or API-key
 /// fallback — these endpoints move key material between nodes, so the
@@ -740,8 +885,20 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
 
     match get_session_token(req) {
         Some(token) => {
-            match state.sessions.validate(&token) {
-                Some(username) => Ok(username),
+            match state.sessions.validate_info(&token) {
+                Some(session) => {
+                    // Viewer-role sessions are read-only. This is THE
+                    // enforcement point for every route that authenticates
+                    // through here — see the read-only section above.
+                    if session.read_only
+                        && !read_only_session_may(req.method(), req.path(), &session.username)
+                    {
+                        tracing::warn!("auth: read-only session '{}' refused {} {} from {:?}",
+                            session.username, req.method(), req.path(), peer_ip(req));
+                        return Err(read_only_forbidden("this action changes the system"));
+                    }
+                    Ok(session.username)
+                }
                 None => Err(session_expired_response("Session expired")),
             }
         }
@@ -832,6 +989,14 @@ pub fn require_operator_auth(
         }
         let proxied = req.headers().get("X-WolfStack-Proxied")
             .and_then(|v| v.to_str().ok()) == Some("1");
+        // The forwarding node tells us when the operator behind this call
+        // holds a read-only session; consoles and command execution are
+        // never available to a viewer, on any node.
+        if req.headers().get(PROXIED_ACTOR_ROLE_HEADER)
+            .and_then(|v| v.to_str().ok()) == Some("read-only")
+        {
+            return Err(read_only_forbidden("consoles and command execution are not available"));
+        }
         let actor = req.headers().get("X-WolfStack-Actor")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim())
@@ -847,7 +1012,16 @@ pub fn require_operator_auth(
         };
     }
     // No cluster-secret header — fall through to session / API-key auth.
-    require_auth(req, state)
+    let who = require_auth(req, state)?;
+    // Console and exec sinks are reached with GET (WebSocket upgrade) or
+    // hand out a ticket on GET, so require_auth's method rule alone would
+    // let a read-only session through. Refuse them here regardless of method.
+    if session_is_read_only(req, state) {
+        tracing::warn!("auth: read-only session '{}' refused operator sink {} {} from {:?}",
+            who, req.method(), req.path(), peer_ip(req));
+        return Err(read_only_forbidden("consoles and command execution are not available"));
+    }
+    Ok(who)
 }
 
 /// Require cluster secret authentication for inter-node endpoints
@@ -945,7 +1119,10 @@ pub async fn login(req: HttpRequest, state: web::Data<AppState>, body: web::Json
 
             state.login_limiter.clear_with(&client_ip, &body.username);
             crate::auth::record_admin_ip(&client_ip);
-            let token = state.sessions.create_session(&body.username);
+            // The user's role decides whether this session may change
+            // anything — see the read-only section near require_auth.
+            let read_only = crate::auth::role_is_read_only(&user.role);
+            let token = state.sessions.create_session(&body.username, read_only);
             let mut cookie = Cookie::build("wolfstack_session", &token)
                 .path("/")
                 .http_only(true)
@@ -964,7 +1141,8 @@ pub async fn login(req: HttpRequest, state: web::Data<AppState>, body: web::Json
                 .cookie(cookie)
                 .json(serde_json::json!({
                     "success": true,
-                    "username": body.username
+                    "username": body.username,
+                    "read_only": read_only,
                 }));
         }
 
@@ -973,7 +1151,8 @@ pub async fn login(req: HttpRequest, state: web::Data<AppState>, body: web::Json
         && crate::auth::authenticate_user(&body.username, &body.password) {
             state.login_limiter.clear_with(&client_ip, &body.username);
             crate::auth::record_admin_ip(&client_ip);
-            let token = state.sessions.create_session(&body.username);
+            // A Linux account has no WolfStack role: full access, as before.
+            let token = state.sessions.create_session(&body.username, false);
             let mut cookie = Cookie::build("wolfstack_session", &token)
                 .path("/")
                 .http_only(true)
@@ -1891,7 +2070,10 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
     match require_auth(&req, &state) {
         Ok(username) => HttpResponse::Ok().json(serde_json::json!({
             "authenticated": true,
-            "username": username
+            "username": username,
+            // Lets the dashboard show the read-only badge up front instead
+            // of the operator discovering it one refused action at a time.
+            "read_only": session_is_read_only(&req, &state),
         })),
         Err(_) => HttpResponse::Ok().json(serde_json::json!({
             "authenticated": false
@@ -2100,7 +2282,13 @@ pub async fn passkey_login_finish(req: HttpRequest, state: web::Data<AppState>, 
         Ok(username) => {
             state.login_limiter.clear(&client_ip);
             crate::auth::record_admin_ip(&client_ip);
-            let token = state.sessions.create_session(&username);
+            // A passkey is bound to a username; if that is a WolfStack-store
+            // user its role applies, otherwise it is a Linux account (full).
+            let read_only = crate::auth::users::UserStore::load()
+                .find(&username)
+                .map(|u| crate::auth::role_is_read_only(&u.role))
+                .unwrap_or(false);
+            let token = state.sessions.create_session(&username, read_only);
             let mut cookie = Cookie::build("wolfstack_session", &token)
                 .path("/")
                 .http_only(true)
@@ -3124,6 +3312,12 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
 
     if username.is_empty() || password.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Username and password required"}));
+    }
+    // Only the two documented roles. Any other string would be stored and
+    // then treated as read-only by role_is_read_only — better to refuse a
+    // typo up front than to create an account that silently cannot act.
+    if role != "admin" && role != "viewer" {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Role must be 'admin' or 'viewer'"}));
     }
     if !crate::auth::is_safe_name(&username) {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid username — use alphanumeric, dash, underscore only"}));
@@ -8445,6 +8639,7 @@ pub async fn node_proxy(
     // itself a peer ("cluster-node"): otherwise a secret-holder could
     // chain through any node's proxy to manufacture operator identity.
     let actor = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let actor_read_only = session_is_read_only(&req, &state);
 
     let (node_id, api_path) = path.into_inner();
 
@@ -8500,6 +8695,13 @@ pub async fn node_proxy(
         // makes those endpoints refuse the forwarded call.
         if actor != "cluster-node" {
             builder = builder.header("X-WolfStack-Actor", actor.clone());
+        }
+        // require_auth above already refused a read-only session any
+        // unsafe method. GET-reached sinks on the far node (console
+        // WebSockets, VNC tickets) need to know too — its
+        // require_operator_auth refuses on this header.
+        if actor_read_only {
+            builder = builder.header(PROXIED_ACTOR_ROLE_HEADER, "read-only");
         }
         if !body_vec.is_empty() {
             builder = builder.body(body_vec.clone());
@@ -35125,6 +35327,11 @@ pub struct InstallPackageRequest {
 /// fixed allowlist server-side so the endpoint can't be abused as a
 /// generic apt/pacman shell. Runs the install synchronously off the
 /// async executor since package managers are blocking subprocesses.
+///
+/// Authorisation: `require_auth` refuses read-only (viewer) sessions
+/// every unsafe method, so a viewer gets 403 here — the gap VolkSec
+/// reported on 2026-09-09 (CWE-862). The allowlist is defence in depth,
+/// not the authorisation boundary.
 pub async fn system_install_package(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -39772,9 +39979,10 @@ async fn set_github_sponsor(
     // Operator-session ONLY (not cluster-secret) — flipping the beta
     // gate is an operator decision, not a peer-driven one.
     let _user = match req.cookie("wolfstack_session")
-        .and_then(|c| state.sessions.validate(c.value()))
+        .and_then(|c| state.sessions.validate_info(c.value()))
     {
-        Some(u) => u,
+        Some(s) if s.read_only => return read_only_forbidden("changing the GitHub Sponsor setting"),
+        Some(s) => s.username,
         None => return session_expired_response(
             "operator session required to change GitHub Sponsor state",
         ),
@@ -42484,8 +42692,10 @@ pub async fn oidc_callback(
     ).into_owned();
     crate::auth::record_admin_ip(&oidc_client_ip);
 
-    // Create session and set cookie
-    let token = state.sessions.create_session(&username);
+    // Create session and set cookie. The IdP-mapped role is the ONLY
+    // place an OIDC user's role exists (they are not in users.json), so
+    // it must be recorded on the session or "viewer" means nothing.
+    let token = state.sessions.create_session(&username, crate::auth::role_is_read_only(&role));
     let mut cookie = Cookie::build("wolfstack_session", &token)
         .path("/")
         .http_only(true)
