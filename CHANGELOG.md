@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.26.1: a viewer account can no longer change anything — the read-only role is now enforced on every route** _(2026-09-10 — [`3822f266`](https://github.com/intelligentwolf/WolfStack/commit/3822f2660f7579ecc4041a035ce86e4f2aa7b2cd))_
 - **v25.26.0: the inbox stops reporting a node that is long gone, and you choose which channels alerts go out on** _(2026-09-09 — [`a4a17990`](https://github.com/intelligentwolf/WolfStack/commit/a4a17990fd4dd14ea16bd09b9e35e8486ab50b58))_
 - **v25.25.3: a WolfNet IP can no longer be claimed by two owners at once, and one that is gets named in the inbox** _(2026-09-08 — [`316043ba`](https://github.com/intelligentwolf/WolfStack/commit/316043baa9343ad94580cf17d8a28f793a9271fb))_
 - **v25.25.2: a host is no longer dropped into emergency mode by a WolfStack-ordered fstab line, and the inbox now reports why the previous boot failed** _(2026-09-07 — [`4467d6fb`](https://github.com/intelligentwolf/WolfStack/commit/4467d6fb717e7d8c1161cc2b9191bd88273a0899))_
