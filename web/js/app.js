@@ -2338,6 +2338,8 @@ function selectView(page) {
         loadClusterBrowser();
     } else if (page === 'databases') {
         dbLoadConnections();
+    } else if (page === 'global-wolfnet') {
+        loadFleetContainers();
     } else if (page === 'control-panel') {
         cpInit();
     } else if (page === 'array') {
@@ -46969,10 +46971,6 @@ async function scanGlobalWolfNet() {
     await Promise.all(wsNodes.map(function (node) { return scanNode(node); }));
     if (btn) { btn.disabled = false; btn.innerHTML = '\uD83D\uDD0D Scan'; }
 
-    // Show fleet containers section and auto-load
-    var fleetSection = document.getElementById('gwn-fleet-section');
-    if (fleetSection) fleetSection.style.display = '';
-    loadFleetContainers();
 }
 
 function filterGlobalWolfNet() {
@@ -47163,40 +47161,256 @@ async function fleetAction(nodeId, runtime, container, action, btn, force) {
     }
 }
 
-async function loadFleetContainers() {
-    var btn = document.getElementById('fleet-load-btn');
+// ─── Fleet Containers & VMs (Global View) ───
+//
+// Model + render split. Each node's inventory is fetched in parallel and
+// pushed into _fleetRows; renderFleetTable() paints the table from that
+// model, so the search box, type/state filters and column sorts re-render
+// without another round of fetches. Selection is a Set of row keys
+// ("nodeId|kind|name") so it survives a reload and a re-filter.
+
+var _fleetRows = [];          // one entry per container / VM across the fleet
+var _fleetNodes = [];         // nodes the current load fanned over
+var _fleetNodeStatus = {};    // nodeId -> 'loading' | 'done'
+var _fleetSelected = new Set();
+var _fleetSort = { col: '', asc: true };
+var _fleetLoading = false;
+var _fleetReloadQueued = false;
+
+function fleetSafeId(nodeId) { return (nodeId || 'local').replace(/[^a-z0-9_-]/gi, '-'); }
+
+function fleetRowKey(nodeId, kind, name) { return (nodeId || 'local') + '|' + kind + '|' + name; }
+
+function fleetSortBy(col) {
+    if (_fleetSort.col === col) { _fleetSort.asc = !_fleetSort.asc; } else { _fleetSort = { col: col, asc: true }; }
+    renderFleetTable();
+}
+
+function fleetFilterState() {
+    var q = ((document.getElementById('fleet-search') || {}).value || '').trim().toLowerCase();
+    var type = (document.getElementById('fleet-type') || {}).value || 'all';
+    var state = (document.getElementById('fleet-state') || {}).value || 'all';
+    return { q: q, type: type, state: state, active: !!q || type !== 'all' || state !== 'all' };
+}
+
+function fleetRowMatches(r, f) {
+    if (f.type !== 'all' && r.kind !== f.type) return false;
+    if (f.state === 'running' && !r.isRunning) return false;
+    if (f.state === 'notrunning' && r.isRunning) return false;
+    if (f.q && r.searchText.indexOf(f.q) === -1) return false;
+    return true;
+}
+
+function fleetVisibleRows() {
+    var f = fleetFilterState();
+    return _fleetRows.filter(function (r) { return fleetRowMatches(r, f); });
+}
+
+// Sort within a node's group — the cluster → server hierarchy is kept,
+// only the rows under each server reorder.
+function fleetSortRows(rows) {
+    var col = _fleetSort.col;
+    if (!col) return rows;
+    var asc = _fleetSort.asc ? 1 : -1;
+    return rows.slice().sort(function (a, b) {
+        if (col === 'ip') return (ipToNum(a.ip) - ipToNum(b.ip)) * asc;
+        var va = (a[col] || '').toLowerCase(), vb = (b[col] || '').toLowerCase();
+        return va.localeCompare(vb) * asc;
+    });
+}
+
+function renderFleetTable() {
     var content = document.getElementById('fleet-containers-content');
     if (!content) return;
+    var f = fleetFilterState();
+    var visible = fleetVisibleRows();
 
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,0.2);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:6px;"></span> Loading...'; }
+    var arrow = function (col) { return _fleetSort.col === col ? (_fleetSort.asc ? ' ▲' : ' ▼') : ''; };
+    var th = function (col, label) { return '<th onclick="fleetSortBy(\'' + col + '\')" style="cursor:pointer;white-space:nowrap;" title="Sort by ' + label + '">' + label + arrow(col) + '</th>'; };
+    var allSelected = visible.length > 0 && visible.every(function (r) { return _fleetSelected.has(r.key); });
+    var html = '<table class="data-table" id="fleet-table"><thead><tr>';
+    html += '<th style="width:32px;"><input type="checkbox" id="fleet-select-all" aria-label="Select every visible container and VM" onchange="fleetToggleSelectAll(this.checked)"' + (allSelected ? ' checked' : '') + '></th>';
+    html += th('typeLabel', 'Type') + th('name', 'Name') + th('state', 'Status') + th('ip', 'IP Address') + '<th>Actions</th>';
+    html += '</tr></thead><tbody id="fleet-tbody">';
 
-    var wsNodes = (typeof allNodes !== 'undefined' && allNodes.length) ? allNodes : [{ id: 'local', hostname: 'local', is_self: true, cluster_name: 'WolfStack' }];
-
-    // Group nodes by cluster
+    // Cluster → server hierarchy. The cluster header only appears when
+    // there is more than one cluster.
     var clusters = {};
-    wsNodes.forEach(function (n) {
+    _fleetNodes.forEach(function (n) {
         var cn = n.cluster_name || 'Default';
         if (!clusters[cn]) clusters[cn] = [];
         clusters[cn].push(n);
     });
-
-    // Build table with cluster→server hierarchy
-    var html = '<table class="data-table" id="fleet-table"><thead><tr>';
-    html += '<th>Type</th><th>Name</th><th>Status</th><th>IP Address</th><th>Actions</th>';
-    html += '</tr></thead><tbody id="fleet-tbody">';
     var clusterNames = Object.keys(clusters);
+    var shownAny = false;
     clusterNames.forEach(function (cn) {
-        if (clusterNames.length > 1) {
-            html += '<tr class="fleet-cluster-header"><td colspan="5" style="background:var(--bg-tertiary);font-weight:bold;padding:10px 16px;font-size:14px;border-bottom:2px solid var(--border);">' + escapeHtml(cn) + '</td></tr>';
-        }
+        var clusterHtml = '';
         clusters[cn].forEach(function (n) {
-            var safeId = (n.id || 'local').replace(/[^a-z0-9_-]/gi, '-');
-            html += '<tr class="fleet-server-header" id="fleet-server-' + safeId + '"><td colspan="5" style="background:var(--bg-secondary);padding:8px 16px' + (clusterNames.length > 1 ? ' 8px 32px' : '') + ';font-weight:600;border-bottom:1px solid var(--border);">' + escapeHtml(n.hostname || n.id || 'local') + (n.address ? ' <span style="color:var(--text-muted);font-weight:normal;font-size:12px;">(' + escapeHtml(n.address) + ')</span>' : '') + '</td></tr>';
-            html += '<tr id="fleet-ph-' + safeId + '" style="color:var(--text-muted);"><td colspan="5" style="padding:12px 16px 12px 48px;"><span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,0.15);border-top-color:var(--text-muted);border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:6px;"></span> Loading containers &amp; VMs...</td></tr>';
+            var nodeId = n.id || 'local';
+            var safeId = fleetSafeId(nodeId);
+            var nodeRows = fleetSortRows(visible.filter(function (r) { return r.nodeId === nodeId; }));
+            var loading = _fleetNodeStatus[nodeId] === 'loading';
+            // With a filter active, a node with no matches is dropped
+            // rather than shown as an empty header.
+            if (f.active && nodeRows.length === 0 && !loading) return;
+            var indent = clusterNames.length > 1 ? ' 8px 32px' : '';
+            clusterHtml += '<tr class="fleet-server-header" id="fleet-server-' + safeId + '"><td colspan="6" style="background:var(--bg-secondary);padding:8px 16px' + indent + ';font-weight:600;border-bottom:1px solid var(--border);">' + escapeHtml(n.hostname || nodeId) + (n.address ? ' <span style="color:var(--text-muted);font-weight:normal;font-size:12px;">(' + escapeHtml(n.address) + ')</span>' : '') + '</td></tr>';
+            if (loading) {
+                clusterHtml += '<tr id="fleet-ph-' + safeId + '" style="color:var(--text-muted);"><td colspan="6" style="padding:12px 16px 12px 48px;"><span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,0.15);border-top-color:var(--text-muted);border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:6px;"></span> Loading containers &amp; VMs...</td></tr>';
+            } else if (nodeRows.length === 0) {
+                clusterHtml += '<tr style="color:var(--text-muted);"><td colspan="6" style="padding:8px 16px 8px 48px;">No containers or VMs on this node</td></tr>';
+            } else {
+                nodeRows.forEach(function (r) {
+                    var checked = _fleetSelected.has(r.key);
+                    clusterHtml += '<tr' + (checked ? ' style="background:rgba(59,130,246,0.06);"' : '') + '><td><input type="checkbox" class="fleet-row-cb" data-key="' + escapeAttr(r.key) + '" aria-label="Select ' + escapeAttr(r.name) + '" onchange="fleetToggleSelect(this)"' + (checked ? ' checked' : '') + '></td>' + r.cellsHtml + '</tr>' + r.subHtml;
+                });
+            }
+            shownAny = true;
         });
+        if (!clusterHtml) return;
+        if (clusterNames.length > 1) {
+            html += '<tr class="fleet-cluster-header"><td colspan="6" style="background:var(--bg-tertiary);font-weight:bold;padding:10px 16px;font-size:14px;border-bottom:2px solid var(--border);">' + escapeHtml(cn) + '</td></tr>';
+        }
+        html += clusterHtml;
     });
+    if (!shownAny) {
+        html += '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px;">' + (f.active ? 'No containers or VMs match the current filter.' : 'No containers or VMs found on any node.') + '</td></tr>';
+    }
     html += '</tbody></table>';
     content.innerHTML = html;
+
+    var selAll = document.getElementById('fleet-select-all');
+    if (selAll) {
+        var some = visible.some(function (r) { return _fleetSelected.has(r.key); });
+        selAll.indeterminate = some && !allSelected;
+    }
+    fleetUpdateStatusLine(visible.length);
+    fleetUpdateBulkBar();
+}
+
+function fleetUpdateStatusLine(visibleCount) {
+    var el = document.getElementById('fleet-status-line');
+    if (!el) return;
+    var total = _fleetNodes.length;
+    var pending = _fleetNodes.filter(function (n) { return _fleetNodeStatus[n.id || 'local'] === 'loading'; });
+    if (pending.length > 0) {
+        var names = pending.slice(0, 3).map(function (n) { return n.hostname || n.id || 'local'; }).join(', ');
+        el.textContent = 'Loading ' + (total - pending.length) + '/' + total + ' nodes — waiting on: ' + names + (pending.length > 3 ? ' (+' + (pending.length - 3) + ' more)' : '') + ' · ' + _fleetRows.length + ' items so far';
+    } else {
+        el.textContent = visibleCount + ' of ' + _fleetRows.length + ' items across ' + total + ' node' + (total === 1 ? '' : 's');
+    }
+}
+
+function fleetToggleSelect(cb) {
+    var key = cb.getAttribute('data-key');
+    if (!key) return;
+    if (cb.checked) _fleetSelected.add(key); else _fleetSelected.delete(key);
+    var tr = cb.closest('tr');
+    if (tr) tr.style.background = cb.checked ? 'rgba(59,130,246,0.06)' : '';
+    var visible = fleetVisibleRows();
+    var selAll = document.getElementById('fleet-select-all');
+    if (selAll) {
+        var all = visible.length > 0 && visible.every(function (r) { return _fleetSelected.has(r.key); });
+        selAll.checked = all;
+        selAll.indeterminate = !all && visible.some(function (r) { return _fleetSelected.has(r.key); });
+    }
+    fleetUpdateBulkBar();
+}
+
+function fleetToggleSelectAll(checked) {
+    fleetVisibleRows().forEach(function (r) { if (checked) _fleetSelected.add(r.key); else _fleetSelected.delete(r.key); });
+    renderFleetTable();
+}
+
+function fleetClearSelection() {
+    _fleetSelected.clear();
+    renderFleetTable();
+}
+
+function fleetUpdateBulkBar() {
+    var bar = document.getElementById('fleet-bulk-bar');
+    var count = document.getElementById('fleet-bulk-count');
+    if (!bar) return;
+    var n = _fleetSelected.size;
+    bar.style.display = n > 0 ? 'flex' : 'none';
+    if (count) count.textContent = n + ' selected';
+}
+
+// Bulk start / stop / restart across every selected row. Same endpoints
+// as the per-row buttons (see fleetAction), run four at a time so a big
+// selection doesn't open a hundred concurrent requests through the node
+// proxies. Rows whose state makes the action a no-op are skipped up
+// front (no "start" on something already running) — same rule as the
+// Control Panel's cpBatchAction.
+async function fleetBulkAction(action) {
+    var byKey = {};
+    _fleetRows.forEach(function (r) { byKey[r.key] = r; });
+    var items = [];
+    _fleetSelected.forEach(function (k) { if (byKey[k]) items.push(byKey[k]); });
+    if (action === 'start') items = items.filter(function (r) { return !r.isRunning; });
+    else items = items.filter(function (r) { return r.isRunning; });
+    if (items.length === 0) {
+        showToast('Nothing selected is in a state that can be ' + (action === 'start' ? 'started' : action === 'stop' ? 'stopped' : 'restarted') + '.', 'info');
+        return;
+    }
+    var nodeCount = new Set(items.map(function (r) { return r.nodeId; })).size;
+    var label = action.charAt(0).toUpperCase() + action.slice(1);
+    var what = items.length + ' item' + (items.length === 1 ? '' : 's') + ' across ' + nodeCount + ' node' + (nodeCount === 1 ? '' : 's');
+    if (!(await showConfirm(label + ' ' + what + '?', 'Bulk ' + action))) return;
+
+    var modal = showProgressModal(action === 'start' ? '▶️' : action === 'stop' ? '⏹️' : '🔄', label + ' ' + what);
+    items.forEach(function (r, i) { modal.addRow('bulk-' + i, r.name + ' · ' + r.server); });
+
+    activityStart();
+    var ok = 0, fail = 0, next = 0;
+    async function worker() {
+        while (next < items.length) {
+            var i = next++;
+            var r = items[i];
+            // A paused Docker container resumes with 'unpause', mirroring the per-row button.
+            var act = (action === 'start' && r.kind === 'docker' && r.state === 'paused') ? 'unpause' : action;
+            var path = r.kind === 'vm'
+                ? ('/api/vms/' + encodeURIComponent(r.name) + '/action')
+                : ('/api/containers/' + r.kind + '/' + encodeURIComponent(r.name) + '/action');
+            try {
+                var resp = await fetch(fleetApiUrl(r.nodeId, path), { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ action: act, force: false }) });
+                var data = await resp.json().catch(function () { return {}; });
+                if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+                ok++;
+                modal.updateRow('bulk-' + i, true, act + ' OK');
+            } catch (e) {
+                fail++;
+                modal.updateRow('bulk-' + i, false, e.message);
+            }
+        }
+    }
+    var workers = [];
+    for (var w = 0; w < Math.min(4, items.length); w++) workers.push(worker());
+    await Promise.all(workers);
+    activityStop();
+    modal.setFooter('<div style="text-align:center;font-size:13px;color:' + (fail ? '#ef4444' : '#10b981') + ';">' + ok + ' succeeded, ' + fail + ' failed</div>');
+    modal.showDone();
+    showToast(label + ': ' + ok + ' ok, ' + fail + ' failed', fail === 0 ? 'success' : 'error');
+    setTimeout(loadFleetContainers, 1000);
+}
+
+async function loadFleetContainers() {
+    // A reload requested mid-load (a per-row action's follow-up, say)
+    // runs once this one finishes rather than racing it.
+    if (_fleetLoading) { _fleetReloadQueued = true; return; }
+    var content = document.getElementById('fleet-containers-content');
+    if (!content) return;
+    _fleetLoading = true;
+    var btn = document.getElementById('fleet-load-btn');
+    if (btn) btn.disabled = true;
+
+    var wsNodes = (typeof allNodes !== 'undefined' && allNodes.length) ? allNodes : [{ id: 'local', hostname: 'local', is_self: true, cluster_name: 'WolfStack' }];
+    _fleetNodes = wsNodes;
+    _fleetRows = [];
+    _fleetNodeStatus = {};
+    wsNodes.forEach(function (n) { _fleetNodeStatus[n.id || 'local'] = 'loading'; });
+    // First paint: every server header with a per-node spinner.
+    renderFleetTable();
 
     var BS = 'margin:2px;font-size:18px;line-height:1;padding:3px 5px;';
     var DS = 'margin:2px;font-size:18px;line-height:1;padding:3px 5px;opacity:0.4;cursor:not-allowed;pointer-events:none;';
@@ -47223,11 +47437,10 @@ async function loadFleetContainers() {
             segs.push(barSeg('', diskPct, dc, diskLabel));
         }
         if (segs.length === 0) return '';
-        return '<tr class="storage-sub-row" style="background:var(--bg-secondary);"><td colspan="5" style="padding:4px 16px 6px 48px;border-top:none;">' +
+        return '<tr class="storage-sub-row" style="background:var(--bg-secondary);"><td colspan="6" style="padding:4px 16px 6px 48px;border-top:none;">' +
             '<div style="display:flex;align-items:center;gap:16px;font-size:11px;">' + segs.join('') + '</div>' +
         '</td></tr>';
     }
-
     function dockerButtons(nodeId, name, state) {
         var r = state === 'running', p = state === 'paused';
         var nid = escapeHtml(nodeId || 'local');
@@ -47316,14 +47529,30 @@ async function loadFleetContainers() {
         return h;
     }
 
+
+    function pushRow(node, kind, typeLabel, name, displayName, state, isRunning, ip, cellsHtml, subHtml, extraSearch) {
+        var nodeId = node.id || 'local';
+        var server = node.hostname || nodeId;
+        _fleetRows.push({
+            key: fleetRowKey(nodeId, kind, name),
+            nodeId: nodeId,
+            kind: kind,
+            typeLabel: typeLabel,
+            name: displayName,
+            server: server,
+            state: state,
+            isRunning: isRunning,
+            ip: ip,
+            searchText: [typeLabel, name, displayName, state, ip, server, node.cluster_name || '', extraSearch || ''].join(' ').toLowerCase(),
+            cellsHtml: cellsHtml,
+            subHtml: subHtml,
+        });
+    }
+
     async function scanNodeContainers(node) {
         var isLocal = !!node.is_self;
         var urlBase = isLocal ? '/api/' : '/api/nodes/' + encodeURIComponent(node.id) + '/proxy/';
         var nodeId = node.id || 'local';
-        var tbody = document.getElementById('fleet-tbody');
-        var safeId = (node.id || 'local').replace(/[^a-z0-9_-]/gi, '-');
-        var ph = document.getElementById('fleet-ph-' + safeId);
-        var rowsHtml = '';
 
         // Docker containers + stats
         try {
@@ -47340,7 +47569,6 @@ async function loadFleetContainers() {
                     var stateColor = c.state === 'running' ? '#10b981' : c.state === 'paused' ? '#f59e0b' : '#6b7280';
                     var cpu = containerCpu(s);
                     var cpuP = cpu ? cpu.share : -1;
-                    var memP = (s.memory_usage && s.memory_limit) ? Math.min(Math.round((s.memory_usage / s.memory_limit) * 100), 100) : -1;
                     var diskP = (c.disk_usage !== undefined && c.disk_total) ? Math.round((c.disk_usage / c.disk_total) * 100) : -1;
                     var sub = makeStatsSubRow(
                         cpuP, cpuP >= 0 ? cpu.text : '', cpu ? cpu.title : '',
@@ -47349,7 +47577,10 @@ async function loadFleetContainers() {
                     );
                     var dSvcBadges = (c.services && c.services.length > 0) ? '<div style="margin-top:3px;">' + c.services.map(function(s) { var sc = s.status === 'running' ? '#10b981' : '#ef4444'; return '<span style="display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;background:' + sc + '22;color:' + sc + ';border:1px solid ' + sc + '44;margin-right:4px;">' + escapeHtml(s.name) + '</span>'; }).join('') + '</div>' : '';
                     var dNetExtra = (c.gateway ? '<div style="font-size:10px;color:var(--text-muted);">GW: ' + escapeHtml(c.gateway) + '</div>' : '') + (c.mac_address ? '<div style="font-size:10px;color:var(--text-muted);">MAC: ' + escapeHtml(c.mac_address) + '</div>' : '');
-                    rowsHtml += '<tr><td>Docker</td><td><strong>' + escapeHtml(c.name) + '</strong>' + dSvcBadges + '</td><td><span style="color:' + stateColor + '">●</span> ' + escapeHtml(c.state || c.status || '?') + '</td><td style="font-size:12px;font-family:monospace;">' + escapeHtml(c.ip_address || '-') + dNetExtra + '</td><td>' + dockerButtons(nodeId, c.name, c.state) + '</td></tr>' + sub;
+                    var stateText = c.state || c.status || '?';
+                    var cells = '<td>Docker</td><td><strong>' + escapeHtml(c.name) + '</strong>' + dSvcBadges + '</td><td><span style="color:' + stateColor + '">●</span> ' + escapeHtml(stateText) + '</td><td style="font-size:12px;font-family:monospace;">' + escapeHtml(c.ip_address || '-') + dNetExtra + '</td><td>' + dockerButtons(nodeId, c.name, c.state) + '</td>';
+                    pushRow(node, 'docker', 'Docker', c.name, c.name, stateText, c.state === 'running', c.ip_address || '', cells, sub,
+                        (c.services || []).map(function (sv) { return sv.name; }).join(' '));
                 });
             }
         } catch (e) { }
@@ -47369,7 +47600,6 @@ async function loadFleetContainers() {
                     var stateColor = c.state === 'running' ? '#10b981' : c.state === 'frozen' ? '#f59e0b' : '#6b7280';
                     var cpu = containerCpu(s);
                     var cpuP = cpu ? cpu.share : -1;
-                    var memP = (s.memory_usage && s.memory_limit) ? Math.min(Math.round((s.memory_usage / s.memory_limit) * 100), 100) : -1;
                     var diskP = (c.disk_usage !== undefined && c.disk_total) ? Math.round((c.disk_usage / c.disk_total) * 100) : -1;
                     var sub = makeStatsSubRow(
                         cpuP, cpuP >= 0 ? cpu.text : '', cpu ? cpu.title : '',
@@ -47378,7 +47608,10 @@ async function loadFleetContainers() {
                     );
                     var lSvcBadges = (c.services && c.services.length > 0) ? '<div style="margin-top:3px;">' + c.services.map(function(s) { var sc = s.status === 'running' ? '#10b981' : '#ef4444'; return '<span style="display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;background:' + sc + '22;color:' + sc + ';border:1px solid ' + sc + '44;margin-right:4px;">' + escapeHtml(s.name) + '</span>'; }).join('') + '</div>' : '';
                     var lNetExtra = (c.gateway ? '<div style="font-size:10px;color:var(--text-muted);">GW: ' + escapeHtml(c.gateway) + '</div>' : '') + (c.mac_address ? '<div style="font-size:10px;color:var(--text-muted);">MAC: ' + escapeHtml(c.mac_address) + '</div>' : '');
-                    rowsHtml += '<tr><td>LXC</td><td><strong>' + escapeHtml(c.hostname || c.name) + '</strong>' + lSvcBadges + (c.hostname ? '<div style="font-size:11px;color:var(--text-muted);">CT ' + escapeHtml(c.name) + '</div>' : '') + '</td><td><span style="color:' + stateColor + '">●</span> ' + escapeHtml(c.state || '?') + '</td><td style="font-size:12px;font-family:monospace;">' + escapeHtml(c.ip_address || '-') + lNetExtra + '</td><td>' + lxcButtons(nodeId, c.name, c.state, c.storage_path) + '</td></tr>' + sub;
+                    var stateText = c.state || '?';
+                    var cells = '<td>LXC</td><td><strong>' + escapeHtml(c.hostname || c.name) + '</strong>' + lSvcBadges + (c.hostname ? '<div style="font-size:11px;color:var(--text-muted);">CT ' + escapeHtml(c.name) + '</div>' : '') + '</td><td><span style="color:' + stateColor + '">●</span> ' + escapeHtml(stateText) + '</td><td style="font-size:12px;font-family:monospace;">' + escapeHtml(c.ip_address || '-') + lNetExtra + '</td><td>' + lxcButtons(nodeId, c.name, c.state, c.storage_path) + '</td>';
+                    pushRow(node, 'lxc', 'LXC', c.name, c.hostname || c.name, stateText, c.state === 'running', c.ip_address || '', cells, sub,
+                        (c.services || []).map(function (sv) { return sv.name; }).join(' '));
                 });
             }
         } catch (e) { }
@@ -47392,30 +47625,31 @@ async function loadFleetContainers() {
                     var stateColor = v.running ? '#10b981' : '#6b7280';
                     var statusText = v.running ? 'running' : 'stopped';
                     var ip = v.wolfnet_ip || '-';
-                    var vmSub = '<tr class="storage-sub-row" style="background:var(--bg-secondary);"><td colspan="5" style="padding:4px 16px 6px 48px;border-top:none;">' +
+                    var vmSub = '<tr class="storage-sub-row" style="background:var(--bg-secondary);"><td colspan="6" style="padding:4px 16px 6px 48px;border-top:none;">' +
                         '<div style="display:flex;align-items:center;gap:16px;font-size:11px;">' +
                             '<div style="flex:1;display:flex;align-items:center;gap:6px;"><span></span><span>' + v.cpus + ' vCPU</span></div>' +
                             '<div style="flex:1;display:flex;align-items:center;gap:6px;"><span></span><span>' + v.memory_mb + ' MB</span></div>' +
                             '<div style="flex:1;display:flex;align-items:center;gap:6px;"><span></span><span>' + (v.disk_size_gb || '?') + ' GiB</span></div>' +
                         '</div></td></tr>';
-                    rowsHtml += '<tr><td>VM</td><td><strong>' + escapeHtml(v.name) + '</strong></td><td><span style="color:' + stateColor + '">●</span> ' + statusText + '</td><td style="font-size:12px;font-family:monospace;">' + escapeHtml(ip) + '</td><td>' + vmButtons(nodeId, v) + '</td></tr>' + vmSub;
+                    var cells = '<td>VM</td><td><strong>' + escapeHtml(v.name) + '</strong></td><td><span style="color:' + stateColor + '">●</span> ' + statusText + '</td><td style="font-size:12px;font-family:monospace;">' + escapeHtml(ip) + '</td><td>' + vmButtons(nodeId, v) + '</td>';
+                    pushRow(node, 'vm', 'VM', v.name, v.name, statusText, !!v.running, v.wolfnet_ip || '', cells, vmSub, '');
                 });
             }
         } catch (e) { }
 
-        // Replace placeholder with actual rows
-        if (ph) {
-            if (rowsHtml) {
-                ph.insertAdjacentHTML('afterend', rowsHtml);
-            } else {
-                ph.insertAdjacentHTML('afterend', '<tr style="color:var(--text-muted);"><td colspan="5" style="padding:8px 16px 8px 48px;">No containers or VMs on this node</td></tr>');
-            }
-            ph.remove();
-        }
+        _fleetNodeStatus[nodeId] = 'done';
+        // Repaint as each node lands so rows fill in progressively.
+        renderFleetTable();
     }
 
     await Promise.all(wsNodes.map(function (node) { return scanNodeContainers(node); }));
-    if (btn) { btn.disabled = false; btn.innerHTML = 'Refresh'; }
+    // Drop selections for items that no longer exist anywhere.
+    var live = new Set(_fleetRows.map(function (r) { return r.key; }));
+    _fleetSelected.forEach(function (k) { if (!live.has(k)) _fleetSelected.delete(k); });
+    renderFleetTable();
+    if (btn) btn.disabled = false;
+    _fleetLoading = false;
+    if (_fleetReloadQueued) { _fleetReloadQueued = false; loadFleetContainers(); }
 }
 
 
@@ -50598,7 +50832,7 @@ const SIDEBAR_FEATURES = [
     { group: 'Datacenter Views', items: [
         { key: 'appstore',         label: 'App Store' },
         { key: 'issues',           label: 'Issues' },
-        { key: 'global-wolfnet',   label: 'Global WolfNet View' },
+        { key: 'global-wolfnet',   label: 'Global View' },
         { key: 'topology',         label: '3D Server Room' },
         { key: 'wolfflow',         label: 'WolfFlow' },
         { key: 'cluster-browser',  label: 'Cluster Browser' },
@@ -70620,14 +70854,21 @@ function cpRender() {
     const searchEl = document.getElementById('cp-search');
     const q = (searchEl?.value || '').trim().toLowerCase();
 
-    const filtered = q
-        ? _cpInventory.filter(it =>
-            (it.name || '').toLowerCase().includes(q) ||
+    const kindSel = document.getElementById('cp-kind');
+    const kindFilter = kindSel ? kindSel.value : 'all';
+    const statusSel = document.getElementById('cp-status');
+    const statusFilter = statusSel ? statusSel.value : 'all';
+    const filtered = _cpInventory.filter(it => {
+        if (kindFilter !== 'all' && it.kind !== kindFilter) return false;
+        if (statusFilter === 'running' && it.status !== 'running') return false;
+        if (statusFilter === 'notrunning' && it.status === 'running') return false;
+        if (!q) return true;
+        return (it.name || '').toLowerCase().includes(q) ||
             (it.node_hostname || '').toLowerCase().includes(q) ||
             (it.image || '').toLowerCase().includes(q) ||
             (it.kind || '').toLowerCase().includes(q) ||
-            (it.status || '').toLowerCase().includes(q))
-        : _cpInventory.slice();
+            (it.status || '').toLowerCase().includes(q);
+    });
 
     // Build rows depending on the selected axis.
     let groupings; // Array<{ id, name, colour?, items, isAll?, isStale? }>
@@ -71413,7 +71654,12 @@ async function cpActionRaw(it, action) {
             body: JSON.stringify({ action }),
         });
     } else if (it.kind === 'vm') {
-        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/vms/${encodeURIComponent(it.name)}/${encodeURIComponent(action)}`, { method: 'POST' });
+        // src/vms/api.rs registers only /{name}/action with a JSON body.
+        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/vms/${encodeURIComponent(it.name)}/action`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action }),
+        });
     }
     if (!resp || !resp.ok) {
         const err = resp ? await resp.json().catch(() => ({})) : {};
@@ -79326,7 +79572,7 @@ const APP_DRAWER_TILES = [
     },
     {
         id: 'global-wolfnet', icon: '', name: 'Global View',
-        desc: 'World map of every cluster you manage.',
+        desc: 'Every container and VM across every node in one table, plus a fleet-wide WolfNet IP scan.',
     },
     {
         id: 'topology', icon: '', name: '3D Server Room',
@@ -83775,6 +84021,7 @@ function fleetMenuGroups() {
             label: 'Compute',
             items: [
                 { label: 'Control Panel', action: go('control-panel') },
+                { label: 'All Containers & VMs', action: go('control-panel') },
                 { label: 'WolfKube', action: go('kubernetes') },
                 { label: 'XO Pools', action: go('xopools') },
             ],

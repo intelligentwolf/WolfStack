@@ -3059,7 +3059,18 @@
                             <option value="cluster">Cluster</option>
                             <option value="custom">Custom groups</option>
                         </select>
-                        <input type="text" id="cp-search" placeholder="search…" oninput="cpRender()"
+                        <select id="cp-kind" aria-label="Filter by type" onchange="cpRender()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+                            <option value="all">All types</option>
+                            <option value="docker">Docker</option>
+                            <option value="lxc">LXC</option>
+                            <option value="vm">VM</option>
+                        </select>
+                        <select id="cp-status" aria-label="Filter by status" onchange="cpRender()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+                            <option value="all">All states</option>
+                            <option value="running">Running</option>
+                            <option value="notrunning">Not running</option>
+                        </select>
+                        <input type="text" id="cp-search" placeholder="search…" aria-label="Search inventory" oninput="cpRender()"
                             style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;min-width:180px;">
                         <button class="btn" onclick="cpReload()" title="Refresh inventory">↻</button>
                         <button class="btn btn-primary" id="cp-new-group-btn" onclick="cpCreateGroup()" style="display:none;">+ New group</button>
@@ -3396,11 +3407,11 @@
                         <div>
                             <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">
                                 Global View</h2>
-                            <p style="color:var(--text-secondary); font-size:13px; margin:0;">Fleet overview — WolfNet IPs, containers, VMs, and workloads across all nodes.</p>
+                            <p style="color:var(--text-secondary); font-size:13px; margin:0;">Every container and VM across every node in one table, plus a WolfNet IP scan of the whole fleet.</p>
                         </div>
                     </div>
                     <div style="display:flex; gap:10px; align-items:center;">
-                        <input type="text" id="gwn-filter" placeholder="Filter..." oninput="filterGlobalWolfNet()"
+                        <input type="text" id="gwn-filter" placeholder="Filter WolfNet IPs..." aria-label="Filter WolfNet IP table" oninput="filterGlobalWolfNet()"
                             style="padding:8px 14px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; color:var(--text-primary); font-size:13px; outline:none; font-family:inherit; width:200px;"
                             onfocus="this.style.borderColor='rgba(59,130,246,0.5)'"
                             onblur="this.style.borderColor='var(--border)'">
@@ -3448,24 +3459,49 @@
                 </div>
             </div>
 
+            <!-- Fleet Containers & VMs — loads as soon as the page opens -->
+            <div id="gwn-fleet-section" style="margin-bottom:20px;">
+                <div class="card">
+                    <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                        <h3 style="margin:0;">Fleet Containers &amp; VMs</h3>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                            <input type="text" id="fleet-search" placeholder="Search name, node, IP…" aria-label="Search containers and VMs" oninput="renderFleetTable()"
+                                style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px;min-width:200px;font-family:inherit;">
+                            <select id="fleet-type" aria-label="Filter by type" onchange="renderFleetTable()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px;">
+                                <option value="all">All types</option>
+                                <option value="docker">Docker</option>
+                                <option value="lxc">LXC</option>
+                                <option value="vm">VM</option>
+                            </select>
+                            <select id="fleet-state" aria-label="Filter by state" onchange="renderFleetTable()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px;">
+                                <option value="all">All states</option>
+                                <option value="running">Running</option>
+                                <option value="notrunning">Not running</option>
+                            </select>
+                            <button class="btn btn-sm" onclick="loadFleetContainers()" id="fleet-load-btn" title="Reload from every node"><span class="ws-icon-clean-wrap" data-icon="refresh"></span> Refresh</button>
+                        </div>
+                    </div>
+                    <div id="fleet-bulk-bar" role="status" aria-live="polite"
+                        style="display:none;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 16px;background:rgba(59,130,246,0.08);border-bottom:1px solid var(--border);font-size:13px;">
+                        <strong id="fleet-bulk-count">0 selected</strong>
+                        <button class="btn btn-sm" onclick="fleetBulkAction('start')" title="Start every selected item that is not running"><span class="ws-icon-clean-wrap" data-icon="play"></span> Start</button>
+                        <button class="btn btn-sm" onclick="fleetBulkAction('stop')" title="Stop every selected item that is running"><span class="ws-icon-clean-wrap" data-icon="stop"></span> Stop</button>
+                        <button class="btn btn-sm" onclick="fleetBulkAction('restart')" title="Restart every selected item that is running"><span class="ws-icon-clean-wrap" data-icon="restart"></span> Restart</button>
+                        <button class="btn btn-sm" onclick="fleetClearSelection()" style="margin-left:auto;">Clear selection</button>
+                    </div>
+                    <div id="fleet-status-line" style="font-size:12px;color:var(--text-muted);padding:6px 16px;border-bottom:1px solid var(--border);"></div>
+                    <div class="card-body" id="fleet-containers-content" style="padding:0; overflow-x:auto;">
+                        <p style="text-align:center;color:var(--text-muted);padding:24px;">Loading containers and VMs from every node…</p>
+                    </div>
+                </div>
+            </div>
+
             <div id="gwn-content">
                 <div class="card">
                     <div class="card-body" style="padding:48px; text-align:center; color:var(--text-muted);">
                         <div style="font-size:48px; margin-bottom:12px;"><span class="ws-icon-clean-wrap" data-icon="search"></span></div>
-                        <p style="font-size:14px; margin:0;">Click <strong>Scan</strong> to discover all IPs across your
+                        <p style="font-size:14px; margin:0;">Click <strong>Scan</strong> to discover every WolfNet IP across your
                             fleet.</p>
-                    </div>
-                </div>
-            </div>
-            <!-- Fleet Containers & VMs (lazy loaded) -->
-            <div id="gwn-fleet-section" style="margin-top:20px; display:none;">
-                <div class="card">
-                    <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-                        <h3>Fleet Containers & VMs</h3>
-                        <button class="btn btn-sm btn-primary" onclick="loadFleetContainers()" id="fleet-load-btn"><span class="ws-icon-clean-wrap" data-icon="package"></span> Load Containers</button>
-                    </div>
-                    <div class="card-body" id="fleet-containers-content" style="padding:0; overflow-x:auto;">
-                        <p style="text-align:center;color:var(--text-muted);padding:24px;">Click <strong>Load Containers</strong> to fetch container and VM details from all nodes.</p>
                     </div>
                 </div>
             </div>
