@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.29.0: Global View shows every container and VM the moment it opens, with search, filters, sorting and bulk actions, and Control Panel VM actions reach a real route** _(2026-09-11 — [`d6e2c95d`](https://github.com/intelligentwolf/WolfStack/commit/d6e2c95d4551ea780c3dd5f00cabe11a71da0215))_
 - **v25.28.1: WolfNet can be started, stopped and restarted on an Unraid agent, and the page no longer calls it "Not Installed"** _(2026-09-10 — [`a3096729`](https://github.com/intelligentwolf/WolfStack/commit/a30967292ac2409d4a29958196ab529f2fd83936))_
 - **v25.28.0: a Compose stack can be force-recreated from the Compose page** _(2026-09-10 — [`583da189`](https://github.com/intelligentwolf/WolfStack/commit/583da1894db48826a9cfe5c6a5880de9b47a0cdd))_
 - **v25.27.0: a container's WolfNet IP can no longer be hijacked by an old rule on a wider-than-/24 WolfNet, backup folder exclusions are editable in place, and the Unraid agent configures WolfNet on first run** _(2026-09-10 — [`bfa2f4eb`](https://github.com/intelligentwolf/WolfStack/commit/bfa2f4eb02c2b0b757c1f5445e582243945e62ca))_
