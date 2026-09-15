@@ -2753,18 +2753,20 @@ spec:
     result
 }
 
+pub struct PersistentVolumeRequest<'a> {
+    pub name: &'a str,
+    pub namespace: &'a str,
+    pub size: &'a str,
+    pub access_mode: &'a str,
+    pub storage_type: &'a str,
+    pub host_path: Option<&'a str>,
+    pub nfs_server: Option<&'a str>,
+    pub nfs_path: Option<&'a str>,
+}
+
 /// Create a PersistentVolume + PVC with a specific backing storage (hostPath or NFS)
-pub fn create_pv_and_pvc(
-    kubeconfig: &str,
-    name: &str,
-    namespace: &str,
-    size: &str,
-    access_mode: &str,
-    storage_type: &str,
-    host_path: Option<&str>,
-    nfs_server: Option<&str>,
-    nfs_path: Option<&str>,
-) -> Result<String, String> {
+pub fn create_pv_and_pvc(kubeconfig: &str, request: PersistentVolumeRequest<'_>) -> Result<String, String> {
+    let PersistentVolumeRequest { name, namespace, size, access_mode, storage_type, host_path, nfs_server, nfs_path } = request;
     let pv_name = format!("{}-pv", name);
 
     let volume_source = match storage_type {
@@ -3159,6 +3161,17 @@ pub fn apply_yaml(kubeconfig: &str, yaml_content: &str) -> Result<String, String
 // ─── App Deployment ───
 // ═══════════════════════════════════════════════
 
+pub struct AppDeployment<'a> {
+    pub app_name: &'a str,
+    pub container_name: &'a str,
+    pub namespace: &'a str,
+    pub image: &'a str,
+    pub ports: &'a [String],
+    pub env: &'a [String],
+    pub volumes: &'a [String],
+    pub replicas: u32,
+}
+
 /// Deploy an application to Kubernetes by generating Deployment + Service YAML
 /// and applying it. Converts Docker-style port mappings and env vars to k8s format.
 ///
@@ -3166,17 +3179,8 @@ pub fn apply_yaml(kubeconfig: &str, yaml_content: &str) -> Result<String, String
 ///   Format: "hostPort:containerPort" where hostPort becomes nodePort
 /// * `env` — Docker-style env vars, e.g. ["KEY=value", "DB_HOST=localhost"]
 /// * `volumes` — Docker-style volume mounts, e.g. ["/host/path:/container/path"]
-pub fn deploy_app_to_k8s(
-    kubeconfig: &str,
-    app_name: &str,
-    container_name: &str,
-    namespace: &str,
-    image: &str,
-    ports: &[String],
-    env: &[String],
-    volumes: &[String],
-    replicas: u32,
-) -> Result<String, String> {
+pub fn deploy_app_to_k8s(kubeconfig: &str, request: AppDeployment<'_>) -> Result<String, String> {
+    let AppDeployment { app_name, container_name, namespace, image, ports, env, volumes, replicas } = request;
     // Sanitize container name for k8s (lowercase, alphanumeric + hyphens only)
     let container_name: String = container_name
         .to_lowercase()

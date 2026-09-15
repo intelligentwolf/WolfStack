@@ -246,6 +246,27 @@ const TOMBSTONE_RETENTION_SECS: u64 = 30 * 24 * 3600;
 /// Hard cap on remembered tombstones — oldest are dropped first.
 const TOMBSTONE_MAX: usize = 500;
 
+pub struct ServiceSettingsUpdate {
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+    pub desired: Option<u32>,
+    pub lb_policy: Option<String>,
+    pub allowed_nodes: Option<Vec<String>>,
+    pub failover: Option<bool>,
+}
+
+pub struct AdoptService {
+    pub name: String,
+    pub container_name: String,
+    pub node_id: String,
+    pub image: String,
+    pub runtime: Runtime,
+    pub cluster_name: String,
+    pub env: Vec<String>,
+    pub ports: Vec<String>,
+    pub volumes: Vec<String>,
+}
+
 /// Shared WolfRun state
 pub struct WolfRunState {
     services: RwLock<Vec<WolfRunService>>,
@@ -547,7 +568,8 @@ impl WolfRunState {
     }
 
     /// Update service settings (min, max, desired replicas)
-    pub fn update_settings(&self, id: &str, min: Option<u32>, max: Option<u32>, desired: Option<u32>, lb_policy: Option<String>, allowed_nodes: Option<Vec<String>>, failover: Option<bool>) -> bool {
+    pub fn update_settings(&self, id: &str, settings: ServiceSettingsUpdate) -> bool {
+        let ServiceSettingsUpdate { min, max, desired, lb_policy, allowed_nodes, failover } = settings;
         let mut svcs = self.services.write().unwrap();
         if let Some(svc) = svcs.iter_mut().find(|s| s.id == id) {
             if let Some(mn) = min { svc.min_replicas = mn; }
@@ -599,18 +621,8 @@ impl WolfRunState {
 
     /// Adopt an existing container as a WolfRun service.
     /// The container is registered as the first running instance.
-    pub fn adopt(
-        &self,
-        name: String,
-        container_name: String,
-        node_id: String,
-        image: String,
-        runtime: Runtime,
-        cluster_name: String,
-        env: Vec<String>,
-        ports: Vec<String>,
-        volumes: Vec<String>,
-    ) -> WolfRunService {
+    pub fn adopt(&self, request: AdoptService) -> WolfRunService {
+        let AdoptService { name, container_name, node_id, image, runtime, cluster_name, env, ports, volumes } = request;
         let id = uuid::Uuid::new_v4().to_string();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
@@ -1066,11 +1078,12 @@ mod tombstone_tests {
             .join(format!("wolfrun-tombstone-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("create temp wolfrun dir");
-        let mut locs = crate::paths::FileLocations::default();
-        locs.wolfrun_dir = tmp.to_string_lossy().into_owned();
-        locs.wolfrun_services = tmp.join("services.json").to_string_lossy().into_owned();
-        locs.wolfrun_failover_events =
-            tmp.join("failover-events.json").to_string_lossy().into_owned();
+        let locs = crate::paths::FileLocations {
+            wolfrun_dir: tmp.to_string_lossy().into_owned(),
+            wolfrun_services: tmp.join("services.json").to_string_lossy().into_owned(),
+            wolfrun_failover_events: tmp.join("failover-events.json").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         crate::paths::set_for_test(locs);
 
         let state = WolfRunState::new();
@@ -1789,7 +1802,7 @@ pub async fn reconcile(
                         env.push(format!("WOLFRUN_SERVICE={}", service.id));
                         env.push(format!("WOLFRUN_SERVICE_NAME={}", service.name));
 
-                        deploy_docker(client, cluster_secret, &node, &container_name, service, &env, wolfrun, &node_id).await;
+                        deploy_docker(client, cluster_secret, &node, DockerDeployment { container_name: &container_name, service, env: &env, node_id: &node_id }, wolfrun).await;
                     }
                     Runtime::Lxc => {
                         // LXC: clone from template, deploy to scheduler's target node
@@ -2146,17 +2159,22 @@ pub async fn reconcile(
 
 // ─── Deployment Helpers ───
 
+struct DockerDeployment<'a> {
+    container_name: &'a str,
+    service: &'a WolfRunService,
+    env: &'a [String],
+    node_id: &'a str,
+}
+
 /// Deploy a Docker container on a node
 async fn deploy_docker(
     client: &reqwest::Client,
     cluster_secret: &str,
     node: &crate::agent::Node,
-    container_name: &str,
-    service: &WolfRunService,
-    env: &[String],
+    deployment: DockerDeployment<'_>,
     wolfrun: &WolfRunState,
-    node_id: &str,
 ) {
+    let DockerDeployment { container_name, service, env, node_id } = deployment;
     let mut payload = serde_json::json!({
         "name": container_name,
         "image": service.image,
@@ -2175,10 +2193,11 @@ async fn deploy_docker(
         let env_owned = env.to_vec();
         let (wolfnet_ip, created) = tokio::task::spawn_blocking(move || {
             let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
-            let created = crate::containers::docker_create(
-                &name, &image, &ports, &env_owned,
-                wolfnet_ip.as_deref(), None, None, None, &volumes,
-            );
+            let created = crate::containers::docker_create(crate::containers::DockerCreateOptions {
+                name: &name, image: &image, ports: &ports, env: &env_owned,
+                wolfnet_ip: wolfnet_ip.as_deref(), memory: None, cpus: None, storage: None,
+                volumes: &volumes,
+            });
             if created.is_ok() {
                 let _ = crate::containers::docker_start(&name);
             }
@@ -2531,10 +2550,11 @@ pub async fn manage_standby(
                 Runtime::Docker => {
                     // For Docker: pull the image and create the container stopped
                     let created = if target_node.is_self {
-                        match crate::containers::docker_create(
-                            &standby_name, &service.image, &service.ports, &service.env,
-                            standby_ip.as_deref(), None, None, None, &service.volumes,
-                        ) {
+                        match crate::containers::docker_create(crate::containers::DockerCreateOptions {
+                            name: &standby_name, image: &service.image, ports: &service.ports, env: &service.env,
+                            wolfnet_ip: standby_ip.as_deref(), memory: None, cpus: None, storage: None,
+                            volumes: &service.volumes,
+                        }) {
                             Ok(_) => true,
                             Err(e) => {
                                 warn!("WolfRun failover: failed to create standby Docker '{}': {}", standby_name, e);

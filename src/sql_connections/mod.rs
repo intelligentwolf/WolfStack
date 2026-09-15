@@ -268,7 +268,7 @@ pub fn list_history(user: &str, connection_id: &str) -> Vec<SavedQueryEntry> {
     let mut out: Vec<_> = load_saved_queries().history.into_iter()
         .filter(|e| e.user == user && e.connection_id == connection_id)
         .collect();
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     out.truncate(20);
     out
 }
@@ -299,7 +299,7 @@ pub fn push_history(user: &str, connection_id: &str, sql: &str) -> Result<(), St
         by_key.entry((e.user.clone(), e.connection_id.clone())).or_default().push(e);
     }
     for v in by_key.values_mut() {
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         v.truncate(20);
     }
     f.history = by_key.into_values().flatten().collect();
@@ -658,7 +658,13 @@ pub async fn execute(
     // of silently failing or calling a dead address.
     cluster: Option<&crate::agent::ClusterState>,
 ) -> Result<SqlResult, String> {
-    execute_with_schema(connection_id, query, requested, caller, cluster_secret, exec_timeout, cluster, None).await
+    execute_with_schema(connection_id, query, requested, caller, cluster_secret, ExecutionOptions { exec_timeout, cluster, schema: None }).await
+}
+
+pub struct ExecutionOptions<'a> {
+    pub exec_timeout: Option<Duration>,
+    pub cluster: Option<&'a crate::agent::ClusterState>,
+    pub schema: Option<&'a str>,
 }
 
 /// Same as `execute` but with an optional schema override that the
@@ -672,10 +678,9 @@ pub async fn execute_with_schema(
     requested: SqlPermission,
     caller: Caller,
     cluster_secret: &str,
-    exec_timeout: Option<Duration>,
-    cluster: Option<&crate::agent::ClusterState>,
-    schema: Option<&str>,
+    options: ExecutionOptions<'_>,
 ) -> Result<SqlResult, String> {
+    let ExecutionOptions { exec_timeout, cluster, schema } = options;
     let cfg = load();
     let conn = cfg.connections.iter()
         .find(|c| c.id == connection_id)
@@ -720,7 +725,7 @@ pub async fn execute_with_schema(
                 return Err(msg);
             }
         };
-        execute_proxied(&conn, query, requested, &caller, cluster_secret, exec_timeout, cluster, schema).await
+        execute_proxied(&conn, query, requested, &caller, cluster_secret, cluster, QueryOptions { exec_timeout, schema }).await
     }
 }
 
@@ -804,6 +809,11 @@ async fn execute_local(
     }
 }
 
+struct QueryOptions<'a> {
+    exec_timeout: Option<Duration>,
+    schema: Option<&'a str>,
+}
+
 /// Proxied execution — POST the query to the target node's
 /// `/api/sql-connections/{id}/query-proxy` endpoint with cluster-secret
 /// auth. That peer runs `execute_local` on our behalf and returns the
@@ -820,10 +830,10 @@ async fn execute_proxied(
     requested: SqlPermission,
     caller: &Caller,
     cluster_secret: &str,
-    exec_timeout: Option<Duration>,
     cluster: &crate::agent::ClusterState,
-    schema: Option<&str>,
+    options: QueryOptions<'_>,
 ) -> Result<SqlResult, String> {
+    let QueryOptions { exec_timeout, schema } = options;
     // Resolve the target peer's address from cluster state. We rely on
     // the agent module's snapshot rather than re-reading nodes.json so
     // the address reflects the currently-observed reachable value

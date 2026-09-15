@@ -111,7 +111,7 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     proposal::{
-        Evidence, EvidenceLink, Proposal, ProposalScope, ProposalSource, RemediationPlan,
+        Evidence, EvidenceLink, Proposal, ProposalScope, RemediationPlan,
         Severity,
     },
     vulnerability::{is_critical_package, PackageManager},
@@ -1825,7 +1825,7 @@ fn score_v2(vector: &str) -> Option<f32> {
     let exploitability = 20.0 * av * ac * au;
     let f = if impact == 0.0 { 0.0 } else { 1.176 };
     let base = (0.6 * impact + 0.4 * exploitability - 1.5) * f;
-    Some(((base * 10.0).round() / 10.0).max(0.0).min(10.0))
+    Some(((base * 10.0).round() / 10.0).clamp(0.0, 10.0))
 }
 
 /// Generic CVSS vector parser: splits on `/`, takes everything after
@@ -2577,9 +2577,8 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context, suppressed_no_fix: 
         }
     };
 
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         severity,
         title,
         why,
@@ -2636,9 +2635,8 @@ fn build_no_fix_only_card(
             links: Vec::new(),
         },
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         Severity::Info,
         title,
         why,
@@ -3022,8 +3020,8 @@ pub fn analyze(
 
 fn build_kernel_unidentified(k: &KernelUnidentified, scope: &ProposalScope) -> Proposal {
     let target_label = k.target.as_target().label();
-    Proposal::new(
-        FINDING_KERNEL_UNIDENTIFIED, ProposalSource::Rule, Severity::Warn,
+    Proposal::new_rule(
+        FINDING_KERNEL_UNIDENTIFIED, Severity::Warn,
         format!("OSV scanner could not identify the running kernel package on {}", target_label),
         format!(
             "The running kernel `{}` on {} could not be resolved to an owning \
@@ -3125,9 +3123,8 @@ fn build_breadcrumb(b: &UnrecognizedDerivativeBreadcrumb, scope: &ProposalScope)
             links: Vec::new(),
         },
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_UNRECOGNIZED_DERIVATIVE,
-        ProposalSource::Rule,
         Severity::Info,
         title,
         why,
@@ -3767,8 +3764,7 @@ mod tests {
             kev_listed: kev,
             fix_available: false,
         };
-        let mut cfg = OsvConfig::default();
-        cfg.kev_only = true;
+        let mut cfg = OsvConfig { kev_only: true, ..Default::default() };
         assert!(should_emit(&mk(true), &cfg));
         assert!(!should_emit(&mk(false), &cfg));
         cfg.kev_only = false;
@@ -4141,9 +4137,7 @@ mod tests {
     fn severity_floor_hides_findings_below_threshold_but_keeps_kev() {
         // Floor=High should hide CVSS 5.0 (Warn tier) but always
         // surface KEV-listed findings regardless of score.
-        let mut cfg = OsvConfig::default();
-        cfg.severity_floor = Severity::High;
-        cfg.suppress_no_fix = false;
+        let cfg = OsvConfig { severity_floor: Severity::High, suppress_no_fix: false, ..Default::default() };
 
         let warn_finding   = mk_finding(Some(5.0), false, true);
         let high_finding   = mk_finding(Some(7.5), false, true);
@@ -4159,9 +4153,7 @@ mod tests {
 
     #[test]
     fn severity_floor_critical_hides_high_keeps_kev() {
-        let mut cfg = OsvConfig::default();
-        cfg.severity_floor = Severity::Critical;
-        cfg.suppress_no_fix = false;
+        let cfg = OsvConfig { severity_floor: Severity::Critical, suppress_no_fix: false, ..Default::default() };
 
         let high   = mk_finding(Some(7.5), false, true);
         let crit   = mk_finding(Some(9.5), false, true);
@@ -4395,7 +4387,7 @@ mod tests {
 
     #[test]
     fn extra_covered_includes_pending_proposals_for_scanned_targets() {
-        use crate::predictive::proposal::{ProposalStore, ProposalSource, RemediationPlan};
+        use crate::predictive::proposal::{ProposalStore, RemediationPlan};
         let ctx = Context::for_node("node-a");
         let mut store = ProposalStore::default();
         // A pending OSV finding for the host whose CVE we are about
@@ -4404,9 +4396,8 @@ mod tests {
             node_id: "node-a".into(),
             resource_id: Some("osv:host:CVE-2099-0001".into()),
         };
-        store.upsert(Proposal::new(
+        store.upsert(Proposal::new_rule(
             FINDING_TYPE,
-            ProposalSource::Rule,
             Severity::High,
             "stale", "stale", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
@@ -4523,8 +4514,7 @@ mod tests {
         let ctx = Context::for_node("node-a");
         let acks = AckStore::default();
         let proposals = crate::predictive::proposal::ProposalStore::default();
-        let mut config = OsvConfig::default();
-        config.kev_only = true;
+        let config = OsvConfig { kev_only: true, ..Default::default() };
         let facts = OsvFacts {
             findings: Vec::new(),
             covered_targets: Vec::new(),
@@ -4571,13 +4561,12 @@ mod tests {
 
     #[test]
     fn extra_covered_handles_non_cve_vuln_ids() {
-        use crate::predictive::proposal::{ProposalStore, ProposalSource, RemediationPlan};
+        use crate::predictive::proposal::{ProposalStore, RemediationPlan};
         let ctx = Context::for_node("node-a");
         let mut store = ProposalStore::default();
         // Proposal whose vuln id is a GHSA, not a CVE.
-        store.upsert(Proposal::new(
+        store.upsert(Proposal::new_rule(
             FINDING_TYPE,
-            ProposalSource::Rule,
             Severity::High,
             "x", "x", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
@@ -4607,11 +4596,11 @@ mod tests {
         // we matched on `contains`, which would let LXC scope auto-
         // resolve when a host scan completed. starts_with-with-colon
         // prevents that — verify.
-        use crate::predictive::proposal::{ProposalStore, ProposalSource, RemediationPlan};
+        use crate::predictive::proposal::{ProposalStore, RemediationPlan};
         let ctx = Context::for_node("node-a");
         let mut store = ProposalStore::default();
-        store.upsert(Proposal::new(
-            FINDING_TYPE, ProposalSource::Rule, Severity::High,
+        store.upsert(Proposal::new_rule(
+            FINDING_TYPE, Severity::High,
             "x", "x", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
             ProposalScope {
@@ -4635,12 +4624,11 @@ mod tests {
 
     #[test]
     fn extra_covered_skips_unscanned_targets() {
-        use crate::predictive::proposal::{ProposalStore, ProposalSource, RemediationPlan};
+        use crate::predictive::proposal::{ProposalStore, RemediationPlan};
         let ctx = Context::for_node("node-a");
         let mut store = ProposalStore::default();
-        store.upsert(Proposal::new(
+        store.upsert(Proposal::new_rule(
             FINDING_TYPE,
-            ProposalSource::Rule,
             Severity::High,
             "x", "x", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },

@@ -1465,7 +1465,7 @@ impl AiAgent {
     /// can flag slow drift the static thresholds miss.
     ///
     /// Alerts are fanned out to the operator's private channels (email
-    /// + Discord/Telegram/Slack). They are NEVER posted to the public
+    /// and Discord/Telegram/Slack). They are NEVER posted to the public
     /// status page — AI output describes host internals (processes,
     /// ports, security findings, config choices) that must not leak to
     /// anonymous status-page viewers. Status pages auto-post only
@@ -2119,11 +2119,7 @@ fn parse_actions(response: &str) -> Vec<AiAction> {
 /// Strip [ACTION ...] ... [/ACTION] tags from text, leaving clean prose
 fn strip_action_tags(text: &str) -> String {
     let mut result = text.to_string();
-    loop {
-        let start = match result.find("[ACTION ") {
-            Some(i) => i,
-            None => break,
-        };
+    while let Some(start) = result.find("[ACTION ") {
         let end = match result[start..].find("[/ACTION]") {
             Some(i) => start + i + 9,
             None => break,
@@ -2303,8 +2299,7 @@ pub fn log_action_audit(action: &AiAction, event: &str, user: &str, output: &str
 /// AI-invented rule that matches nothing looks deployed while never firing.
 fn execute_probe_tags(response: &str) -> String {
     let mut result = response.to_string();
-    loop {
-        let start = match result.find("[PROBE]") { Some(i) => i, None => break };
+    while let Some(start) = result.find("[PROBE]") {
         let end = match result[start..].find("[/PROBE]") { Some(i) => start + i, None => break };
         let json = result[start + 7..end].trim().to_string();
 
@@ -2356,11 +2351,7 @@ async fn execute_wolfnote_tags(response: &str) -> String {
     let mut result = response.to_string();
 
     // Process tags iteratively (can't mutate while finding)
-    loop {
-        let start_idx = match result.find("[WOLFNOTE") {
-            Some(i) => i,
-            None => break,
-        };
+    while let Some(start_idx) = result.find("[WOLFNOTE") {
         let end_tag = match result[start_idx..].find("[/WOLFNOTE]") {
             Some(i) => start_idx + i,
             None => break,
@@ -2833,7 +2824,7 @@ async fn call_local(
     history: &[ChatMessage],
     user_msg: &str,
 ) -> Result<String, String> {
-    call_local_inner(client, base_url, api_key, model, system, history, user_msg, false).await
+    call_local_inner(client, LocalEndpoint { base_url, api_key }, model, system, history, user_msg, false).await
 }
 
 /// Function-calling variant of `call_local`. Sends the OpenAI-compatible
@@ -2855,19 +2846,24 @@ async fn call_local_with_tools(
     history: &[ChatMessage],
     user_msg: &str,
 ) -> Result<String, String> {
-    call_local_inner(client, base_url, api_key, model, system, history, user_msg, true).await
+    call_local_inner(client, LocalEndpoint { base_url, api_key }, model, system, history, user_msg, true).await
+}
+
+struct LocalEndpoint<'a> {
+    base_url: &'a str,
+    api_key: &'a str,
 }
 
 async fn call_local_inner(
     client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
+    endpoint: LocalEndpoint<'_>,
     model: &str,
     system: &str,
     history: &[ChatMessage],
     user_msg: &str,
     with_tools: bool,
 ) -> Result<String, String> {
+    let LocalEndpoint { base_url, api_key } = endpoint;
     if base_url.is_empty() {
         return Err("Local AI URL not configured — set it in Settings → AI Agent".to_string());
     }
@@ -4005,20 +4001,26 @@ fn get_top_processes() -> Option<String> {
     Some(result)
 }
 
-pub fn build_metrics_summary(
-    hostname: &str,
-    cpu_percent: f32,
-    memory_used_gb: f64,
-    memory_total_gb: f64,
-    disk_used_gb: f64,
-    disk_total_gb: f64,
-    docker_count: u32,
-    lxc_count: u32,
-    vm_count: u32,
-    uptime_secs: u64,
-    guest_cpu_stats: Option<&[(&str, &str, u64, &str, f32)]>, // (pve_node, guest_type, vmid, name, cpu_percent)
-    k8s_summary: Option<&str>,
-) -> String {
+/// (PVE node, guest type, VM ID, name, CPU usage).
+pub type GuestCpuStat<'a> = (&'a str, &'a str, u64, &'a str, f32);
+
+pub struct MetricsSummary<'a> {
+    pub hostname: &'a str,
+    pub cpu_percent: f32,
+    pub memory_used_gb: f64,
+    pub memory_total_gb: f64,
+    pub disk_used_gb: f64,
+    pub disk_total_gb: f64,
+    pub docker_count: u32,
+    pub lxc_count: u32,
+    pub vm_count: u32,
+    pub uptime_secs: u64,
+    pub guest_cpu_stats: Option<&'a [GuestCpuStat<'a>]>,
+    pub k8s_summary: Option<&'a str>,
+}
+
+pub fn build_metrics_summary(input: MetricsSummary<'_>) -> String {
+    let MetricsSummary { hostname, cpu_percent, memory_used_gb, memory_total_gb, disk_used_gb, disk_total_gb, docker_count, lxc_count, vm_count, uptime_secs, guest_cpu_stats, k8s_summary } = input;
     let mem_percent = if memory_total_gb > 0.0 { (memory_used_gb / memory_total_gb * 100.0) as u32 } else { 0 };
     let disk_percent = if disk_total_gb > 0.0 { (disk_used_gb / disk_total_gb * 100.0) as u32 } else { 0 };
     let uptime_hours = uptime_secs / 3600;

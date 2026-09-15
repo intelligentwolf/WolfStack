@@ -37,7 +37,7 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
 };
 
@@ -441,9 +441,8 @@ fn build_unpublished_proposal(u: &UnpublishedContainer, scope: &ProposalScope) -
         format!("docker inspect {} --format '{{{{json .NetworkSettings.Ports}}}}'", u.container),
         format!("docker stop {} && docker start {}", u.container, u.container),
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE_UNPUBLISHED,
-        ProposalSource::Rule,
         Severity::High,
         title,
         why,
@@ -492,9 +491,8 @@ fn build_conflict_proposal(c: &Conflict, scope: &ProposalScope) -> Proposal {
             links: Vec::new(),
         });
     }
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE_CONFLICT,
-        ProposalSource::Rule,
         Severity::Warn,
         title,
         why,

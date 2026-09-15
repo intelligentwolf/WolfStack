@@ -52,6 +52,7 @@
 //!        hitting 12 nodes becomes 12 auto-reports for one incident.
 //!     6. Replies need a human. Auto-send + no follow-up = case dies
 //!        in the desk's queue.
+//!
 //!   The regression test `only_api_handler_calls_send_report` enforces
 //!   this at build time.
 //! - **Try to discover NEW abuse contacts beyond whois.** No RIPE
@@ -236,7 +237,7 @@ pub fn collect_evidence(
         })
         .collect();
     // Newest first, then trim.
-    out.sort_by(|a, b| b.timestamp_unix.cmp(&a.timestamp_unix));
+    out.sort_by_key(|e| std::cmp::Reverse(e.timestamp_unix));
     out.truncate(max_lines);
     out
 }
@@ -392,6 +393,7 @@ impl ReportHistory {
 ///   - the alerting loop in `alerting.rs`
 ///   - a `cron`-style scheduled task
 ///   - a tailing loop / log monitor
+///
 /// The regression test `only_api_handler_calls_send_report` will fail
 /// the build if a second caller appears anywhere in the source tree.
 /// See the module-level doc for the six reasons this is forbidden.

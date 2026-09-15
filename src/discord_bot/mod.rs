@@ -469,6 +469,7 @@ pub async fn send_discord_message(
 /// desired set is the union of:
 ///   - the global `AlertConfig.discord_bot_token` (when non-empty), and
 ///   - every per-agent `discord.bot_token` override.
+///
 /// For each unique token the supervisor keeps one gateway session
 /// (run_once) alive; tokens that leave the set have their session
 /// aborted. Sessions that exit on their own (gateway dropped, error)

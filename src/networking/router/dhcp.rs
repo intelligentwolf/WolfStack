@@ -390,12 +390,8 @@ pub fn resolve_apply_interface(lan: &LanSegment) -> Result<ApplyResolution, Stri
 /// when no interface has it. Walks `/sys/class/net` and asks `ip addr`
 /// per interface — same shape the rest of dhcp.rs uses.
 fn find_interface_with_ip(target_ip: &str) -> Option<String> {
-    for iface in list_host_interfaces() {
-        if interface_addresses(&iface).iter().any(|ip| ip == target_ip) {
-            return Some(iface);
-        }
-    }
-    None
+    list_host_interfaces().into_iter()
+        .find(|iface| interface_addresses(iface).iter().any(|ip| ip == target_ip))
 }
 
 /// If `iface` is enslaved to a Linux bridge, return the bridge name.

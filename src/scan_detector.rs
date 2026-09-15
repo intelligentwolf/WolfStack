@@ -28,7 +28,7 @@
 //! `inode→pid` map), and flag any that is not allowlisted and persists
 //! for `raw_socket_min_samples` consecutive samples. The persistence gate
 //! + allowlist (dhclient, tcpdump, ping, keepalived, …) keep brief/benign
-//! raw-socket users from being actioned.
+//!   raw-socket users from being actioned.
 //!
 //! ## Why /proc not eBPF
 //!
@@ -180,7 +180,7 @@ fn default_allowlist() -> Vec<String> {
 ///   - Does killing it take down a FUSE/kernel mount?  (pmxcfs, lxcfs, fuse-*)
 ///   - Does killing it brick the OS networking stack?  (NetworkManager, systemd-networkd)
 ///   - Does killing it kill running guests (data loss for VM tenants)?  (libvirtd, qemu-kvm)
-/// If yes to any, it goes here.
+///     If yes to any, it goes here.
 pub const ESSENTIAL_SAFETY_COMMS: &[&str] = &[
     // ── Proxmox VE cluster filesystem + services ─────────────────
     // pmxcfs → /etc/pve. corosync → quorum. HA stack → fence-on-kill.
@@ -926,10 +926,12 @@ mod tests {
 
     #[test]
     fn config_round_trip() {
-        let mut cfg = ScanDetectorConfig::default();
-        cfg.threshold_destinations = 75;
-        cfg.action = "alert_only".into();
-        cfg.allowlist_uids = vec![1000, 1001];
+        let cfg = ScanDetectorConfig {
+            threshold_destinations: 75,
+            action: "alert_only".into(),
+            allowlist_uids: vec![1000, 1001],
+            ..Default::default()
+        };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: ScanDetectorConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.threshold_destinations, 75);

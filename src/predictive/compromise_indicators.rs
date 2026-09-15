@@ -71,7 +71,7 @@ use serde::{Deserialize, Serialize};
 use crate::predictive::{
     Context,
     ack::AckStore,
-    proposal::{Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Evidence, Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 /// Stable IP of the known C2 server from the 2026-05-14 incident.
@@ -943,9 +943,8 @@ fn build_root_shell_proposal(shell: &str, rem: Option<&RemediationOutcome>, scop
         },
     ];
     if let Some(r) = rem { evidence.push(remediation_evidence(r)); }
-    Proposal::new(
+    Proposal::new_rule(
         FT_ROOT_SHELL,
-        ProposalSource::Rule,
         Severity::Critical,
         format!("Root login shell is `{}` — not a standard interactive shell", shell),
         format!(
@@ -982,9 +981,8 @@ fn build_locker_binary_proposal(rem: Option<&RemediationOutcome>, scope: &Propos
         },
     ];
     if let Some(r) = rem { evidence.push(remediation_evidence(r)); }
-    Proposal::new(
+    Proposal::new_rule(
         FT_LOCKER_BINARY,
-        ProposalSource::Rule,
         Severity::Critical,
         format!("Attacker payload binary present at `{}`", LOCKER_BINARY_PATH),
         format!(
@@ -1021,9 +1019,8 @@ fn build_masked_units_proposal(units: &[String], rem: Option<&RemediationOutcome
         },
     ];
     if let Some(r) = rem { evidence.push(remediation_evidence(r)); }
-    Proposal::new(
+    Proposal::new_rule(
         FT_PROXMOX_MASKED,
-        ProposalSource::Rule,
         Severity::Critical,
         format!("Critical service(s) masked: {}", unit_list),
         format!(
@@ -1065,9 +1062,8 @@ fn build_c2_connection_proposal(sockets: &[String], rem: Option<&RemediationOutc
         },
     ];
     if let Some(r) = rem { evidence.push(remediation_evidence(r)); }
-    Proposal::new(
+    Proposal::new_rule(
         FT_C2_CONNECTION,
-        ProposalSource::Rule,
         Severity::Critical,
         format!("Live socket to known C2 host {}", KNOWN_C2_IP),
         format!(
@@ -1104,9 +1100,8 @@ fn build_bash_history_proposal(hits: &[String], scope: &ProposalScope) -> Propos
             links: Vec::new(),
         },
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FT_BASH_HISTORY,
-        ProposalSource::Rule,
         Severity::High,
         format!("BootingWorld attack signature in /root/.bash_history: {}", hit_list),
         format!(
@@ -1142,9 +1137,8 @@ fn build_immutable_ui_proposal(files: &[String], rem: Option<&RemediationOutcome
         },
     ];
     if let Some(r) = rem { evidence.push(remediation_evidence(r)); }
-    Proposal::new(
+    Proposal::new_rule(
         FT_IMMUTABLE_UI,
-        ProposalSource::Rule,
         Severity::High,
         format!("Proxmox UI file(s) marked immutable: {}", file_list),
         format!(
@@ -1436,9 +1430,8 @@ mod tests {
 
         let scope = ProposalScope { node_id: "ws-test".into(), resource_id: None };
         let until = chrono::Utc::now() + chrono::Duration::hours(24);
-        let mut p = Proposal::new(
+        let mut p = Proposal::new_rule(
             FT_ROOT_SHELL,
-            ProposalSource::Rule,
             Severity::Critical,
             "stub", "stub", Vec::new(),
             RemediationPlan::Manual { instructions: "stub".into(), commands: Vec::new() },

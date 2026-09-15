@@ -24,18 +24,21 @@ fn icon_packs_dir() -> String { crate::paths::get().icon_packs_dir }
 /// dropped into /usr/share/icons behind our back.
 const PACK_SCAN_TTL: Duration = Duration::from_secs(300);
 
-static PACK_SCAN_CACHE: OnceLock<Mutex<Option<(Instant, Vec<IconPack>)>>> = OnceLock::new();
+type PackScan = Option<(Instant, Vec<IconPack>)>;
+type IconPaths = HashMap<(String, String), Option<PathBuf>>;
+
+static PACK_SCAN_CACHE: OnceLock<Mutex<PackScan>> = OnceLock::new();
 /// (pack_id, semantic_name) -> resolved file, memoised. `None` is cached
 /// too: a miss is the *expensive* answer (~15k failed stat() calls once
 /// every candidate and every fallback has been tried), so never paying
 /// for the same miss twice is the whole point.
-static ICON_PATH_CACHE: OnceLock<Mutex<HashMap<(String, String), Option<PathBuf>>>> = OnceLock::new();
+static ICON_PATH_CACHE: OnceLock<Mutex<IconPaths>> = OnceLock::new();
 
-fn pack_scan_cache() -> &'static Mutex<Option<(Instant, Vec<IconPack>)>> {
+fn pack_scan_cache() -> &'static Mutex<PackScan> {
     PACK_SCAN_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-fn icon_path_cache() -> &'static Mutex<HashMap<(String, String), Option<PathBuf>>> {
+fn icon_path_cache() -> &'static Mutex<IconPaths> {
     ICON_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

@@ -1069,7 +1069,7 @@ async fn main() -> std::io::Result<()> {
                     // certainly not landed yet — the 2s self-monitor loop
                     // below re-advertises the moment it does.
                     let ip_now = public_ip.try_read().ok().and_then(|g| g.clone());
-                    cluster.update_self(metrics, components, 0, 0, 0, 0, ip_now, has_docker, has_lxc, has_kvm, tls_enabled);
+                    cluster.update_self(agent::SelfStatus { metrics, components, docker_count: 0, lxc_count: 0, vm_count: 0, compose_count: 0, public_ip: ip_now, has_docker, has_lxc, has_kvm, tls_enabled });
                     mon
                 }
                 Err(_) => {
@@ -1755,8 +1755,8 @@ async fn main() -> std::io::Result<()> {
                         //    immediately.
                         {
                             let mut log = alert_log.write().unwrap_or_else(|e| e.into_inner());
-                            let mut next_id = log.last().map(|e| e.id + 1).unwrap_or(1);
-                            for (sev, title, detail) in &new_alerts {
+                            let first_id = log.last().map(|e| e.id + 1).unwrap_or(1);
+                            for (next_id, (sev, title, detail)) in (first_id..).zip(&new_alerts) {
                                 log.push(api::AlertLogEntry {
                                     id: next_id,
                                     timestamp: now.clone(),
@@ -1766,7 +1766,6 @@ async fn main() -> std::io::Result<()> {
                                     hostname: hostname.clone(),
                                     cluster: cluster_name.clone(),
                                 });
-                                next_id += 1;
                             }
                             while log.len() > 200 { log.remove(0); }
                         }
@@ -2160,7 +2159,8 @@ async fn main() -> std::io::Result<()> {
         // self-guards (no-op off Proxmox / when there are none) and is
         // idempotent; it tars + re-creates rootfs, so it runs on the blocking
         // pool rather than the async runtime.
-        let _ = tokio::task::spawn_blocking(crate::appstore::reconcile_orphaned_lxc);
+        // Detach the scheduled task so reconciliation does not delay startup.
+        drop(tokio::task::spawn_blocking(crate::appstore::reconcile_orphaned_lxc));
 
         // Antivirus scheduler — every 5 minutes, check whether the
         // configured schedule_hours interval has elapsed since the
@@ -2682,7 +2682,7 @@ async fn main() -> std::io::Result<()> {
                 let hostname = metrics.hostname.clone();
                 let known_nodes = cluster_clone.get_all_nodes();
                 let deleted_ids = cluster_clone.get_deleted_ids();
-                let msg = agent::AgentMessage::StatusReport {
+                let msg = agent::AgentMessage::StatusReport(Box::new(agent::StatusReport {
                     node_id: self_id,
                     hostname,
                     metrics: metrics.clone(),
@@ -2714,13 +2714,13 @@ async fn main() -> std::io::Result<()> {
                         std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
                     } else { None },
                     pubkey: node_identity::self_pubkey(),
-                };
+                }));
                 if let Ok(json) = serde_json::to_value(&msg)
                     && let Ok(mut cache) = cached_status_bg.write() {
                         *cache = Some(json);
                     }
 
-                cluster_clone.update_self(metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip.read().await.clone(), has_docker, has_lxc, has_kvm, tls_enabled);
+                cluster_clone.update_self(agent::SelfStatus { metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip: public_ip.read().await.clone(), has_docker, has_lxc, has_kvm, tls_enabled });
 
                 // Sleep at the BOTTOM so the first collection happens at
                 // startup rather than `self_monitor_secs` after it. See the
@@ -4081,16 +4081,13 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                         crate::kubernetes::health_summary()
                     }).await.unwrap_or(None);
 
-                    let summary = ai::build_metrics_summary(
-                        &hostname,
-                        cpu_pct,
-                        mem_used_gb, mem_total_gb,
-                        disk_used_gb, disk_total_gb,
-                        docker_count, lxc_count, vm_count,
-                        uptime_secs,
-                        if guest_stats_refs.is_empty() { None } else { Some(&guest_stats_refs) },
-                        k8s_health.as_deref(),
-                    );
+                    let summary = ai::build_metrics_summary(ai::MetricsSummary {
+                        hostname: &hostname, cpu_percent: cpu_pct,
+                        memory_used_gb: mem_used_gb, memory_total_gb: mem_total_gb,
+                        disk_used_gb, disk_total_gb, docker_count, lxc_count, vm_count, uptime_secs,
+                        guest_cpu_stats: if guest_stats_refs.is_empty() { None } else { Some(&guest_stats_refs) },
+                        k8s_summary: k8s_health.as_deref(),
+                    });
                     let sample = ai::baseline::Sample {
                         ts: chrono::Utc::now().timestamp(),
                         cpu_pct,

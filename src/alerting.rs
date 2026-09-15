@@ -380,7 +380,7 @@ pub struct AlertConfig {
 
     /// Send a follow-up "recovered" notification when an alert clears.
     /// Default true (the v23 implicit behaviour for offline/restored
-    /// + threshold-recovery). Operators who don't want the noise can
+    /// and threshold-recovery). Operators who don't want the noise can
     /// flip this off without untangling individual per-rule toggles.
     #[serde(default = "default_true")]
     pub recovery_notifications: bool,
@@ -1559,8 +1559,7 @@ mod tests {
     /// compromise alerts (Simple too strict). Either is a P0 regression.
     #[test]
     fn simple_mode_only_allows_compromise() {
-        let mut cfg = AlertConfig::default();
-        cfg.alert_verbosity = AlertVerbosity::Simple;
+        let cfg = AlertConfig { alert_verbosity: AlertVerbosity::Simple, ..Default::default() };
         assert!(cfg.allows(AlertCategory::Compromise));
         assert!(!cfg.allows(AlertCategory::BruteForce));
         assert!(!cfg.allows(AlertCategory::Posture));
@@ -1570,8 +1569,7 @@ mod tests {
 
     #[test]
     fn verbose_mode_allows_every_category() {
-        let mut cfg = AlertConfig::default();
-        cfg.alert_verbosity = AlertVerbosity::Verbose;
+        let cfg = AlertConfig { alert_verbosity: AlertVerbosity::Verbose, ..Default::default() };
         assert!(cfg.allows(AlertCategory::Compromise));
         assert!(cfg.allows(AlertCategory::BruteForce));
         assert!(cfg.allows(AlertCategory::Posture));
@@ -1610,10 +1608,8 @@ mod tests {
     /// disabled config or push alerts past Simple — both regressions.
     #[test]
     fn should_send_requires_enabled_and_category_allowed() {
-        let mut cfg = AlertConfig::default();
         // Disabled + Simple: nothing fires.
-        cfg.enabled = false;
-        cfg.alert_verbosity = AlertVerbosity::Simple;
+        let mut cfg = AlertConfig { enabled: false, alert_verbosity: AlertVerbosity::Simple, ..Default::default() };
         assert!(!should_send(&cfg, AlertCategory::Compromise));
         assert!(!should_send(&cfg, AlertCategory::Lifecycle));
         // Enabled + Simple: only Compromise.
@@ -1689,12 +1685,14 @@ mod tests {
     /// weekday mask = M-F only.
     #[test]
     fn quiet_hours_same_day_window() {
-        let mut q = QuietHours::default();
-        q.enabled = true;
-        q.start_hhmm = "09:00".into();
-        q.end_hhmm = "17:00".into();
-        q.timezone = "Europe/Berlin".into();
-        q.days_of_week = 0x1F; // Mon-Fri only
+        let q = QuietHours {
+            enabled: true,
+            start_hhmm: "09:00".into(),
+            end_hhmm: "17:00".into(),
+            timezone: "Europe/Berlin".into(),
+            days_of_week: 0x1F, // Mon-Fri only
+            ..Default::default()
+        };
 
         // 2026-05-19 is Tuesday — selected weekday.
         // 13:00 Europe/Berlin == 11:00 UTC (summer time = UTC+2).
@@ -1722,12 +1720,14 @@ mod tests {
     /// crosses midnight. Operator picks Mon-Fri evenings.
     #[test]
     fn quiet_hours_overnight_window() {
-        let mut q = QuietHours::default();
-        q.enabled = true;
-        q.start_hhmm = "22:00".into();
-        q.end_hhmm = "06:00".into();
-        q.timezone = "Europe/Berlin".into();
-        q.days_of_week = 0x1F;
+        let q = QuietHours {
+            enabled: true,
+            start_hhmm: "22:00".into(),
+            end_hhmm: "06:00".into(),
+            timezone: "Europe/Berlin".into(),
+            days_of_week: 0x1F,
+            ..Default::default()
+        };
 
         // 23:00 Tue local == 21:00 UTC.
         let late_evening = chrono::DateTime::parse_from_rfc3339("2026-05-19T21:00:00Z")
@@ -1750,21 +1750,23 @@ mod tests {
     /// transparent outside the window.
     #[test]
     fn allows_at_respects_quiet_hours_and_protects_compromise() {
-        let mut cfg = AlertConfig::default();
-        cfg.enabled = true;
-        cfg.alert_verbosity = AlertVerbosity::Verbose;
-        cfg.quiet_hours = Some(QuietHours {
+        let cfg = AlertConfig {
             enabled: true,
-            start_hhmm: "09:00".into(),
-            end_hhmm: "17:00".into(),
-            timezone: "Europe/Berlin".into(),
-            days_of_week: 0x1F,
-            // Operator silences Threshold + Lifecycle, AND tries to
-            // silence Compromise — but Compromise must still fire.
-            suppress_categories: vec![
-                "threshold".into(), "lifecycle".into(), "compromise".into(),
-            ],
-        });
+            alert_verbosity: AlertVerbosity::Verbose,
+            quiet_hours: Some(QuietHours {
+                enabled: true,
+                start_hhmm: "09:00".into(),
+                end_hhmm: "17:00".into(),
+                timezone: "Europe/Berlin".into(),
+                days_of_week: 0x1F,
+                // Operator silences Threshold + Lifecycle, AND tries to
+                // silence Compromise — but Compromise must still fire.
+                suppress_categories: vec![
+                    "threshold".into(), "lifecycle".into(), "compromise".into(),
+                ],
+            }),
+            ..Default::default()
+        };
 
         // Inside the window, Tuesday 13:00 Berlin == 11:00 UTC.
         let inside = chrono::DateTime::parse_from_rfc3339("2026-05-19T11:00:00Z")
@@ -1838,10 +1840,12 @@ mod tests {
         // includes() returns None on bad tz; allows_at maps None to "allowed".
         assert_eq!(q.includes(chrono::Utc::now()), None);
 
-        let mut cfg = AlertConfig::default();
-        cfg.enabled = true;
-        cfg.alert_verbosity = AlertVerbosity::Verbose;
-        cfg.quiet_hours = Some(q);
+        let cfg = AlertConfig {
+            enabled: true,
+            alert_verbosity: AlertVerbosity::Verbose,
+            quiet_hours: Some(q),
+            ..Default::default()
+        };
         assert!(cfg.allows_at(AlertCategory::Threshold, chrono::Utc::now()),
             "bad timezone must not silently swallow alerts");
     }

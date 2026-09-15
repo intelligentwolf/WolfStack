@@ -109,7 +109,7 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     compromise_indicators::RemediationOutcome,
-    proposal::{Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 pub const FEED_URL: &str = "https://iplists.firehol.org/files/firehol_level1.netset";
@@ -418,6 +418,7 @@ fn parse_feed_entries(path: &str) -> Vec<String> {
 ///     the CGN filter we'd sever the operator's Tailscale-based
 ///     management access the moment v23.2 deployed
 ///   - Local management LANs (192.168.x.x typically)
+///
 /// — i.e. the entire cluster's east-west and admin traffic. We
 /// strip them at feed-parse time so they never reach the kernel
 /// ipset.
@@ -1088,9 +1089,8 @@ pub fn analyze(
         && was_migration_emitted_recently()
         && !suppressed(FT_THREAT_INTEL_MIGRATED)
     {
-        out.push(Proposal::new(
+        out.push(Proposal::new_rule(
             FT_THREAT_INTEL_MIGRATED,
-            ProposalSource::Rule,
             Severity::Warn,
             "Threat-intel enforcement disabled by v23.2.2 safety migration",
             format!(
@@ -1127,9 +1127,8 @@ pub fn analyze(
         && !facts.ipset_available
         && !suppressed(FT_THREAT_INTEL_NO_IPSET)
     {
-        out.push(Proposal::new(
+        out.push(Proposal::new_rule(
             FT_THREAT_INTEL_NO_IPSET,
-            ProposalSource::Rule,
             Severity::High,
             "Threat-intel blocking can't enforce — `ipset` not installed",
             "WolfStack uses the FireHOL Level 1 IP blocklist to drop traffic to/from known-bad addresses. That requires the `ipset` kernel hash-table tool, which isn't installed on this host. Without it the analyzer can detect the gap but can't enforce.".to_string(),
@@ -1150,9 +1149,8 @@ pub fn analyze(
     // DryRun → Info card so the operator remembers preview mode is
     // running and they haven't yet promoted to enforce. Suppressible.
     if facts.state == EnforceState::DryRun && !suppressed(FT_THREAT_INTEL_DRY_RUN) {
-        out.push(Proposal::new(
+        out.push(Proposal::new_rule(
             FT_THREAT_INTEL_DRY_RUN,
-            ProposalSource::Rule,
             Severity::Info,
             "Threat-intel blocklist running in DryRun (no traffic blocked)",
             format!(
@@ -1708,7 +1706,7 @@ mod tests {
         assert_eq!(back.schema_version, 2);
         assert_eq!(back.clusters.get("prod").copied(), Some(EnforceState::Enforce));
         assert_eq!(back.clusters.get("staging").copied(), Some(EnforceState::DryRun));
-        assert!(back.clusters.get("never-heard-of-it").is_none());
+        assert!(!back.clusters.contains_key("never-heard-of-it"));
     }
 
     /// Fresh-preflight gate: 0 (missing) is rejected, fresh is

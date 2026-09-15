@@ -877,16 +877,16 @@ fn native_crypt(password: &str, salt: &str) -> Option<String> {
     let c_salt = CString::new(salt).ok()?;
     unsafe {
         // Try libcrypt.so.2 (Arch/Fedora), then libcrypt.so.1 (Debian/Ubuntu)
-        let lib = libc::dlopen(b"libcrypt.so.2\0".as_ptr() as *const _, libc::RTLD_NOW);
+        let lib = libc::dlopen(c"libcrypt.so.2".as_ptr(), libc::RTLD_NOW);
         let lib = if lib.is_null() {
-            libc::dlopen(b"libcrypt.so.1\0".as_ptr() as *const _, libc::RTLD_NOW)
+            libc::dlopen(c"libcrypt.so.1".as_ptr(), libc::RTLD_NOW)
         } else {
             lib
         };
         if lib.is_null() {
             return None;
         }
-        let sym = libc::dlsym(lib, b"crypt\0".as_ptr() as *const _);
+        let sym = libc::dlsym(lib, c"crypt".as_ptr());
         if sym.is_null() {
             libc::dlclose(lib);
             return None;
@@ -1262,13 +1262,19 @@ impl LoginRateLimiter {
 
     /// Manually clear a lockout for a specific IP. Operator escape hatch.
     pub fn unblock(&self, ip: &str) {
+        self.unblock_local(ip);
+        // A peer may still hold a block even if this node has none.
+        self.fire_unblock_hook(ip);
+    }
+
+    /// Clear this node only. Peer deliveries must not re-enter fleet fanout.
+    pub fn unblock_local(&self, ip: &str) {
         let mut attempts = self.attempts.write().unwrap();
         attempts.remove(ip);
         drop(attempts);
         // Drop the kernel rule too — operator unblocking expects full recovery.
         kernel_unblock_ip(ip);
         self.persist_lockouts();
-        self.fire_unblock_hook(ip);
         self.audit_push(AuthLogEntry {
             timestamp: now_secs(),
             ip: ip.to_string(),
@@ -3419,6 +3425,42 @@ mod lockout_tests {
         assert!(l.is_locked_out("8.8.8.8"));
         l.unblock("8.8.8.8");
         assert!(!l.is_locked_out("8.8.8.8"));
+    }
+
+    #[test]
+    fn peer_unblock_does_not_propagate_even_when_repeated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let l = make_limiter(LoginLockoutConfig {
+            max_failures: 1, window_seconds: 60, lockout_seconds: 60,
+            trusted_ips: vec![], enabled: true,
+        });
+        l.install_propagation_hooks(
+            std::sync::Arc::new(|_, _| {}),
+            std::sync::Arc::new(move |_| { captured.fetch_add(1, Ordering::SeqCst); }),
+        );
+        l.record_failure_with("192.0.2.91", "test");
+        assert!(l.is_locked_out("192.0.2.91"));
+        l.unblock_local("192.0.2.91");
+        assert!(!l.is_locked_out("192.0.2.91"));
+        l.unblock_local("192.0.2.91");
+        l.unblock_local("192.0.2.92");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "peer deliveries must never start another fleet fanout");
+    }
+
+    #[test]
+    fn operator_unblock_propagates_once_even_without_local_lockout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let l = make_limiter(LoginLockoutConfig::default());
+        l.install_propagation_hooks(
+            std::sync::Arc::new(|_, _| {}),
+            std::sync::Arc::new(move |_| { captured.fetch_add(1, Ordering::SeqCst); }),
+        );
+        l.unblock("192.0.2.92");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "another node can still have the IP blocked");
     }
 
     #[test]

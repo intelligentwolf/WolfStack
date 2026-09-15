@@ -765,7 +765,7 @@ pub async fn tui_node_backups(
                         esc(&s.name),
                         format!("{:?}", s.frequency).to_lowercase(),
                         esc(&s.time),
-                        format!("{}", s.storage.storage_type),
+                        s.storage.storage_type,
                         if s.enabled { "<span class=\"online\">yes</span>" } else { "no" },
                     ));
                 }
@@ -782,8 +782,8 @@ pub async fn tui_node_backups(
                     let status_cls = if e.status == crate::backup::BackupStatus::Completed { "online" } else { "stopped" };
                     body.push_str(&format!(
                         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><span class=\"{}\">{}</span></td></tr>",
-                        esc(&e.target.name), format!("{}", e.target.target_type),
-                        format!("{}", e.storage.storage_type),
+                        esc(&e.target.name), e.target.target_type,
+                        e.storage.storage_type,
                         esc(&e.created_at), format_bytes(e.size_bytes),
                         status_cls, esc(&status_str),
                     ));
@@ -933,7 +933,7 @@ pub async fn tui_all_backups(req: HttpRequest, state: web::Data<AppState>) -> Ht
                 body.push_str(&format!(
                     "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     esc(&s.name), format!("{:?}", s.frequency).to_lowercase(), esc(&s.time),
-                    format!("{}", s.storage.storage_type),
+                    s.storage.storage_type,
                     if s.enabled { "<span class=\"online\">yes</span>" } else { "no" },
                 ));
             }
@@ -949,8 +949,8 @@ pub async fn tui_all_backups(req: HttpRequest, state: web::Data<AppState>) -> Ht
                 let cls = if e.status == crate::backup::BackupStatus::Completed { "online" } else { "stopped" };
                 body.push_str(&format!(
                     "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><span class=\"{}\">{}</span></td></tr>",
-                    esc(&e.target.name), format!("{}", e.target.target_type),
-                    format!("{}", e.storage.storage_type),
+                    esc(&e.target.name), e.target.target_type,
+                    e.storage.storage_type,
                     esc(&e.created_at), format_bytes(e.size_bytes), cls, esc(&status_str),
                 ));
             }

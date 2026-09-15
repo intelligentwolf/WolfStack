@@ -497,14 +497,14 @@ fn run_iptables(args: &[&str]) -> Result<(), String> {
 ///
 /// Policy dispatch:
 /// - `round_robin`  — iptables `statistic --mode nth`, each backend
-///    emitted once per weight unit so the distribution is exactly
-///    weighted over `total_weight` consecutive packets.
+///   emitted once per weight unit so the distribution is exactly
+///   weighted over `total_weight` consecutive packets.
 /// - `ip_hash`      — iptables `statistic --mode random --probability`
-///    cascade. rule i has probability `w_i / remaining_weight_total`;
-///    fall-through guarantees every packet lands somewhere.
+///   cascade. rule i has probability `w_i / remaining_weight_total`;
+///   fall-through guarantees every packet lands somewhere.
 /// - `source_hash`  — nftables `jhash ip saddr mod total_weight vmap`
-///    for real source-IP stickiness. Falls back to `ip_hash` with a
-///    warning if nft isn't installed.
+///   for real source-IP stickiness. Falls back to `ip_hash` with a
+///   warning if nft isn't installed.
 ///
 /// Return-path SNAT + FORWARD-ACCEPT always use plain iptables —
 /// they're policy-agnostic.

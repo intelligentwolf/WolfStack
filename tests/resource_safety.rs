@@ -49,6 +49,39 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// A received unblock must terminate on that node. Together with the limiter's
+/// runtime hook-count tests, this guards the HTTP wiring that caused the fleet
+/// storm: peer deliveries re-entered the operator path and every node fanned out.
+#[test]
+fn unblock_handlers_do_not_create_propagation_cycles() {
+    let src = strip_line_comments(include_str!("../src/api/mod.rs"));
+    let handler = |name: &str| {
+        src.split(&format!("pub async fn {name}("))
+            .nth(1).expect("unblock handler must exist")
+            .split("\n}\n").next().unwrap().to_string()
+    };
+    let peer = handler("security_auth_unblock_peer");
+    assert!(peer.contains(".unblock_local(&body.ip)"), "peer must only clear local state");
+    assert!(!peer.contains(".unblock("), "peer must not invoke the propagation hook");
+    assert!(!peer.contains("propagate_kernel_unblock_to_peers"));
+
+    let operator = handler("security_auth_unblock");
+    let branches = operator.split("if body.propagate {").nth(1).unwrap();
+    let (propagating, local) = branches.split_once("} else {").unwrap();
+    assert!(propagating.contains(".unblock(&body.ip)"));
+    assert!(!propagating.contains(".unblock_local("));
+    assert!(local.contains(".unblock_local(&body.ip)"));
+    assert_eq!(operator.matches(".unblock(&body.ip)").count(), 1);
+    assert_eq!(operator.matches(".unblock_local(&body.ip)").count(), 1);
+    assert!(!operator.contains("propagate_kernel_unblock_to_peers"),
+        "the limiter hook owns the one operator fanout");
+    assert!(!operator.contains("tokio::spawn"));
+    for body in [&operator, &peer] {
+        assert!(body.contains("web::block"), "kernel commands and persistence must leave the HTTP worker");
+        assert!(body.contains(".await"), "the unblock must finish before returning success");
+    }
+}
+
 /// Every `.rs` file under src/.
 fn source_files() -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

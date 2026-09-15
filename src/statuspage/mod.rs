@@ -1682,8 +1682,8 @@ fn html_escape(s: &str) -> String {
 /// e.g. "2025-03-15T14:30:00Z" → "15 Mar 2025, 14:30 UTC"
 fn format_iso_date(iso: &str) -> String {
     // Try parsing with timezone suffix
-    let normalized = if iso.ends_with('Z') {
-        format!("{}+00:00", &iso[..iso.len() - 1])
+    let normalized = if let Some(without_z) = iso.strip_suffix('Z') {
+        format!("{}+00:00", without_z)
     } else if iso.contains('+') || iso.matches('-').count() > 2 {
         iso.to_string()
     } else {

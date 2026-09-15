@@ -1071,7 +1071,7 @@ fn is_in_subnet(ip: std::net::Ipv4Addr, net_addr: std::net::Ipv4Addr, prefix: u8
 ///      same port wolfnet listens on, neither guaranteed); Clear is
 ///      robust (roaming-only via the source address+port the peer
 ///      actually initiated from, kept alive by NAT's flow mapping).
-///   Otherwise → Set to `public_ip:peer_port`.
+///      Otherwise → Set to `public_ip:peer_port`.
 pub fn decide_peer_endpoint(
     self_lan_address: &str,
     self_wolfnet_subnet: Option<(std::net::Ipv4Addr, u8)>,
@@ -1946,8 +1946,8 @@ pub fn remove_wolfnet_peer(name: &str) -> Result<String, String> {
         if trimmed == "[[peers]]" {
             // Check if the next few lines contain our target peer name
             let mut is_target = false;
-            for j in (i + 1)..std::cmp::min(i + 10, lines.len()) {
-                let check = lines[j].trim();
+            for line in lines.iter().take(std::cmp::min(i + 10, lines.len())).skip(i + 1) {
+                let check = line.trim();
                 if check.starts_with('[') && check != "[[peers]]" { break; }
                 if check == "[[peers]]" { break; }
                 if check.starts_with("name") {
@@ -4278,7 +4278,7 @@ fn generate_client_config(bridge: &WireGuardBridge, client: &WireGuardClient) ->
         name = client.name,
         date = &chrono_now()[..10],
         bridge_sub = bridge_sub,
-        bridge_prefix = format!("10.20.{}", bridge.bridge_octet),
+        bridge_prefix = format_args!("10.20.{}", bridge.bridge_octet),
         wn_sub = wn_sub,
         wn_prefix = bridge.wolfnet_subnet,
         priv_key = client.private_key,
@@ -4524,7 +4524,7 @@ fn wg_set_peer(bridge: &WireGuardBridge, client: &WireGuardClient) -> Result<(),
 /// and the WolfNet subnet (e.g. 10.0.10.0/24) using NETMAP for 1:1 translation:
 ///   - Client sends to 10.20.X.5 → DNAT rewrites dst to 10.0.10.5
 ///   - Response from 10.0.10.5 → SNAT rewrites src to 10.20.X.5
-/// Also MASQUERADEs the client source so WolfNet peers route replies back here.
+///     Also MASQUERADEs the client source so WolfNet peers route replies back here.
 fn setup_bridge_nat(bridge: &WireGuardBridge) -> Result<(), String> {
     let iface = bridge.interface_name();
     let subnet = bridge.bridge_subnet();

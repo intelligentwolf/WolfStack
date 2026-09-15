@@ -645,8 +645,7 @@ pub async fn refresh_all_for(
     apply_local_kernel: bool,
 ) -> ThreatIntelState {
     let cfg = ThreatIntelConfig::load_for(cluster);
-    let mut new_state = ThreatIntelState::default();
-    new_state.last_refresh_secs = unix_now();
+    let mut new_state = ThreatIntelState { last_refresh_secs: unix_now(), ..Default::default() };
 
     // Run fetches on a blocking thread pool. The reqwest::blocking client
     // would otherwise stall the async runtime. Sequencing them serially is
@@ -1026,8 +1025,7 @@ mod tests {
 
     #[test]
     fn test_enforcement_active_logic() {
-        let mut c = ThreatIntelConfig::default();
-        c.enabled = true; c.dry_run = false; c.paused = false;
+        let mut c = ThreatIntelConfig { enabled: true, dry_run: false, paused: false, ..Default::default() };
         assert!(enforcement_active(&c));
         c.paused = true;
         assert!(!enforcement_active(&c), "paused must short-circuit enforcement");
@@ -1175,8 +1173,7 @@ mod tests {
 
     #[test]
     fn test_state_round_trip_serde() {
-        let mut s = ThreatIntelState::default();
-        s.blocklist_size = 12345;
+        let mut s = ThreatIntelState { blocklist_size: 12345, ..Default::default() };
         s.blocklist_v4.insert("203.0.113.0/24".to_string());
         s.last_refresh_secs = 1_700_000_000;
         s.providers.insert("spamhaus_drop".to_string(), ProviderState {

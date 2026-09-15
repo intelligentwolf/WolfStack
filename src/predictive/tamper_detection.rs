@@ -76,7 +76,7 @@ use crate::predictive::{
     ack::AckStore,
     baselines::{self, Verdict},
     compromise_indicators::RemediationOutcome,
-    proposal::{Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Evidence, Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 pub const FT_SSHD_CONFIG_TAMPER: &str = "tamper:sshd_config";
@@ -696,9 +696,8 @@ fn build_tamper_proposal(
     let manual_cmds: Vec<String> = paths.iter().map(|tp| {
         format!("# Inspect current vs baseline for {}:\ndiff <(cat {}) <(cat /var/lib/wolfstack/baselines/{}.content)", tp.path, tp.path, baselines::slug_for(&tp.path))
     }).collect();
-    Proposal::new(
+    Proposal::new_rule(
         finding_type.to_string(),
-        ProposalSource::Rule,
         Severity::Critical,
         title.to_string(),
         why,
@@ -750,9 +749,8 @@ fn build_fail2ban_proposal(facts: &TamperFacts, rem: Option<&RemediationOutcome>
         links: Vec::new(),
     }];
     if let Some(r) = rem { evidence.push(remediation_evidence_for(r)); }
-    Proposal::new(
+    Proposal::new_rule(
         FT_FAIL2BAN_TAMPER,
-        ProposalSource::Rule,
         Severity::Critical,
         format!("fail2ban not protecting SSH on this node ({})", symptoms.join(", ")),
         "fail2ban is installed but inactive / masked / not running the [sshd] jail. WolfStack auto-attempts to unmask + start it. If the [sshd] jail is disabled in config, reseed your fail2ban baseline AFTER fixing the config so future ticks recognize the corrected state.".to_string(),

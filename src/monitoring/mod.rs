@@ -91,7 +91,9 @@ const TOP_PROC_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Last top-processes scan: when it was taken, top-by-CPU, top-by-memory.
 /// Process-wide, so every viewer and every node-proxied request shares one
 /// scan rather than each triggering their own.
-static TOP_PROC_CACHE: Mutex<Option<(Instant, Vec<ProcessInfo>, Vec<ProcessInfo>)>> =
+type ProcessSnapshot = (Instant, Vec<ProcessInfo>, Vec<ProcessInfo>);
+
+static TOP_PROC_CACHE: Mutex<Option<ProcessSnapshot>> =
     Mutex::new(None);
 
 /// Number of running processes, counted straight from /proc.
@@ -404,7 +406,7 @@ impl SystemMonitor {
         let top_cpu: Vec<ProcessInfo> = cached_cpu.iter().take(count).cloned().collect();
 
         // Top Memory
-        procs.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+        procs.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
         let cached_mem: Vec<ProcessInfo> = procs.iter().take(depth).cloned().collect();
         let top_mem: Vec<ProcessInfo> = cached_mem.iter().take(count).cloned().collect();
 

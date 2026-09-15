@@ -4868,11 +4868,11 @@ impl VmManager {
     /// Sources of truth for "is this a passthrough NIC":
     ///   1. VM JSON configs in base_dir — `extra_nics[].passthrough_interface`
     ///   2. Slaves of any `br-pt-*` bridge currently in /sys/class/net
-    /// We deliberately do NOT touch slaves of admin-named bridges (`vmbr0`,
-    /// `br0`, etc.) because we can't tell them apart from the admin's own
-    /// bridge config — the Proxmox passthrough path uses `vmbr{N}` too, but
-    /// missing the offload re-apply on Proxmox is safer than clobbering an
-    /// admin's deliberate offload settings.
+    ///      We deliberately do NOT touch slaves of admin-named bridges (`vmbr0`,
+    ///      `br0`, etc.) because we can't tell them apart from the admin's own
+    ///      bridge config — the Proxmox passthrough path uses `vmbr{N}` too, but
+    ///      missing the offload re-apply on Proxmox is safer than clobbering an
+    ///      admin's deliberate offload settings.
     pub fn reapply_passthrough_offloads(&self) {
         use std::collections::HashSet;
         // Make sure the binary actually exists before we silently shell out

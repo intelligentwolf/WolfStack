@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::predictive::{
     Context,
     ack::AckStore,
-    proposal::{Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Evidence, Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 /// Finding type for "this node can't ping a configured WolfNet peer".
@@ -345,9 +345,8 @@ fn build_proposal(p: &PeerProbe, local_has_public_ip: bool, scope: &ProposalScop
             .to_string()
     };
 
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         Severity::High,
         title,
         why,

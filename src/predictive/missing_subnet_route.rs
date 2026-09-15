@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::predictive::{
     Context,
     ack::AckStore,
-    proposal::{Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Evidence, Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 /// Finding type emitted by this analyzer.
@@ -474,9 +474,8 @@ fn build_proposal(missing: &[&MissingRoute], scope: &ProposalScope) -> Proposal 
         }
     }).collect();
 
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         Severity::High,
         title,
         why,

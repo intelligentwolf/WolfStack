@@ -39,7 +39,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context,
     ack::AckStore,
-    proposal::{Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Evidence, Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 pub const FINDING_TYPE: &str = "wolfnet_ip_conflict";
@@ -290,9 +290,8 @@ pub fn analyze(
                 ],
             ),
         };
-        out.push(Proposal::new(
+        out.push(Proposal::new_rule(
             FINDING_TYPE,
-            ProposalSource::Rule,
             severity,
             title,
             why,

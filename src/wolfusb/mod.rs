@@ -1312,21 +1312,23 @@ echo "OK: wolfusb installation complete"
 
 // ─── Assignment Operations ───
 
+pub struct DeviceAssignmentRequest<'a> {
+    pub busid: &'a str,
+    pub label: &'a str,
+    pub usb_id: &'a str,
+    pub source_node_id: &'a str,
+    pub source_hostname: &'a str,
+    pub source_address: &'a str,
+    pub target_type: &'a str,
+    pub target_name: &'a str,
+    pub target_node_id: &'a str,
+    pub target_hostname: &'a str,
+    pub is_local_source: bool,
+}
+
 /// Assign a USB device to a container/VM, potentially on a different node.
-pub fn assign_device(
-    config: &mut WolfUsbConfig,
-    busid: &str,
-    label: &str,
-    usb_id: &str,
-    source_node_id: &str,
-    source_hostname: &str,
-    source_address: &str,
-    target_type: &str,
-    target_name: &str,
-    target_node_id: &str,
-    target_hostname: &str,
-    is_local_source: bool,
-) -> Result<String, String> {
+pub fn assign_device(config: &mut WolfUsbConfig, request: DeviceAssignmentRequest<'_>) -> Result<String, String> {
+    let DeviceAssignmentRequest { busid, label, usb_id, source_node_id, source_hostname, source_address, target_type, target_name, target_node_id, target_hostname, is_local_source } = request;
     if !["docker", "lxc", "vm"].contains(&target_type) {
         return Err(format!("Invalid target type: {}", target_type));
     }

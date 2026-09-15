@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context,
     ack::AckStore,
-    proposal::{Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
+    proposal::{Evidence, Proposal, ProposalScope, RemediationPlan, Severity},
 };
 
 pub const FINDING_EMERGENCY: &str = "boot_emergency_mode";
@@ -454,9 +454,8 @@ pub fn analyze(
                     )
                 }
             );
-            out.push(Proposal::new(
+            out.push(Proposal::new_rule(
                 FINDING_EMERGENCY,
-                ProposalSource::Rule,
                 Severity::High,
                 "The previous boot stopped in emergency mode",
                 why,
@@ -524,9 +523,8 @@ pub fn analyze(
                     ),
                 ),
             };
-            out.push(Proposal::new(
+            out.push(Proposal::new_rule(
                 FINDING_FSTAB_RISK,
-                ProposalSource::Rule,
                 sev,
                 title,
                 why,
@@ -566,9 +564,8 @@ pub fn analyze(
             {
                 continue;
             }
-            out.push(Proposal::new(
+            out.push(Proposal::new_rule(
                 FINDING_FSTAB_REPAIRED,
-                ProposalSource::Rule,
                 Severity::Info,
                 format!("WolfStack added nofail to the fstab line for {}", mp),
                 format!(

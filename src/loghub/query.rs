@@ -169,7 +169,7 @@ pub fn search(root: &str, q: &SearchQuery) -> SearchResult {
         }
     }
 
-    matched.sort_by(|a, b| b.ts.cmp(&a.ts));
+    matched.sort_by_key(|event| std::cmp::Reverse(event.ts));
     if matched.len() > limit {
         matched.truncate(limit);
     }
