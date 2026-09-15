@@ -185,7 +185,7 @@ fn ingress_label(cluster: &crate::agent::ClusterState, ingress_node_id: &str) ->
 /// - `Ok(Some(url))` — the workload runs here and is reachable.
 /// - `Ok(None)`      — not running on this node (caller may look wider).
 /// - `Err(..)`       — bad input, or it runs here but the ingress can't
-///                     reach it (message says how to fix that).
+///   reach it (message says how to fix that).
 pub fn resolve_upstream_local(
     kind: &str,
     workload_ref: &str,

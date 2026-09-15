@@ -421,10 +421,10 @@ fn cidr_matches_ip(cidr: &str, ip: &str) -> bool {
 ///     in INPUT are untouched precisely because INPUT is never flushed);
 ///   * a user chain declared `:WOLFROUTER_IN - [0:0]` IS flushed and
 ///     refilled wholesale — exactly the v4 lifecycle we want.
-/// So: declare/refill only OUR chains here, and let `apply_v6_companion`
-/// add the built-in→WOLFROUTER jumps idempotently (`-C` probe, `-I 1` on
-/// miss). That keeps operator/`kernel_block_ip` v6 rules in the built-in
-/// chains intact and the jump count pinned at exactly one.
+///     So: declare/refill only OUR chains here, and let `apply_v6_companion`
+///     add the built-in→WOLFROUTER jumps idempotently (`-C` probe, `-I 1` on
+///     miss). That keeps operator/`kernel_block_ip` v6 rules in the built-in
+///     chains intact and the jump count pinned at exactly one.
 ///
 /// Content: the same state/loopback accepts as v4 plus the threat-intel
 /// v6 chain when enforcement is active. NO user rules — those compile to

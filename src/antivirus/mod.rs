@@ -2461,8 +2461,8 @@ fn run_chkrootkit_scan() -> Result<Vec<Finding>, String> {
 ///   - `Checking 'aliens'... started`
 ///   - `Checking 'aliens'... finished`
 ///   - `Searching for X... not tested`
-/// chkrootkit emits these between every real check; they're status,
-/// not results. Real hits look like:
+///     chkrootkit emits these between every real check; they're status,
+///     not results. Real hits look like:
 ///   - `Checking 'bindshell'... INFECTED (PORTS: 31337)`
 ///   - `eth0: PACKET SNIFFER(/path/to/proc)` (no '...' separator but contains INFECTED later)
 fn parse_chkrootkit_output(s: &str) -> Vec<Finding> {

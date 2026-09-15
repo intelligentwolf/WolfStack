@@ -37,7 +37,7 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
 };
 
@@ -296,9 +296,8 @@ fn build_pbs_proposal(container: &str, mount_unit: &str, scope: ProposalScope) -
         format!("lxc-attach -n {} -- systemd-tmpfiles --create", container),
         format!("lxc-attach -n {} -- systemctl restart proxmox-backup proxmox-backup-proxy", container),
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE_PBS,
-        ProposalSource::Rule,
         Severity::High,
         format!("PBS in '{}' loses /run/proxmox-backup ownership on every restart", container),
         "Proxmox Backup Server relies on a tmpfs mount unit to give \
@@ -341,9 +340,8 @@ fn build_generic_proposal(container: &str, failed: &[&String], scope: ProposalSc
         format!("lxc-attach -n {} -- systemd-tmpfiles --create   # immediate heal for missing /run dirs", container),
         "journalctl -k --since '1 hour ago' | grep -i 'apparmor.*DENIED' | tail -20   # on this host".to_string(),
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         severity,
         format!("Container '{}' is running with a degraded boot ({} failed boot unit{})",
             container, failed.len(), if failed.len() == 1 { "" } else { "s" }),
@@ -388,6 +386,7 @@ fn build_generic_proposal(container: &str, failed: &[&String], scope: ProposalSc
 ///      `backup` ownership on every boot — the PERMANENT fix;
 ///   2. apply it now (`systemd-tmpfiles --create`) and chown the live
 ///      dir, so the running proxy recovers on its next write.
+///
 /// Deliberately does NOT mask units or restart the proxy — those are
 /// the disruptive steps that stay in the operator card. Idempotent
 /// (exits early once the drop-in exists), PBS-only (keyed off

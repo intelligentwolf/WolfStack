@@ -485,18 +485,11 @@ fn install_docker(
 
         crate::containers::docker_pull(&sidecar.image)?;
 
-        crate::containers::docker_create_with_cmd(
-            &sidecar_name,
-            &sidecar.image,
-            &sidecar.ports,
-            &env,
-            None,  // no WolfNet IP for sidecars
-            None,  // no memory limit
-            None,  // no CPU limit
-            None,  // no storage limit
-            &sidecar.volumes,
-            &cmd,
-        )?;
+        crate::containers::docker_create_with_cmd(crate::containers::DockerCreateOptions {
+            name: &sidecar_name, image: &sidecar.image, ports: &sidecar.ports, env: &env,
+            wolfnet_ip: None, memory: None, cpus: None, storage: None,
+            volumes: &sidecar.volumes,
+        }, &cmd)?;
         sidecar_names.push(sidecar_name.clone());
 
         // Run post-install exec commands, if any. These need the
@@ -575,18 +568,11 @@ fn install_docker(
 
     // Create the container (not started)
 
-    crate::containers::docker_create_with_cmd(
-        container_name,
-        &docker.image,
-        &docker.ports,
-        &env,
-        wolfnet_ip.as_deref(),
-        None,
-        None,
-        None,
-        &docker.volumes,
-        &cmd,
-    )?;
+    crate::containers::docker_create_with_cmd(crate::containers::DockerCreateOptions {
+        name: container_name, image: &docker.image, ports: &docker.ports, env: &env,
+        wolfnet_ip: wolfnet_ip.as_deref(), memory: None, cpus: None, storage: None,
+        volumes: &docker.volumes,
+    }, &cmd)?;
 
     let mut msg = format!("{} configured as Docker container '{}' (stopped)", app.name, container_name);
     if let Some(ref ip) = wolfnet_ip {
@@ -1421,10 +1407,10 @@ pub fn install_vm_streamed(
             //   B (physical LAN NIC) — user picks their own LAN IP (e.g.
             //                          192.168.1.1), the firewall serves
             //                          that real L2 segment. Production use.
-            let steps: Vec<String> = if lan_interface.is_some() {
+            let steps: Vec<String> = if let Some(lan_interface) = &lan_interface {
                 vec![
                     format!("LAN = physical NIC '{}' (vtnet0), WAN = physical NIC '{}' (vtnet1). OPNsense serves a real L2 LAN segment on the LAN NIC.",
-                        lan_interface.as_ref().unwrap(),
+                        lan_interface,
                         wan_interface.as_deref().unwrap_or("?")),
                     "Wait ~60s for the live console login prompt.".into(),
                     "Log in as 'installer' / 'opnsense' to start the guided installer.".into(),
@@ -2235,20 +2221,26 @@ fn emit_port_flag(script: &mut String, spec: &str, counter: &mut usize) -> Strin
     format!(" -p ${{__PORT_{}}}:{}{}", idx, container_str, suffix)
 }
 
+pub struct PrepareInstallOptions<'a> {
+    pub app_id: &'a str,
+    pub target: &'a str,
+    pub container_name: &'a str,
+    pub user_inputs: &'a HashMap<String, String>,
+    pub storage_path: Option<&'a str>,
+    pub custom_ports: Option<&'a [String]>,
+    pub extra_env: Option<&'a [String]>,
+    pub extra_volumes: Option<&'a [String]>,
+    pub memory_limit: Option<&'a str>,
+    pub cpu_limit: Option<&'a str>,
+}
+
 /// Prepare an install script for live terminal execution.
 /// Returns (session_id, script_path) on success.
-pub fn prepare_install(
-    app_id: &str,
-    target: &str,
-    container_name: &str,
-    user_inputs: &HashMap<String, String>,
-    storage_path: Option<&str>,
-    custom_ports: Option<&[String]>,
-    extra_env: Option<&[String]>,
-    extra_volumes: Option<&[String]>,
-    memory_limit: Option<&str>,
-    cpu_limit: Option<&str>,
-) -> Result<(String, String), String> {
+pub fn prepare_install(options: PrepareInstallOptions<'_>) -> Result<(String, String), String> {
+    let PrepareInstallOptions {
+        app_id, target, container_name, user_inputs, storage_path, custom_ports,
+        extra_env, extra_volumes, memory_limit, cpu_limit,
+    } = options;
     // Never prepare an install without the parameters the app requires.
     validate_required_inputs(app_id, user_inputs)?;
     let mut app = get_app(app_id).ok_or_else(|| format!("App '{}' not found", app_id))?;
@@ -2611,11 +2603,13 @@ pub fn prepare_install(
 
                 // Create now. pct_create_api downloads the template on first
                 // use, attaches the WolfNet NIC + marker, and returns the VMID.
-                let (vmid, create_msg) = crate::containers::pct_create_api(
-                    container_name, &lxc.distribution, &lxc.release, &lxc.architecture,
-                    pct_storage.as_deref(), None, None, memory_mb, cpu_cores, wolfnet_ip.as_deref(),
-                    "wolfnet", None, None, None,
-                )?;
+                let (vmid, create_msg) = crate::containers::pct_create_api(crate::containers::PctCreateOptions {
+                    name: container_name, distribution: &lxc.distribution,
+                    release: &lxc.release, architecture: &lxc.architecture,
+                    storage_id: pct_storage.as_deref(), template_storage_id: None,
+                    root_password: None, memory_mb, cpu_cores, wolfnet_ip: wolfnet_ip.as_deref(),
+                    net_mode: "wolfnet", bridge: None, bridge_ip: None, bridge_gateway: None,
+                })?;
 
                 // Record the install against the VMID — that's how every later
                 // action will find this container on a PVE host.

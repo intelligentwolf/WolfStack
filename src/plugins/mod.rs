@@ -292,9 +292,9 @@ pub fn start_all_backends() {
         if plugin.status == "active" && plugin.manifest.has_backend {
             if let Err(e) = start_backend(&plugin.manifest.id) {
                 tracing::warn!("Failed to start plugin '{}' backend: {}", plugin.manifest.id, e);
-            } else if plugin.manifest.api_port.is_some() {
+            } else if let Some(port) = plugin.manifest.api_port {
                 tracing::info!("Started plugin '{}' backend on port {}",
-                    plugin.manifest.id, plugin.manifest.api_port.unwrap());
+                    plugin.manifest.id, port);
             }
         }
     }

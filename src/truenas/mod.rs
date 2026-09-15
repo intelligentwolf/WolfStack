@@ -604,7 +604,7 @@ impl TrueNasClient {
                     }
             }
         }
-        out.sort_by(|a, b| b.used_bytes.cmp(&a.used_bytes));
+        out.sort_by_key(|b| std::cmp::Reverse(b.used_bytes));
         Ok(out)
     }
 
@@ -717,6 +717,16 @@ fn urlencoding_encode(s: &str) -> String {
 
 // ─── Persisted store (mirror of XoStore) ───────────────────────────
 
+pub struct TrueNasUpdate {
+    pub label: String,
+    pub cluster: Option<String>,
+    pub api_url: String,
+    pub pool_name: String,
+    pub insecure_tls: bool,
+    pub cache_ttl_secs: u64,
+    pub new_key: Option<String>,
+}
+
 pub struct TrueNasStore {
     instances: Vec<TrueNasInstance>,
     path: String,
@@ -785,10 +795,8 @@ impl TrueNasStore {
     /// Update mutable fields of an existing instance. A blank `new_key` leaves
     /// the stored key unchanged (so the operator can edit other fields without
     /// re-entering the key).
-    pub fn update(&mut self, id: &str, label: String, cluster: Option<String>, api_url: String,
-                  pool_name: String, insecure_tls: bool, cache_ttl_secs: u64, new_key: Option<String>)
-        -> Result<(), String>
-    {
+    pub fn update(&mut self, id: &str, update: TrueNasUpdate) -> Result<(), String> {
+        let TrueNasUpdate { label, cluster, api_url, pool_name, insecure_tls, cache_ttl_secs, new_key } = update;
         let inst = self.instances.iter_mut().find(|i| i.id == id)
             .ok_or_else(|| format!("instance {} not found", id))?;
         if label.trim().is_empty() { return Err("label is required".into()); }

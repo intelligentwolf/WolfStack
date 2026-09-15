@@ -456,8 +456,10 @@ pub struct NfsStatus {
 }
 
 pub fn status() -> NfsStatus {
-    let mut st = NfsStatus::default();
-    st.installed = super::sources::which_helper("exportfs").is_some();
+    let mut st = NfsStatus {
+        installed: super::sources::which_helper("exportfs").is_some(),
+        ..Default::default()
+    };
     if st.installed {
         // Multi-distro probe: nfs-server (Arch/openSUSE/Fedora),
         // nfs-kernel-server (Debian/Ubuntu).

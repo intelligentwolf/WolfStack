@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "25.29.0"
+version = "25.29.1"
 edition = "2024"
 authors = ["IntelligentWolf Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -89,7 +89,8 @@ rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustl
 lz4_flex = "0.11"
 
 # Database editors
-mysql_async = "0.34"
+# Match mysql_async 0.34 defaults except unused FromRow/FromValue derive macros.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal", "bigdecimal", "rust_decimal", "time", "frunk", "native-tls-tls", "binlog"] }
 tokio-postgres = { version = "0.7", features = ["runtime"] }
 deadpool-postgres = "0.14"
 sqlparser = "0.52"

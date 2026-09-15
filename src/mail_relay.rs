@@ -461,10 +461,12 @@ mod tests {
     /// A configured relay emits credentials and turns auth on.
     #[test]
     fn configured_relay_authenticates() {
-        let mut cfg = crate::ai::AiConfig::default();
-        cfg.smtp_host = "mail.example.net".to_string();
-        cfg.smtp_user = "relay@example.net".to_string();
-        cfg.smtp_pass = "hunter2".to_string();
+        let cfg = crate::ai::AiConfig {
+            smtp_host: "mail.example.net".to_string(),
+            smtp_user: "relay@example.net".to_string(),
+            smtp_pass: "hunter2".to_string(),
+            ..Default::default()
+        };
         let rc = build_msmtprc(&cfg);
         assert!(rc.contains("auth on"), "expected auth on, got:\n{rc}");
         assert!(rc.contains("host mail.example.net"));

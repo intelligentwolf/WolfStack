@@ -773,7 +773,8 @@ impl ClusterState {
     }
 
     /// Update this node's own status
-    pub fn update_self(&self, metrics: SystemMetrics, components: Vec<ComponentStatus>, docker_count: u32, lxc_count: u32, vm_count: u32, compose_count: u32, public_ip: Option<String>, has_docker: bool, has_lxc: bool, has_kvm: bool, tls_enabled: bool) {
+    pub fn update_self(&self, status: SelfStatus) {
+        let SelfStatus { metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, has_docker, has_lxc, has_kvm, tls_enabled } = status;
         // Our own LAN IPs (cached 60s) — used both to advertise a dialable
         // address and to self-heal phantoms saved under one of our own IPs.
         let my_ips = local_ipv4_addrs();
@@ -1015,7 +1016,7 @@ impl ClusterState {
 
     /// Add a server by address — persists to disk (join_verified=true because only called after token validation)
     pub fn add_server(&self, address: String, port: u16, cluster_name: Option<String>) -> String {
-        let id = self.add_server_full(address, port, "wolfstack".to_string(), None, None, None, None, cluster_name);
+        let id = self.add_server_full(ServerOptions { address, port, node_type: "wolfstack".to_string(), pve_token: None, pve_fingerprint: None, pve_node_name: None, pve_cluster_name: None, cluster_name });
         self.mark_verified(&id);
         id
     }
@@ -1024,7 +1025,7 @@ impl ClusterState {
     #[allow(dead_code)]
     pub fn add_proxmox_server(&self, address: String, port: u16, token: String, fingerprint: Option<String>, node_name: String, pve_cluster_name: Option<String>) -> String {
         // Use pve_cluster_name as the generic cluster_name too
-        let id = self.add_server_full(address, port, "proxmox".to_string(), Some(token), fingerprint, Some(node_name), pve_cluster_name.clone(), pve_cluster_name);
+        let id = self.add_server_full(ServerOptions { address, port, node_type: "proxmox".to_string(), pve_token: Some(token), pve_fingerprint: fingerprint, pve_node_name: Some(node_name), pve_cluster_name: pve_cluster_name.clone(), cluster_name: pve_cluster_name });
         self.mark_verified(&id);
         id
     }
@@ -1040,7 +1041,8 @@ impl ClusterState {
     }
 
     /// Add a server with full options (deduplicates by address+port+pve_node_name)
-    fn add_server_full(&self, address: String, port: u16, node_type: String, pve_token: Option<String>, pve_fingerprint: Option<String>, pve_node_name: Option<String>, pve_cluster_name: Option<String>, cluster_name: Option<String>) -> String {
+    fn add_server_full(&self, options: ServerOptions) -> String {
+        let ServerOptions { address, port, node_type, pve_token, pve_fingerprint, pve_node_name, pve_cluster_name, cluster_name } = options;
         let mut nodes = self.nodes_write();
         
         // Dedup: check if a node with the same address+port+node_type already exists
@@ -1700,70 +1702,100 @@ impl ClusterState {
 
 }
 
+struct ServerOptions {
+    address: String,
+    port: u16,
+    node_type: String,
+    pve_token: Option<String>,
+    pve_fingerprint: Option<String>,
+    pve_node_name: Option<String>,
+    pve_cluster_name: Option<String>,
+    cluster_name: Option<String>,
+}
+
+/// Collected local status applied atomically to the cluster registry.
+pub struct SelfStatus {
+    pub metrics: SystemMetrics,
+    pub components: Vec<ComponentStatus>,
+    pub docker_count: u32,
+    pub lxc_count: u32,
+    pub vm_count: u32,
+    pub compose_count: u32,
+    pub public_ip: Option<String>,
+    pub has_docker: bool,
+    pub has_lxc: bool,
+    pub has_kvm: bool,
+    pub tls_enabled: bool,
+}
+
+/// Status payload; boxing it leaves the externally tagged JSON unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusReport {
+    pub node_id: String,
+    pub hostname: String,
+    pub metrics: SystemMetrics,
+    pub components: Vec<ComponentStatus>,
+    #[serde(default)]
+    pub docker_count: u32,
+    #[serde(default)]
+    pub lxc_count: u32,
+    #[serde(default)]
+    pub vm_count: u32,
+    #[serde(default)]
+    pub compose_count: u32,
+    #[serde(default)]
+    pub public_ip: Option<String>,
+    #[serde(default)]
+    pub known_nodes: Vec<Node>,
+    #[serde(default)]
+    pub deleted_ids: Vec<String>,
+    /// WolfNet IPs in use on this node (host IP first, then the IPs of
+    /// RUNNING containers/VMs). Receivers build the route map from this.
+    #[serde(default)]
+    pub wolfnet_ips: Vec<String>,
+    /// Every WolfNet IP this node holds, stopped workloads included —
+    /// for allocation on peers only, never for routing. Empty from a
+    /// node older than v25.25.3 (its `wolfnet_ips` is then the used set).
+    #[serde(default)]
+    pub wolfnet_reserved_ips: Vec<String>,
+    #[serde(default)]
+    pub has_docker: bool,
+    #[serde(default)]
+    pub has_lxc: bool,
+    #[serde(default)]
+    pub has_kvm: bool,
+    /// Workload subnets (CIDRs) on this peer — Docker / LXC / VM
+    /// bridges. Consumed by the missing-route analyzer so peers see
+    /// what subnet_routes need to point at this node. See
+    /// `networking::collect_workload_subnets`.
+    #[serde(default)]
+    pub workload_subnets: Vec<String>,
+    /// Operator-declared physical-location tag — see `Node::site`.
+    /// `None` from older peers; the cluster-sync site decision
+    /// falls back to auto-derive from address in that case.
+    #[serde(default)]
+    pub site: Option<String>,
+    /// Operator-set friendly display name — see `Node::display_name`.
+    /// `None` from older peers; the UI then shows the hostname.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Tier roles assigned to this node — see `Node::roles`. Empty from
+    /// older peers → general-purpose node.
+    #[serde(default)]
+    pub roles: Vec<NodeRole>,
+    /// Enterprise license key — propagated to cluster nodes that don't have one
+    #[serde(default)]
+    pub license_key: Option<String>,
+    /// Sender's Ed25519 public key (base64). Older peers omit it.
+    #[serde(default)]
+    pub pubkey: Option<String>,
+}
+
 /// Message exchanged between agents
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentMessage {
     /// "Hello, here's my status"
-    StatusReport {
-        node_id: String,
-        hostname: String,
-        metrics: SystemMetrics,
-        components: Vec<ComponentStatus>,
-        #[serde(default)]
-        docker_count: u32,
-        #[serde(default)]
-        lxc_count: u32,
-        #[serde(default)]
-        vm_count: u32,
-        #[serde(default)]
-        compose_count: u32,
-        #[serde(default)]
-        public_ip: Option<String>,
-        #[serde(default)]
-        known_nodes: Vec<Node>,
-        #[serde(default)]
-        deleted_ids: Vec<String>,
-        /// WolfNet IPs in use on this node (host IP first, then the IPs of
-        /// RUNNING containers/VMs). Receivers build the route map from this.
-        #[serde(default)]
-        wolfnet_ips: Vec<String>,
-        /// Every WolfNet IP this node holds, stopped workloads included —
-        /// for allocation on peers only, never for routing. Empty from a
-        /// node older than v25.25.3 (its `wolfnet_ips` is then the used set).
-        #[serde(default)]
-        wolfnet_reserved_ips: Vec<String>,
-        #[serde(default)]
-        has_docker: bool,
-        #[serde(default)]
-        has_lxc: bool,
-        #[serde(default)]
-        has_kvm: bool,
-        /// Workload subnets (CIDRs) on this peer — Docker / LXC / VM
-        /// bridges. Consumed by the missing-route analyzer so peers see
-        /// what subnet_routes need to point at this node. See
-        /// `networking::collect_workload_subnets`.
-        #[serde(default)]
-        workload_subnets: Vec<String>,
-        /// Operator-declared physical-location tag — see `Node::site`.
-        /// `None` from older peers; the cluster-sync site decision
-        /// falls back to auto-derive from address in that case.
-        #[serde(default)]
-        site: Option<String>,
-        /// Operator-set friendly display name — see `Node::display_name`.
-        /// `None` from older peers; the UI then shows the hostname.
-        #[serde(default)]
-        display_name: Option<String>,
-        /// Tier roles assigned to this node — see `Node::roles`. Empty from
-        /// older peers → general-purpose node.
-        #[serde(default)]
-        roles: Vec<NodeRole>,
-        /// Enterprise license key — propagated to cluster nodes that don't have one
-        #[serde(default)]
-        license_key: Option<String>,
-        /// Sender's Ed25519 public key (base64). Older peers omit it.
-        #[serde(default)]
-        pubkey: Option<String>,
-    },
+    StatusReport(Box<StatusReport>),
     /// "Give me your status"
     StatusRequest,
     /// "Install this component"
@@ -2323,7 +2355,8 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         continue;
                     }
                     if let Ok(msg) = resp.json::<AgentMessage>().await
-                        && let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, wolfnet_reserved_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, license_key, pubkey: peer_pubkey } = msg {
+                        && let AgentMessage::StatusReport(report) = msg {
+                            let StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, wolfnet_reserved_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, license_key, pubkey: peer_pubkey } = *report;
                             let now = now_unix();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -2998,6 +3031,60 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
 #[cfg(test)]
 mod role_tests {
     use super::*;
+
+    // Fixture keys follow the pre-boxing AgentMessage::StatusReport fields.
+    // Keeping this as JSON catches accidental wrappers and renamed wire fields.
+    fn status_report_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "StatusReport": {
+                "node_id": "node-compat", "hostname": "compat-host",
+                "metrics": {
+                    "hostname": "compat-host", "uptime_secs": 42,
+                    "cpu_usage_percent": 12.5, "cpu_count": 2, "cpu_model": "test",
+                    "memory_total_bytes": 1024, "memory_used_bytes": 512,
+                    "memory_percent": 50.0, "swap_total_bytes": 0, "swap_used_bytes": 0,
+                    "disks": [], "network": [],
+                    "load_avg": { "one": 1.0, "five": 0.5, "fifteen": 0.25 },
+                    "processes": 3, "os_name": "Linux", "os_version": null,
+                    "kernel_version": null, "hardware_tier": "mid"
+                },
+                "components": [], "docker_count": 1, "lxc_count": 2,
+                "vm_count": 3, "compose_count": 4, "public_ip": "192.0.2.1",
+                "known_nodes": [], "deleted_ids": ["removed-node"],
+                "wolfnet_ips": ["10.0.0.1"], "wolfnet_reserved_ips": ["10.0.0.2"],
+                "has_docker": true, "has_lxc": true, "has_kvm": true,
+                "workload_subnets": ["10.0.1.0/24"], "site": "site-a",
+                "display_name": "Compatibility node", "roles": ["host"],
+                "license_key": "test-license", "pubkey": "test-key"
+            }
+        })
+    }
+
+    #[test]
+    fn boxed_status_report_preserves_wire_schema() {
+        let fixture = status_report_fixture();
+        let message: AgentMessage = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(message).unwrap(), fixture);
+    }
+
+    #[test]
+    fn status_report_accepts_older_peers_missing_optional_fields() {
+        let mut fixture = status_report_fixture();
+        fixture["StatusReport"].as_object_mut().unwrap().retain(|key, _| {
+            matches!(key.as_str(), "node_id" | "hostname" | "metrics" | "components")
+        });
+        let AgentMessage::StatusReport(report) = serde_json::from_value(fixture).unwrap() else {
+            panic!("expected a status report");
+        };
+        assert_eq!(report.node_id, "node-compat");
+        assert_eq!((report.docker_count, report.lxc_count, report.vm_count, report.compose_count), (0, 0, 0, 0));
+        assert!(!report.has_docker && !report.has_lxc && !report.has_kvm);
+        assert!(report.public_ip.is_none() && report.site.is_none() && report.display_name.is_none());
+        assert!(report.license_key.is_none() && report.pubkey.is_none());
+        assert!(report.known_nodes.is_empty() && report.deleted_ids.is_empty());
+        assert!(report.wolfnet_ips.is_empty() && report.wolfnet_reserved_ips.is_empty());
+        assert!(report.workload_subnets.is_empty() && report.roles.is_empty());
+    }
 
     #[test]
     fn role_serde_is_snake_case_and_stable() {

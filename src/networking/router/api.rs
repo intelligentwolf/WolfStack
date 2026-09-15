@@ -75,15 +75,6 @@ async fn drain_response(resp: reqwest::Response) {
     let _ = resp.bytes().await;
 }
 
-/// Push the current RouterConfig to every other cluster node so the
-/// firewall, LANs, and zone assignments stay in sync. Fired (in the
-/// background, doesn't block the originating user request) after every
-/// successful write. Each peer accepts via `/api/router/config-receive`
-/// authenticated with the X-WolfStack-Secret header.
-///
-/// "Settings should replicate across the cluster when they are changed
-/// so nothing breaks" — this is that.
-
 // ─── Subnet-route overlap helpers (Codex P2, v20.11.2) ───
 //
 // Determine whether two subnet routes can both apply on the same node. A
@@ -109,6 +100,14 @@ fn scope_label(node_id: &Option<String>) -> String {
     }
 }
 
+/// Push the current RouterConfig to every other cluster node so the
+/// firewall, LANs, and zone assignments stay in sync. Fired (in the
+/// background, doesn't block the originating user request) after every
+/// successful write. Each peer accepts via `/api/router/config-receive`
+/// authenticated with the X-WolfStack-Secret header.
+///
+/// "Settings should replicate across the cluster when they are changed
+/// so nothing breaks" — this is that.
 pub(crate) fn replicate_config_to_cluster(state: S) {
     // The clone of the config and nodes happens INSIDE the spawned task,
     // by which time the caller has returned and any write lock from the
@@ -5913,7 +5912,8 @@ pub async fn wolfnet_routes_resync(req: HttpRequest, state: S) -> HttpResponse {
                 _ => continue,
             };
             let msg: Result<crate::agent::AgentMessage, _> = resp.json().await;
-            if let Ok(crate::agent::AgentMessage::StatusReport { wolfnet_ips, .. }) = msg {
+            if let Ok(crate::agent::AgentMessage::StatusReport(report)) = msg {
+                let wolfnet_ips = report.wolfnet_ips;
                 if wolfnet_ips.len() > 1 {
                     let host_wn_ip = &wolfnet_ips[0];
                     if !host_wn_ip.is_empty()
@@ -6421,23 +6421,28 @@ pub async fn fix_tick_pppoe_default_route(
         };
         let owner = conn.node_id.clone();
         if owner != crate::agent::self_node_id() {
-            // Drop the lock before the proxy so we don't hold it across .await.
-            drop(cfg);
+            Err(owner)
+        } else {
+            match &mut conn.mode {
+                wan::WanMode::Pppoe(p) => { p.use_default_route = true; }
+                _ => return HttpResponse::BadRequest().body("WAN is not PPPoE — flag doesn't apply"),
+            }
+            let updated = conn.clone();
+            if let Err(e) = cfg.save() {
+                return HttpResponse::InternalServerError().body(format!("save: {}", e));
+            }
+            Ok(updated)
+        }
+    };
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(owner) => {
             return proxy_router_post_to_node(
                 state, &owner,
                 &format!("router/fix/wan/{}/tick-pppoe-default-route", id),
                 serde_json::json!({}),
             ).await;
         }
-        match &mut conn.mode {
-            wan::WanMode::Pppoe(p) => { p.use_default_route = true; }
-            _ => return HttpResponse::BadRequest().body("WAN is not PPPoE — flag doesn't apply"),
-        }
-        let updated = conn.clone();
-        if let Err(e) = cfg.save() {
-            return HttpResponse::InternalServerError().body(format!("save: {}", e));
-        }
-        updated
     };
     let res = tokio::task::spawn_blocking(move || wan::apply(&updated)).await;
     replicate_config_to_cluster(state.clone());

@@ -6519,8 +6519,8 @@ pub fn restore_vm(entry: &BackupEntry) -> Result<String, String> {
 /// The archive format produced by `backup_vm` (Stage B) is the same
 /// across platforms — flat tar.gz with `<name>.json` (portable VmConfig)
 /// + `<name>.qcow2` (OS disk) + optional `<name>-<slot>.qcow2` extra
-/// disks. Restore reads the JSON, then routes to the per-platform
-/// creation primitives.
+///   disks. Restore reads the JSON, then routes to the per-platform
+///   creation primitives.
 pub fn restore_vm_local(local_path: &Path, vm_name: &str, target_storage: Option<&str>) -> Result<String, String> {
     if crate::containers::is_proxmox() {
         return restore_vm_to_proxmox(local_path, vm_name, target_storage);
@@ -7607,6 +7607,29 @@ pub fn create_backup_with_log(
     entries
 }
 
+/// Drain a vzdump pipe while retaining the valid lines used to locate its archive.
+fn collect_vzdump_output(reader: impl std::io::BufRead, log: &std::sync::mpsc::Sender<String>) -> String {
+    let mut all = String::new();
+    for result in reader.lines() {
+        match result {
+            Ok(line) => {
+                let _ = log.send(format!("  {}", line));
+                all.push_str(&line);
+                all.push('\n');
+            }
+            // BufRead::read_line consumes the malformed line before rejecting
+            // its UTF-8. Keep draining so later archive paths are still found.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => {
+                warn!("Failed to read vzdump output: {}", e);
+                let _ = log.send(format!("  Failed to read vzdump output: {}", e));
+                break;
+            }
+        }
+    }
+    all
+}
+
 /// Proxmox vzdump with real-time log output
 fn backup_lxc_proxmox_with_log(
     vmid: &str,
@@ -7642,30 +7665,18 @@ fn backup_lxc_proxmox_with_log(
 
         let log_clone = log.clone();
         let stdout_handle = std::thread::spawn(move || {
-            let mut all = String::new();
-            if let Some(stdout) = stdout {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(stdout).lines().flatten() {
-                    let _ = log_clone.send(format!("  {}", line));
-                    all.push_str(&line);
-                    all.push('\n');
-                }
+            match stdout {
+                Some(stdout) => collect_vzdump_output(std::io::BufReader::new(stdout), &log_clone),
+                None => String::new(),
             }
-            all
         });
 
         let log_clone2 = log.clone();
         let stderr_handle = std::thread::spawn(move || {
-            let mut all = String::new();
-            if let Some(stderr) = stderr {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(stderr).lines().flatten() {
-                    let _ = log_clone2.send(format!("  {}", line));
-                    all.push_str(&line);
-                    all.push('\n');
-                }
+            match stderr {
+                Some(stderr) => collect_vzdump_output(std::io::BufReader::new(stderr), &log_clone2),
+                None => String::new(),
             }
-            all
         });
 
         let all_stdout = stdout_handle.join().unwrap_or_default();
@@ -8374,15 +8385,17 @@ mod prune_tests {
     /// keep = the `retention` newest.
     #[test]
     fn prune_survives_interleaved_entry_order() {
-        let mut config = BackupConfig::default();
-        config.entries = vec![
-            mk_for("ct1", "a-old",    "2026-07-01T03:00:00Z", "s"),
-            mk_for("ct9", "other",    "2026-07-10T03:00:00Z", "different-schedule"),
-            mk_for("ct1", "b-new",    "2026-07-05T03:00:00Z", "s"),
-            mk_for("ct1", "c-mid",    "2026-07-03T03:00:00Z", "s"),
-            mk_for("ct1", "d-newest", "2026-07-06T03:00:00Z", "s"),
-            mk_for("ct1", "e-oldest", "2026-06-30T03:00:00Z", "s"),
-        ];
+        let mut config = BackupConfig {
+            entries: vec![
+                mk_for("ct1", "a-old",    "2026-07-01T03:00:00Z", "s"),
+                mk_for("ct9", "other",    "2026-07-10T03:00:00Z", "different-schedule"),
+                mk_for("ct1", "b-new",    "2026-07-05T03:00:00Z", "s"),
+                mk_for("ct1", "c-mid",    "2026-07-03T03:00:00Z", "s"),
+                mk_for("ct1", "d-newest", "2026-07-06T03:00:00Z", "s"),
+                mk_for("ct1", "e-oldest", "2026-06-30T03:00:00Z", "s"),
+            ],
+            ..Default::default()
+        };
         prune_schedule_backups(&mut config, "s", 2);
         let names: Vec<&str> = config.entries.iter().map(|e| e.id.as_str()).collect();
         // Newest two of schedule "s" survive; the other schedule is untouched.
@@ -8477,11 +8490,13 @@ mod prune_tests {
     /// completed entries — must not panic on the empty slice path.
     #[test]
     fn prune_noop_at_or_below_retention() {
-        let mut config = BackupConfig::default();
-        config.entries = vec![
-            mk("a", "2026-07-01T03:00:00Z", "s"),
-            mk("b", "2026-07-02T03:00:00Z", "s"),
-        ];
+        let mut config = BackupConfig {
+            entries: vec![
+                mk("a", "2026-07-01T03:00:00Z", "s"),
+                mk("b", "2026-07-02T03:00:00Z", "s"),
+            ],
+            ..Default::default()
+        };
         prune_schedule_backups(&mut config, "s", 2);
         assert_eq!(config.entries.len(), 2);
         prune_schedule_backups(&mut config, "missing-schedule", 0);
@@ -9355,6 +9370,12 @@ fn build_pct_lookup() -> std::collections::HashMap<String, (String, String)> {
     map
 }
 
+pub struct PbsRestoreOptions<'a> {
+    pub overwrite: bool,
+    pub new_name: &'a str,
+    pub target_storage: &'a str,
+}
+
 /// Restore with real-time progress tracking via callback
 pub fn restore_from_pbs_with_progress<F>(
     storage: &BackupStorage,
@@ -9362,13 +9383,12 @@ pub fn restore_from_pbs_with_progress<F>(
     archive: &str,
     _target_dir: &str,
     on_progress: F,
-    overwrite: bool,
-    new_name: &str,
-    target_storage: &str,
+    options: PbsRestoreOptions<'_>,
 ) -> Result<String, String>
 where
     F: Fn(String, Option<f64>),
 {
+    let PbsRestoreOptions { overwrite, new_name, target_storage } = options;
     let repo = pbs_repo_string(storage);
 
     // Parse snapshot "type/id/timestamp" to determine backup kind and ID
@@ -10411,8 +10431,7 @@ mod remove_backup_server_tests {
     #[test]
     fn a_report_with_nothing_to_do_is_a_noop() {
         assert!(ServerRemovalReport::default().is_noop());
-        let mut r = ServerRemovalReport::default();
-        r.history_entries_scrubbed = 1;
+        let r = ServerRemovalReport { history_entries_scrubbed: 1, ..Default::default() };
         assert!(!r.is_noop());
     }
 
@@ -10585,8 +10604,7 @@ pub fn proxmox_conf_to_vm_config(conf: &str, vm_name: &str) -> serde_json::Value
                         }
                     }
                     // Detect bus type from key
-                    if key.starts_with("ide") { os_disk_bus = "ide".to_string(); }
-                    else if key.starts_with("sata") { os_disk_bus = "ide".to_string(); } // QEMU maps sata to ide
+                    if key.starts_with("ide") || key.starts_with("sata") { os_disk_bus = "ide".to_string(); } // QEMU maps sata to ide
                     else if key.starts_with("scsi") { os_disk_bus = "scsi".to_string(); }
                     else { os_disk_bus = "virtio".to_string(); }
                 }
@@ -11412,5 +11430,41 @@ mod target_label_tests {
             let label = target_log_label(&target(t.clone(), ""));
             assert!(!label.trim().is_empty(), "{:?} rendered blank", t);
         }
+    }
+}
+
+#[cfg(test)]
+mod vzdump_output_tests {
+    use super::collect_vzdump_output;
+
+    #[test]
+    fn malformed_utf8_does_not_hide_a_later_archive_path() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let output = b"good\r\n\xff\ncreating archive '/path/archive.tar.zst'\n";
+        let captured = collect_vzdump_output(std::io::Cursor::new(output), &tx);
+        assert_eq!(captured, "good\ncreating archive '/path/archive.tar.zst'\n");
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![
+            "  good", "  creating archive '/path/archive.tar.zst'",
+        ]);
+    }
+
+    #[test]
+    fn persistent_read_error_stops_and_reports_once() {
+        struct FailingReader<'a>(&'a std::cell::Cell<usize>);
+        impl std::io::Read for FailingReader<'_> {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set(self.0.get() + 1);
+                assert_eq!(self.0.get(), 1, "must not retry a persistent read error");
+                Err(std::io::Error::other("pipe read failed"))
+            }
+        }
+        let reads = std::cell::Cell::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let captured = collect_vzdump_output(std::io::BufReader::new(FailingReader(&reads)), &tx);
+        assert!(captured.is_empty());
+        assert_eq!(reads.get(), 1);
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![
+            "  Failed to read vzdump output: pipe read failed",
+        ]);
     }
 }

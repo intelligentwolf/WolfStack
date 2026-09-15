@@ -943,7 +943,7 @@ fn try_auto_recover_from_backup(
     }
     // Newest first — we want the closest-to-live-state backup that
     // parses, not the oldest one we still have lying around.
-    backups.sort_by(|a, b| b.0.cmp(&a.0));
+    backups.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     for (ts, bak_path) in backups {
         let bak_str = bak_path.to_string_lossy().to_string();
@@ -1082,7 +1082,7 @@ pub fn list_recovery_snapshots() -> Vec<RecoverySnapshot> {
             parses,
         });
     }
-    snaps.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    snaps.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
     snaps
 }
 
@@ -1786,15 +1786,15 @@ pub struct ArtifactReconstruction {
 ///      / rp_filter loose) on gateway nodes. Runs even when no other
 ///      router config is bound to this node, so a pure-gateway VPS
 ///      gets its plumbing reinstalled after every restart/update.
-/// Safe-mode is explicitly OFF: unattended boot has no human to
-/// confirm rules within the 30s window, and auto-reverting on every
-/// reboot would be worse than "rules applied with no rollback".
-/// Detect and remove default routes whose next-hop is one of THIS
-/// host's own IPv4 addresses. Such routes can never deliver a packet
-/// — the kernel can't ARP itself — and emit ICMP host-unreachable
-/// from a local IP, producing the classic `traceroute` `!H`-on-hop-1
-/// symptom. There is no legitimate setup that ships a default route
-/// pointing at your own IP.
+///      Safe-mode is explicitly OFF: unattended boot has no human to
+///      confirm rules within the 30s window, and auto-reverting on every
+///      reboot would be worse than "rules applied with no rollback".
+///      Detect and remove default routes whose next-hop is one of THIS
+///      host's own IPv4 addresses. Such routes can never deliver a packet
+///      — the kernel can't ARP itself — and emit ICMP host-unreachable
+///      from a local IP, producing the classic `traceroute` `!H`-on-hop-1
+///      symptom. There is no legitimate setup that ships a default route
+///      pointing at your own IP.
 ///
 /// Real failure mode (PapaSchlumpf, April 2026): a router box had its
 /// LAN gateway IP (10.10.10.1) configured as the LAN segment's
@@ -4193,7 +4193,7 @@ fn local_wolfnet_ipv4() -> Option<String> {
 
 /// Run `ip -4 route get <first-in-subnet>` and pull out the egress iface
 /// + source IP. Returns (None, None) if anything failed (parse error,
-/// command error, kernel said unreachable). Pure read.
+///   command error, kernel said unreachable). Pure read.
 fn inspect_subnet_egress(cidr: &str) -> (Option<String>, Option<String>) {
     use std::process::Command;
     let probe_ip = match first_addr_in_cidr(cidr) {

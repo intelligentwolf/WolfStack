@@ -48,7 +48,7 @@ use crate::predictive::{
     Context,
     metrics::MetricsHistory,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan,
+        Evidence, Proposal, ProposalScope, RemediationPlan,
     },
     ack::AckStore,
     disk_verdict::{
@@ -349,9 +349,8 @@ fn build_proposal(fact: &ContainerDiskFact, scope: &ProposalScope, v: &Verdict) 
 
     let remediation = build_remediation(fact);
 
-    Proposal::new(
+    Proposal::new_rule(
         fact.runtime.finding_type(),
-        ProposalSource::Rule,
         v.severity,
         title,
         why,

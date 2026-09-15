@@ -563,6 +563,35 @@ pub struct SmbStatus {
     pub sessions: u32,
 }
 
+pub fn status() -> SmbStatus {
+    let mut st = SmbStatus {
+        installed: super::sources::which_helper("smbd").is_some(),
+        ..Default::default()
+    };
+    if st.installed {
+        // Same multi-distro probe as reload — smbd / smb / samba.
+        st.running = ["smbd", "smb", "samba"].iter().any(|u| {
+            Command::new("systemctl")
+                .args(["is-active", "--quiet", u])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        if let Ok(out) = Command::new("smbd").arg("--version").output()
+            && out.status.success() {
+                st.version = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            }
+        // smbstatus -j is JSON — count sessions.
+        if let Ok(out) = Command::new("smbstatus").arg("-j").output()
+            && out.status.success()
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                    && let Some(sessions) = v.get("sessions").and_then(|s| s.as_object()) {
+                        st.sessions = sessions.len() as u32;
+                    }
+    }
+    st
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,31 +734,4 @@ mod tests {
         assert!(body.contains("    unix extensions = no\n"),
             "wide links needs the global smb1-unix-extensions kill switch — got:\n{}", body);
     }
-}
-
-pub fn status() -> SmbStatus {
-    let mut st = SmbStatus::default();
-    st.installed = super::sources::which_helper("smbd").is_some();
-    if st.installed {
-        // Same multi-distro probe as reload — smbd / smb / samba.
-        st.running = ["smbd", "smb", "samba"].iter().any(|u| {
-            Command::new("systemctl")
-                .args(["is-active", "--quiet", u])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        });
-        if let Ok(out) = Command::new("smbd").arg("--version").output()
-            && out.status.success() {
-                st.version = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
-            }
-        // smbstatus -j is JSON — count sessions.
-        if let Ok(out) = Command::new("smbstatus").arg("-j").output()
-            && out.status.success()
-                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-                    && let Some(sessions) = v.get("sessions").and_then(|s| s.as_object()) {
-                        st.sessions = sessions.len() as u32;
-                    }
-    }
-    st
 }

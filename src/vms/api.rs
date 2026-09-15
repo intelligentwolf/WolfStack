@@ -825,7 +825,7 @@ fn default_true() -> bool { true }
 ///   * Proxmox  → `qm clone <vmid> <new-vmid> --name <new-name> [--full 1]`
 ///   * libvirt  → `virt-clone --original <name> --name <new-name> --auto-clone`
 ///   * native   → file-copies the OS disk + extra disks, regenerates MACs,
-///                writes a fresh JSON config with cleared runtime fields.
+///     writes a fresh JSON config with cleared runtime fields.
 ///
 /// The clone runs synchronously (a full disk copy can take minutes on
 /// large VMs), so the handler is wrapped in `web::block` to keep the
@@ -1732,7 +1732,7 @@ async fn vm_disk_migrate(
                     &format!("[{}/{}] Moving {} ({} → {})…", idx + 1, slot_count, slot, from, target));
                 if let Err(e) = run_qm_move_disk_with_progress(
                     &tasks_for_task, &tid, vmid, slot, &target, remove_source,
-                    idx, slot_count,
+                    DiskMoveProgress { slot_index: idx, slot_count },
                 ).await {
                     migration_fail(&tasks_for_task, &tid,
                         &format!("qm move_disk {} {} → {} failed: {} (prior moved: [{}])",
@@ -1826,6 +1826,11 @@ async fn poll_disk_copy_size(
     }
 }
 
+struct DiskMoveProgress {
+    slot_index: usize,
+    slot_count: usize,
+}
+
 /// Run `qm move_disk` for a single PVE disk slot, streaming its stderr
 /// and parsing the `(NN.N%)` counter PVE prints. Per-slot progress is
 /// mapped onto the overall percent so the bar advances smoothly across
@@ -1837,9 +1842,9 @@ async fn run_qm_move_disk_with_progress(
     slot: &str,
     target: &str,
     remove_source: bool,
-    slot_index: usize,
-    slot_count: usize,
+    progress: DiskMoveProgress,
 ) -> Result<(), String> {
+    let DiskMoveProgress { slot_index, slot_count } = progress;
     use tokio::process::Command as TokioCommand;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -2257,7 +2262,7 @@ async fn vm_import_external(
                 }
                 archive_path = Some(dest);
             }
-            _ => { while let Some(_) = field.next().await {} }
+            _ => { while field.next().await.is_some() {} }
         }
     }
 

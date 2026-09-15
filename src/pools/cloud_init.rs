@@ -21,12 +21,12 @@
 //!      GitHub fallback. Runs it.
 //!   5. Per role:
 //!        * leader   → POST `/api/tenants/self-register` to the SP
-//!                     with the bootstrap token + leader URL. SP
-//!                     validates the token against a pending pool.
+//!          with the bootstrap token + leader URL. SP
+//!          validates the token against a pending pool.
 //!        * follower → POST `/api/cluster/bootstrap-add` to the
-//!                     leader's URL with X-WolfStack-Secret =
-//!                     pool_secret + own join_token + own address.
-//!                     Leader joins this VM into its cluster.
+//!          leader's URL with X-WolfStack-Secret =
+//!          pool_secret + own join_token + own address.
+//!          Leader joins this VM into its cluster.
 //!
 //! Both callbacks run inside a small bash retry loop because the
 //! daemon may take 30-60 s to come up after setup.sh, and the

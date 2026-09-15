@@ -54,7 +54,7 @@ use chrono::{DateTime, Utc};
 use crate::predictive::{
     Context,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
 };
@@ -347,8 +347,8 @@ fn build_failure_proposal(fact: &ScheduleFact, scope: &ProposalScope) -> Proposa
         });
     }
 
-    Proposal::new(
-        FINDING_TYPE_FAILED, ProposalSource::Rule, severity, title, why, evidence,
+    Proposal::new_rule(
+        FINDING_TYPE_FAILED, severity, title, why, evidence,
         RemediationPlan::Manual {
             instructions:
                 "Read the error on the failed entries and clear its cause. A \
@@ -448,8 +448,8 @@ fn build_proposal(
         ],
     };
 
-    Proposal::new(
-        FINDING_TYPE, ProposalSource::Rule, severity,
+    Proposal::new_rule(
+        FINDING_TYPE, severity,
         title, why, evidence, remediation, scope.clone(),
     )
 }

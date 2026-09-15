@@ -432,9 +432,7 @@ fn decode_mount_escapes(s: &str) -> String {
                     let octal = std::str::from_utf8(&digits).ok()
                         .and_then(|s| u8::from_str_radix(s, 8).ok());
                     if let Some(code) = octal {
-                        if code.is_ascii() && code >= 0x20 {
-                            out.push(code as char);
-                        } else if code == 0x09 || code == 0x0a {
+                        if (code.is_ascii() && code >= 0x20) || code == 0x09 || code == 0x0a {
                             out.push(code as char);
                         } else {
                             out.push('\\');
@@ -778,8 +776,7 @@ pub fn parse_nmdstat(content: &str) -> Vec<Array> {
 
     let mut state = match md_state {
         "STARTED" => {
-            if any_missing       { "degraded" }
-            else if any_disabled { "degraded" }
+            if any_missing || any_disabled { "degraded" }
             else if resync_active {
                 if resync_action.starts_with("recon") || resync_action.starts_with("clear") {
                     "recovering"
@@ -1028,8 +1025,8 @@ pub fn parity_cancel(name: &str) -> Result<String, ArrayError> {
 ///     /proc/nmdstat (mdResync != 0, mdResyncPos) for progress.
 ///   * `check CANCEL/PAUSE/RESUME` returns once the kernel has
 ///     scheduled the state change.
-/// This matches the existing mdadm path (write to
-/// /sys/block/mdN/md/sync_action is also fire-and-forget).
+///     This matches the existing mdadm path (write to
+///     /sys/block/mdN/md/sync_action is also fire-and-forget).
 fn nonraid_action(args: &[&str]) -> Result<String, ArrayError> {
     if nmdctl_path().is_some() {
         // `-u` (unattended) suppresses interactive prompts.

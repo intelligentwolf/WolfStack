@@ -36,7 +36,7 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     proposal::{
-        Evidence, EvidenceLink, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, EvidenceLink, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     vulnerability::{detect_host_pm, PackageManager, VulnerabilityFacts},
     osv::OsvFacts,
@@ -581,9 +581,8 @@ fn build_proposal(packages: &[RemovablePackage], pm: PackageManager, scope: &Pro
         _ => vec!["# distro-specific — no canonical command available".to_string()],
     };
 
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         severity,
         title,
         why,

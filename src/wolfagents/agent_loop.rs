@@ -15,7 +15,7 @@
 //!    a. For each tool_use block, dispatch via `dispatch::dispatch`.
 //!    b. Build matching tool_result blocks.
 //!    c. Append both the assistant turn AND the tool_result turn to
-//!       the conversation and loop.
+//!    the conversation and loop.
 //! 4. Stop when `stop_reason` is `end_turn` / `max_tokens` / reach the
 //!    per-turn round cap (so a bad response can't spin forever).
 //! 5. Return the final assistant text + a compact trace of tool calls
@@ -106,22 +106,22 @@ pub async fn run_turn(
         }
         "openrouter" => {
             openai_tool_loop(
-                agent, &cfg, "https://openrouter.ai/api/v1",
-                &cfg.openrouter_api_key, &system_prompt, &history,
+                agent, &cfg, OpenAiEndpoint { base_url: "https://openrouter.ai/api/v1", api_key: &cfg.openrouter_api_key },
+                &system_prompt, &history,
                 user_message, state,
             ).await
         }
         "openai" => {
             openai_tool_loop(
-                agent, &cfg, "https://api.openai.com/v1",
-                &cfg.openai_api_key, &system_prompt, &history,
+                agent, &cfg, OpenAiEndpoint { base_url: "https://api.openai.com/v1", api_key: &cfg.openai_api_key },
+                &system_prompt, &history,
                 user_message, state,
             ).await
         }
         "local" => {
             openai_tool_loop(
-                agent, &cfg, &cfg.local_url,
-                &cfg.local_api_key, &system_prompt, &history,
+                agent, &cfg, OpenAiEndpoint { base_url: &cfg.local_url, api_key: &cfg.local_api_key },
+                &system_prompt, &history,
                 user_message, state,
             ).await
         }
@@ -138,6 +138,11 @@ pub async fn run_turn(
     }
 }
 
+struct OpenAiEndpoint<'a> {
+    base_url: &'a str,
+    api_key: &'a str,
+}
+
 /// OpenAI-compatible tool loop — used for OpenRouter and any local
 /// OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp
 /// server, etc.). The wire format is standardised: `tools` carries an
@@ -152,13 +157,13 @@ pub async fn run_turn(
 async fn openai_tool_loop(
     agent: &Agent,
     cfg: &crate::ai::AiConfig,
-    base_url: &str,
-    api_key: &str,
+    endpoint: OpenAiEndpoint<'_>,
     system_prompt: &str,
     history: &[crate::ai::ChatMessage],
     user_message: &str,
     state: &crate::api::AppState,
 ) -> Result<AgentTurn, String> {
+    let OpenAiEndpoint { base_url, api_key } = endpoint;
     if base_url.trim().is_empty() {
         return Err("Local/OpenRouter base URL not configured — set it in Settings → AI Agent".into());
     }

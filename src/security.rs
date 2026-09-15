@@ -924,7 +924,7 @@ fn scan_ssh_bruteforce(out: &mut Vec<DependencyCheck>) {
     let mut attackers: Vec<(String, u32)> = counts.into_iter()
         .filter(|(_, n)| *n >= 10)
         .collect();
-    attackers.sort_by(|a, b| b.1.cmp(&a.1));
+    attackers.sort_by_key(|attacker| std::cmp::Reverse(attacker.1));
     if attackers.is_empty() { return; }
     let top = attackers.iter().take(5)
         .map(|(ip, n)| format!("  {} — {} failed attempts", ip, n))

@@ -22,7 +22,8 @@ use super::AppState;
 
 /// Temporary storage for VNC proxy ports created by the ticket endpoint.
 /// Key: vmid, Value: (port, ticket, creation_time)
-static VNC_PORTS: std::sync::LazyLock<Mutex<HashMap<u64, (u16, String, std::time::Instant)>>> =
+type VncProxyTicket = (u16, String, std::time::Instant);
+static VNC_PORTS: std::sync::LazyLock<Mutex<HashMap<u64, VncProxyTicket>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 
@@ -463,15 +464,12 @@ pub async fn pve_console_ws(
     let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
 
     // Spawn the bridge task
-    actix_rt::spawn(pve_bridge(session, msg_stream, address, port, pve_name, term_port, ticket, token, fp, vmid, guest_type));
+    actix_rt::spawn(pve_bridge(session, msg_stream, PveBridgeTarget { pve_host: address, pve_port: port, pve_node: pve_name, term_port, ticket, token, _fingerprint: fp, vmid, guest_type }));
 
     Ok(res)
 }
 
-/// Bridge browser WS ↔ PVE termproxy WS
-async fn pve_bridge(
-    mut session: actix_ws::Session,
-    mut msg_stream: actix_ws::MessageStream,
+struct PveBridgeTarget {
     pve_host: String,
     pve_port: u16,
     pve_node: String,
@@ -481,7 +479,15 @@ async fn pve_bridge(
     _fingerprint: Option<String>,
     vmid: u64,
     guest_type: String,
+}
+
+/// Bridge browser WS ↔ PVE termproxy WS
+async fn pve_bridge(
+    mut session: actix_ws::Session,
+    mut msg_stream: actix_ws::MessageStream,
+    target: PveBridgeTarget,
 ) {
+    let PveBridgeTarget { pve_host, pve_port, pve_node, term_port, ticket, token, _fingerprint, vmid, guest_type } = target;
     // Build PVE WebSocket URL — percent-encode the ticket
     let vncticket: String = ticket.bytes().map(|b| {
         if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {

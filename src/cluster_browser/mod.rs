@@ -337,9 +337,7 @@ fn pull_image_with_progress(tx: &std::sync::mpsc::Sender<String>) -> Result<(), 
         if trimmed.contains("Pull complete") {
             layers_pulled += 1;
             let _ = tx.send(format!("Layer {} downloaded ({})", layers_pulled, &trimmed[..12.min(trimmed.len())]));
-        } else if trimmed.starts_with("Status:") || trimmed.starts_with("Digest:") {
-            let _ = tx.send(trimmed.to_string());
-        } else if trimmed.contains("Pulling from") {
+        } else if trimmed.starts_with("Status:") || trimmed.starts_with("Digest:") || trimmed.contains("Pulling from") {
             let _ = tx.send(trimmed.to_string());
         }
         // Other lines (per-layer "Downloading [...]" with byte counts)

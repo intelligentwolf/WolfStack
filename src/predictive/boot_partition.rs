@@ -50,7 +50,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
 };
@@ -421,8 +421,8 @@ pub fn analyze(
                     ),
                 )
             };
-            out.push(Proposal::new(
-                FINDING_BOOT_SPACE, ProposalSource::Rule, sev,
+            out.push(Proposal::new_rule(
+                FINDING_BOOT_SPACE, sev,
                 title, why,
                 vec![
                     Evidence {
@@ -494,8 +494,8 @@ pub fn analyze(
                     facts.running_kernel.as_deref().unwrap_or("?"),
                 ));
             }
-            out.push(Proposal::new(
-                FINDING_BOOT_ORPHANS, ProposalSource::Rule, sev,
+            out.push(Proposal::new_rule(
+                FINDING_BOOT_ORPHANS, sev,
                 format!("{} orphaned kernel(s) in /boot", a.orphaned_images.len()),
                 why,
                 vec![Evidence {

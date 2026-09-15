@@ -32,8 +32,8 @@
 //! - sshd:          `Failed password for [invalid user]? <user> from <IP>`
 //! - sshd:          `Invalid user <user> from <IP>`
 //! - sshd:          `Disconnected from authenticating user <user> <IP> ... [preauth]`
-//!                   — only when there was a password attempt; pure
-//!                     pre-auth disconnects are bots and don't count.
+//!   — only when there was a password attempt; pure
+//!   pre-auth disconnects are bots and don't count.
 //! - pvedaemon:     `authentication failure; rhost=<IP> user=<user> ...`
 //! - pveproxy:      `authentication failure; rhost=<IP> user=<user> ...`
 //!

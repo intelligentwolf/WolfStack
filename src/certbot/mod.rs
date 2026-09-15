@@ -1236,11 +1236,13 @@ pub fn plugin_packages(plugin: &str) -> Option<&'static PluginPackages> {
 /// shelling out to `certbot plugins --prepare` and parsing the
 /// trailing list. Format (verified against certbot 4.x stdout):
 ///
+/// ```text
 ///   * dns-cloudflare
 ///   Description: Obtain certificates using a DNS TXT record (if you are
 ///   using Cloudflare for DNS).
 ///   Interfaces: Authenticator, Plugin
 ///   Entry point: dns-cloudflare = certbot_dns_cloudflare._internal.dns_cloudflare:Authenticator
+/// ```
 ///
 /// Empty Vec if certbot isn't installed or the command fails — caller
 /// treats that the same as "nothing installed".
@@ -2471,9 +2473,7 @@ mod tests {
         // we can confirm container_install_notes returns Some for
         // every container kind it should warn about. Use the public
         // ContainerKind enum directly via a synthetic check.
-        let lxc_note = match ContainerKind::Lxc {
-            ContainerKind::Lxc => true, _ => false,
-        };
+        let lxc_note = matches!(ContainerKind::Lxc, ContainerKind::Lxc);
         assert!(lxc_note);
     }
 

@@ -3192,21 +3192,9 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
     } else {
 
         // Add IP alias /32 (idempotent — ignore EEXIST)
-        let alias_result = Command::new("nsenter")
+        let _ = Command::new("nsenter")
             .args(["--target", &container_pid, "--net", "ip", "addr", "add", &format!("{}/32", ip), "dev", "eth0"])
             .output();
-        match &alias_result {
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                if o.status.success() {
-
-                } else if stderr.contains("EEXIST") || stderr.contains("File exists") {
-
-                } 
-            }
-            Err(_e) => {},
-        }
-
         // Add route to WolfNet subnet via gateway so container can reach other WolfNet hosts.
         // The `src` hint ensures the kernel uses the WolfNet IP as source, not the
         // Docker bridge IP — critical for cross-node connectivity.
@@ -8537,6 +8525,9 @@ fn build_lxc_container_info(
     }
 }
 
+type LxcDiskUsage = (Option<u64>, Option<u64>, Option<String>);
+type LxcDiskUsageMap = std::collections::HashMap<String, LxcDiskUsage>;
+
 /// List LXC containers using Proxmox's pct command (filters out stale containers)
 /// Run ONE `df -PT --block-size=1` for every running LXC container's
 /// host-side rootfs path and return a map keyed by vmid. Avoids the
@@ -8551,7 +8542,7 @@ fn build_lxc_container_info(
 /// `-P` enforces POSIX (no line wrapping for long device names),
 /// `-T` adds the FS-type column, `--block-size=1` returns raw bytes.
 fn host_df_for_lxc(vmids: &[String])
-    -> std::collections::HashMap<String, (Option<u64>, Option<u64>, Option<String>)>
+    -> LxcDiskUsageMap
 {
     let mut map = std::collections::HashMap::new();
     if vmids.is_empty() { return map; }
@@ -8903,7 +8894,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
         .filter(|(_, state, _)| state == "running")
         .map(|(vmid, _, _)| vmid.clone())
         .collect();
-    let host_df_map: std::collections::HashMap<String, (Option<u64>, Option<u64>, Option<String>)> =
+    let host_df_map: LxcDiskUsageMap =
         host_df_for_lxc(&running_vmids);
 
     // Now process each container in parallel for remaining details
@@ -9151,14 +9142,14 @@ fn parse_pct_rootfs_size(rootfs_cfg: &str) -> Option<u64> {
         if p.starts_with("size=") {
             let size_str = p.trim_start_matches("size=");
             // Parse number + optional suffix (G, M, T, K)
-            let (num_part, multiplier) = if size_str.ends_with('T') {
-                (&size_str[..size_str.len()-1], 1024u64 * 1024 * 1024 * 1024)
-            } else if size_str.ends_with('G') {
-                (&size_str[..size_str.len()-1], 1024u64 * 1024 * 1024)
-            } else if size_str.ends_with('M') {
-                (&size_str[..size_str.len()-1], 1024u64 * 1024)
-            } else if size_str.ends_with('K') {
-                (&size_str[..size_str.len()-1], 1024u64)
+            let (num_part, multiplier) = if let Some(num_part) = size_str.strip_suffix('T') {
+                (num_part, 1024u64 * 1024 * 1024 * 1024)
+            } else if let Some(num_part) = size_str.strip_suffix('G') {
+                (num_part, 1024u64 * 1024 * 1024)
+            } else if let Some(num_part) = size_str.strip_suffix('M') {
+                (num_part, 1024u64 * 1024)
+            } else if let Some(num_part) = size_str.strip_suffix('K') {
+                (num_part, 1024u64)
             } else {
                 (size_str, 1024u64 * 1024 * 1024) // Default to GiB
             };
@@ -12710,14 +12701,28 @@ fn pick_default_container_storage(pvesm_status: &str) -> String {
     active.first().map(|s| s.to_string()).unwrap_or_else(|| "local-lvm".to_string())
 }
 
-pub fn pct_create_api(name: &str, distribution: &str, release: &str, architecture: &str,
-              storage_id: Option<&str>, template_storage_id: Option<&str>,
-              root_password: Option<&str>,
-              memory_mb: Option<u32>, cpu_cores: Option<u32>,
-              wolfnet_ip: Option<&str>,
-              net_mode: &str,
-              bridge: Option<&str>, bridge_ip: Option<&str>, bridge_gateway: Option<&str>)
-              -> Result<(u32, String), String> {
+pub struct PctCreateOptions<'a> {
+    pub name: &'a str,
+    pub distribution: &'a str,
+    pub release: &'a str,
+    pub architecture: &'a str,
+    pub storage_id: Option<&'a str>,
+    pub template_storage_id: Option<&'a str>,
+    pub root_password: Option<&'a str>,
+    pub memory_mb: Option<u32>,
+    pub cpu_cores: Option<u32>,
+    pub wolfnet_ip: Option<&'a str>,
+    pub net_mode: &'a str,
+    pub bridge: Option<&'a str>,
+    pub bridge_ip: Option<&'a str>,
+    pub bridge_gateway: Option<&'a str>,
+}
+
+pub fn pct_create_api(options: PctCreateOptions<'_>) -> Result<(u32, String), String> {
+    let PctCreateOptions {
+        name, distribution, release, architecture, storage_id, template_storage_id,
+        root_password, memory_mb, cpu_cores, wolfnet_ip, net_mode, bridge, bridge_ip, bridge_gateway,
+    } = options;
     let vmid = pct_next_vmid()?;
     // Detect a real rootdir storage when the caller didn't specify one.
     let storage_default = if storage_id.is_none() { pve_default_container_storage() } else { String::new() };
@@ -14210,9 +14215,12 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
     // On Proxmox, delegate to pct create. Template-storage hint passes
     // through so the user's choice of vztmpl storage is honoured.
     if is_proxmox() {
-        let result = pct_create_api(name, distribution, release, architecture,
-            storage_path, template_cache_path, None, None, None, None,
-            "wolfnet", None, None, None);
+        let result = pct_create_api(PctCreateOptions {
+            name, distribution, release, architecture,
+            storage_id: storage_path, template_storage_id: template_cache_path,
+            root_password: None, memory_mb: None, cpu_cores: None, wolfnet_ip: None,
+            net_mode: "wolfnet", bridge: None, bridge_ip: None, bridge_gateway: None,
+        });
         if result.is_ok() { invalidate_count_caches(); }
         return result.map(|(_vmid, msg)| msg);
     }
@@ -14476,13 +14484,23 @@ pub fn docker_pull(image: &str) -> Result<String, String> {
     }
 }
 
-/// Create a Docker container from an image
-/// If wolfnet_ip is provided, the container will be connected to the WolfNet overlay network
-/// volumes: list of volume mount specs, e.g. ["/host/path:/container/path", "myvolume:/data"]
-pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], wolfnet_ip: Option<&str>,
-                     memory: Option<&str>, cpus: Option<&str>, _storage: Option<&str>,
-                     volumes: &[String]) -> Result<String, String> {
-    docker_create_with_cmd(name, image, ports, env, wolfnet_ip, memory, cpus, _storage, volumes, &[])
+pub struct DockerCreateOptions<'a> {
+    pub name: &'a str,
+    pub image: &'a str,
+    pub ports: &'a [String],
+    pub env: &'a [String],
+    pub wolfnet_ip: Option<&'a str>,
+    pub memory: Option<&'a str>,
+    pub cpus: Option<&'a str>,
+    pub storage: Option<&'a str>,
+    /// Volume mount specs, e.g. `/host/path:/container/path` or `myvolume:/data`.
+    pub volumes: &'a [String],
+}
+
+/// Create a Docker container from an image.
+/// If wolfnet_ip is provided, connect to the WolfNet overlay on start.
+pub fn docker_create(options: DockerCreateOptions<'_>) -> Result<String, String> {
+    docker_create_with_cmd(options, &[])
 }
 
 /// Like `docker_create` but also passes `cmd` as positional args
@@ -14490,10 +14508,10 @@ pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], 
 /// ENTRYPOINT needs a subcommand (cloudflared `tunnel run`, etc.)
 /// to actually do anything. Passing an empty slice is equivalent to
 /// calling `docker_create`.
-#[allow(clippy::too_many_arguments)]
-pub fn docker_create_with_cmd(name: &str, image: &str, ports: &[String], env: &[String], wolfnet_ip: Option<&str>,
-                     memory: Option<&str>, cpus: Option<&str>, _storage: Option<&str>,
-                     volumes: &[String], cmd: &[String]) -> Result<String, String> {
+pub fn docker_create_with_cmd(options: DockerCreateOptions<'_>, cmd: &[String]) -> Result<String, String> {
+    let DockerCreateOptions {
+        name, image, ports, env, wolfnet_ip, memory, cpus, storage: _storage, volumes,
+    } = options;
 
     // Pre-flight: refuse the create if any requested host port is
     // already bound by another Docker container or a host process.
@@ -14847,9 +14865,9 @@ fn lxc_replace_or_append(config: &mut String, key: &str, value: &str) -> bool {
     let mut found = false;
     let lines: Vec<String> = config.lines().map(|l| {
         let trimmed = l.trim_start();
-        if trimmed.starts_with(key) {
+        if let Some(rest) = trimmed.strip_prefix(key) {
             // accept both "key = …" and "key=…"
-            let rest = trimmed[key.len()..].trim_start();
+            let rest = rest.trim_start();
             if rest.starts_with('=') {
                 found = true;
                 return new_line.clone();
@@ -15102,8 +15120,6 @@ fn lxc_strip_lines_with_key_prefix(config: &str, key_prefix: &str) -> String {
     }
     out
 }
-
-/// Stop an LXC container
 
 /// Clone a Docker container — commits it as an image, then creates a new container
 pub fn docker_clone(container: &str, new_name: &str) -> Result<String, String> {
@@ -17130,10 +17146,10 @@ pub fn docker_import(
 
     // Create container from the loaded image
     let wolfnet_ip = next_available_wolfnet_ip();
-    docker_create(
-        container_name, &image_name, ports, env,
-        wolfnet_ip.as_deref(), None, None, None, volumes,
-    )?;
+    docker_create(DockerCreateOptions {
+        name: container_name, image: &image_name, ports, env,
+        wolfnet_ip: wolfnet_ip.as_deref(), memory: None, cpus: None, storage: None, volumes,
+    })?;
 
     // Start it
     docker_start(container_name)?;

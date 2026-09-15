@@ -62,7 +62,7 @@ pub struct ImageWatcherConfig {
     /// Maximum number of containers to auto-update concurrently. Each
     /// apply involves a docker pull (network) + stop / start (kernel
     /// + I/O), so 1 by default avoids storming the host. Operators
-    /// with fast networks and beefy hosts can raise this.
+    ///   with fast networks and beefy hosts can raise this.
     #[serde(default = "default_max_parallel_updates")]
     pub max_parallel_updates: usize,
     /// When true, the pre-update safety backup SKIPS all bind mounts
@@ -1598,15 +1598,19 @@ mod tests {
     #[test]
     fn per_container_check_interval_overrides_global() {
         const DAY: u64 = 86_400;
-        let mut cfg = ImageWatcherConfig::default();
-        cfg.check_interval_secs = DAY; // global 24h
+        let mut cfg = ImageWatcherConfig {
+            check_interval_secs: DAY,
+            ..Default::default()
+        };
 
         // No override → global.
         assert_eq!(cfg.effective_interval_secs("nginx"), DAY);
 
         // An override ABOVE the floor is honoured verbatim.
-        let mut slower = ContainerUpdatePolicy::default();
-        slower.check_interval_secs = Some(2 * DAY);
+        let slower = ContainerUpdatePolicy {
+            check_interval_secs: Some(2 * DAY),
+            ..Default::default()
+        };
         cfg.container_policies.insert("nginx".into(), slower);
         assert_eq!(cfg.effective_interval_secs("nginx"), 2 * DAY);
         assert_eq!(cfg.effective_interval_secs("other"), DAY); // still global
@@ -1618,35 +1622,43 @@ mod tests {
         // Any override BELOW the 6h floor is clamped up to it. This is the
         // guard that matters: a single "watch this closely" container used to
         // be able to put the whole loop on a 60-second cycle.
-        let mut tiny = ContainerUpdatePolicy::default();
-        tiny.check_interval_secs = Some(5);
+        let tiny = ContainerUpdatePolicy {
+            check_interval_secs: Some(5),
+            ..Default::default()
+        };
         cfg.container_policies.insert("db".into(), tiny);
         assert_eq!(cfg.effective_interval_secs("db"), MIN_CHECK_INTERVAL_SECS);
         assert_eq!(cfg.min_effective_interval_secs(), MIN_CHECK_INTERVAL_SECS);
 
         // Explicit 0 (or None) means "use global", not "check constantly".
-        let mut zero = ContainerUpdatePolicy::default();
-        zero.check_interval_secs = Some(0);
+        let zero = ContainerUpdatePolicy {
+            check_interval_secs: Some(0),
+            ..Default::default()
+        };
         cfg.container_policies.insert("z".into(), zero);
         assert_eq!(cfg.effective_interval_secs("z"), DAY);
 
         // A global smaller than the floor is raised to it, so a config
         // stored before this clamp existed can't check more often than 6h.
-        let mut cfg2 = ImageWatcherConfig::default();
-        cfg2.check_interval_secs = 120;
+        let mut cfg2 = ImageWatcherConfig {
+            check_interval_secs: 120,
+            ..Default::default()
+        };
         assert_eq!(cfg2.effective_interval_secs("any"), MIN_CHECK_INTERVAL_SECS);
         assert_eq!(cfg2.min_effective_interval_secs(), MIN_CHECK_INTERVAL_SECS);
 
         // The default config is itself at the floor, never below it.
         assert_eq!(ImageWatcherConfig::default().check_interval_secs, MIN_CHECK_INTERVAL_SECS);
-        assert!(MIN_CHECK_INTERVAL_SECS >= 6 * 60 * 60);
+        const { assert!(MIN_CHECK_INTERVAL_SECS >= 6 * 60 * 60); }
 
         // A passive (Pinned) container's override must NOT drag the whole
         // loop's cadence down — it's never checked anyway.
-        let mut pinned = ContainerUpdatePolicy::default();
-        pinned.policy = UpdatePolicy::Pinned;
-        pinned.pinned_to = Some("1.2.3".into());
-        pinned.check_interval_secs = Some(60);
+        let pinned = ContainerUpdatePolicy {
+            policy: UpdatePolicy::Pinned,
+            pinned_to: Some("1.2.3".into()),
+            check_interval_secs: Some(60),
+            ..Default::default()
+        };
         cfg2.container_policies.insert("frozen".into(), pinned);
         assert_eq!(cfg2.min_effective_interval_secs(), MIN_CHECK_INTERVAL_SECS);
 
@@ -1758,10 +1770,12 @@ mod tests {
 
     #[test]
     fn config_serialization_roundtrip() {
-        let mut config = ImageWatcherConfig::default();
-        config.enabled = true;
-        config.check_interval_secs = 1800;
-        config.default_policy = UpdatePolicy::AutoUpdate;
+        let mut config = ImageWatcherConfig {
+            enabled: true,
+            check_interval_secs: 1800,
+            default_policy: UpdatePolicy::AutoUpdate,
+            ..Default::default()
+        };
         config.container_policies.insert(
             "my-app".into(),
             ContainerUpdatePolicy {
@@ -1941,8 +1955,10 @@ mod tests {
     /// the explicit-entry-wins behaviour.
     #[test]
     fn policy_for_uses_explicit_entry_then_default() {
-        let mut cfg = ImageWatcherConfig::default();
-        cfg.default_policy = UpdatePolicy::AutoUpdate;
+        let mut cfg = ImageWatcherConfig {
+            default_policy: UpdatePolicy::AutoUpdate,
+            ..Default::default()
+        };
         cfg.container_policies.insert("ngx".into(), ContainerUpdatePolicy {
             policy: UpdatePolicy::Ignore,
             ..Default::default()
@@ -2039,13 +2055,15 @@ mod tests {
             error: None,
         });
 
-        let mut incoming = ImageWatcherConfig::default();
-        incoming.enabled = true;
-        incoming.check_interval_secs = 7200;
-        incoming.default_policy = UpdatePolicy::AutoUpdate;
-        incoming.schedule_cron = Some("0 4 * * 0".to_string());
-        incoming.schedule_window_minutes = 120;
-        incoming.max_parallel_updates = 3;
+        let mut incoming = ImageWatcherConfig {
+            enabled: true,
+            check_interval_secs: 7200,
+            default_policy: UpdatePolicy::AutoUpdate,
+            schedule_cron: Some("0 4 * * 0".to_string()),
+            schedule_window_minutes: 120,
+            max_parallel_updates: 3,
+            ..Default::default()
+        };
         // The pushing node's own policies/history must NOT leak into the peer.
         incoming.container_policies.insert(
             "other-host-container".to_string(),
@@ -2121,8 +2139,10 @@ mod tests {
         // PROPAGATION from a peer: only cluster-wide fields are taken; this
         // host's netdata policy (backup=true) and history stay untouched, and
         // the pusher's own container policy is not adopted.
-        let mut prop_incoming = ImageWatcherConfig::default();
-        prop_incoming.enabled = true;
+        let mut prop_incoming = ImageWatcherConfig {
+            enabled: true,
+            ..Default::default()
+        };
         prop_incoming.container_policies.insert(
             "peer-only".to_string(), ContainerUpdatePolicy::default());
 

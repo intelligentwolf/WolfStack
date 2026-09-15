@@ -192,11 +192,10 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    /// Build a fresh `Pending` proposal. Caller fills in the
+    /// Build a fresh rule-based `Pending` proposal. Caller fills in the
     /// finding-specific fields; this fixes id + timestamps + status.
-    pub fn new(
+    pub fn new_rule(
         finding_type: impl Into<String>,
-        source: ProposalSource,
         severity: Severity,
         title: impl Into<String>,
         why: impl Into<String>,
@@ -208,7 +207,7 @@ impl Proposal {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             finding_type: finding_type.into(),
-            source,
+            source: ProposalSource::Rule,
             severity,
             title: title.into(),
             why: why.into(),
@@ -701,9 +700,8 @@ mod tests {
     }
 
     fn fake_proposal(finding: &str, sev: Severity, sc: ProposalScope) -> Proposal {
-        Proposal::new(
+        Proposal::new_rule(
             finding,
-            ProposalSource::Rule,
             sev,
             "title",
             "why",

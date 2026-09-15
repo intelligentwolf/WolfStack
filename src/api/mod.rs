@@ -1758,16 +1758,20 @@ pub async fn security_auth_unblock(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let body = body.into_inner();
-    state.login_limiter.unblock(&body.ip);
-    if body.propagate {
-        let cluster = state.cluster.clone();
-        let secret = state.cluster_secret.clone();
-        let ip = body.ip.clone();
-        tokio::spawn(async move {
-            propagate_kernel_unblock_to_peers(cluster, secret, ip).await;
-        });
+    let ip = body.ip.clone();
+    if web::block(move || {
+        if body.propagate {
+            // The limiter hook owns fleet propagation; do not also spawn it here.
+            state.login_limiter.unblock(&body.ip);
+        } else {
+            state.login_limiter.unblock_local(&body.ip);
+        }
+    }).await.is_err() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Could not complete the IP unblock. Please retry."
+        }));
     }
-    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "ip": body.ip }))
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "ip": ip }))
 }
 
 pub async fn propagate_kernel_unblock_to_peers(
@@ -1825,7 +1829,12 @@ pub async fn security_auth_unblock_peer(
     body: web::Json<UnblockRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    state.login_limiter.unblock(&body.ip);
+    // Never forward a peer delivery, regardless of its propagate field.
+    if web::block(move || state.login_limiter.unblock_local(&body.ip)).await.is_err() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Could not complete the IP unblock. Please retry."
+        }));
+    }
     HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
 
@@ -2350,12 +2359,6 @@ pub async fn passkey_delete(req: HttpRequest, state: web::Data<AppState>, path: 
 }
 
 // ─── Threat Intelligence (WolfRouter integration) ───
-
-/// Helper: collect the cluster's known node addresses for the safe-filter.
-/// Filters out the unspecified address (0.0.0.0 / ::) — that's the
-/// "listen on all interfaces" sentinel some nodes report instead of a
-/// real public address; passing it to threat-intel as an exempt creates
-/// no value and confuses the self-blacklist scan.
 
 /// Helper: best-effort extraction of the requesting client's IP. Used as a
 /// transient exemption so an admin can't accidentally lock themselves out
@@ -4855,9 +4858,9 @@ fn has_no_other_peers(state: &AppState) -> bool {
 ///      cluster member. NEVER auto-restart; rotation docs explicitly
 ///      say "restart when convenient" so existing work isn't
 ///      interrupted.
-/// We distinguish by checking whether this node has any peers
-/// configured: a peerless node is fresh (case 1); a node with peers
-/// is active (case 2).
+///      We distinguish by checking whether this node has any peers
+///      configured: a peerless node is fresh (case 1); a node with peers
+///      is active (case 2).
 pub async fn cluster_secret_receive(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     // Auth: the normal inter-node secret, OR a single-use bootstrap grant this
     // node minted in its own join-handshake moments ago. The grant path lets a
@@ -5967,12 +5970,14 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
 pub async fn agent_set_cluster_name(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(e) = require_cluster_auth(&req, &state) { return e; }
     if let Some(name) = body.get("cluster_name").and_then(|v| v.as_str()) {
-        let mut nodes = state.cluster.nodes_write();
-        let old = nodes.get(&state.cluster.self_id).and_then(|n| n.cluster_name.clone());
-        if let Some(n) = nodes.get_mut(&state.cluster.self_id) {
-            n.cluster_name = Some(name.to_string());
-        }
-        drop(nodes);
+        let old = {
+            let mut nodes = state.cluster.nodes_write();
+            let old = nodes.get(&state.cluster.self_id).and_then(|n| n.cluster_name.clone());
+            if let Some(n) = nodes.get_mut(&state.cluster.self_id) {
+                n.cluster_name = Some(name.to_string());
+            }
+            old
+        };
         crate::agent::ClusterState::save_self_cluster_name(name);
         // If this push is a cluster RENAME (our name actually changed), bring
         // this node's local cluster-tagged stores (TrueNAS/Unraid/Galera/
@@ -6335,13 +6340,13 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
     ///   * Different sites (or one untagged in a way that can't match)
     ///     → fall through to `decide_peer_endpoint` so the public-IP
     ///     + safety-guards path applies for both LAN-side and
-    ///     public-side targets. Pre-Site, the LAN-target branch
-    ///     unconditionally wrote `peer.lan_address` — on klasSponsor's
-    ///     UniFi multi-VLAN cluster that meant target VLAN 10 dialed
-    ///     a peer at its VLAN 20 address (unreachable), wolfnet roamed
-    ///     to the public IP, then every reload reverted to the
-    ///     unreachable LAN — observable as the endpoint flapping
-    ///     between local and public.
+    ///       public-side targets. Pre-Site, the LAN-target branch
+    ///       unconditionally wrote `peer.lan_address` — on klasSponsor's
+    ///       UniFi multi-VLAN cluster that meant target VLAN 10 dialed
+    ///       a peer at its VLAN 20 address (unreachable), wolfnet roamed
+    ///       to the public IP, then every reload reverted to the
+    ///       unreachable LAN — observable as the endpoint flapping
+    ///       between local and public.
     ///
     /// Backward-compat for single-LAN clusters: all nodes share a /24,
     /// so all auto-derived sites match, so the LAN branch fires
@@ -6545,11 +6550,9 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
     let mut skipped = 0u32;
     let mut pruned = 0u32;
 
-    for i in 0..infos.len() {
-        let target = &infos[i];
-        for j in 0..infos.len() {
+    for (i, target) in infos.iter().enumerate() {
+        for (j, peer) in infos.iter().enumerate() {
             if i == j { continue; }
-            let peer = &infos[j];
 
             // Per-target endpoint selection — see `pick_wolfnet_endpoint`
             // above. `None` means "roaming-only on this target for this
@@ -9240,7 +9243,7 @@ pub async fn docker_create(
     let memory = body.memory_limit.as_deref();
     let cpus = body.cpu_cores.as_deref();
     let storage = body.storage_limit.as_deref();
-    match containers::docker_create(&body.name, &body.image, ports, env, wolfnet_ip, memory, cpus, storage, &body.volumes) {
+    match containers::docker_create(containers::DockerCreateOptions { name: &body.name, image: &body.image, ports, env, wolfnet_ip, memory, cpus, storage, volumes: &body.volumes }) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         // Port-conflict pre-flight rejections start with "Cannot
         // create container `…`: requested host port …" — that's a
@@ -9339,15 +9342,13 @@ pub async fn lxc_create(
         });
         let cpu_cores = body.cpu_cores.as_deref().and_then(|c| c.parse::<u32>().ok());
 
-        return match containers::pct_create_api(
-            &body.name, &body.distribution, &body.release, &body.architecture,
-            storage, template_storage, password, memory_mb, cpu_cores,
-            wolfnet_ip.as_deref(),
-            net_mode,
-            body.bridge_name.as_deref(),
-            body.bridge_ip.as_deref(),
-            body.bridge_gateway.as_deref(),
-        ) {
+        return match containers::pct_create_api(containers::PctCreateOptions {
+            name: &body.name, distribution: &body.distribution, release: &body.release,
+            architecture: &body.architecture, storage_id: storage, template_storage_id: template_storage,
+            root_password: password, memory_mb, cpu_cores, wolfnet_ip: wolfnet_ip.as_deref(),
+            net_mode, bridge: body.bridge_name.as_deref(), bridge_ip: body.bridge_ip.as_deref(),
+            bridge_gateway: body.bridge_gateway.as_deref(),
+        }) {
             Ok((vmid, mut msg)) => {
                 // Notes / description — set after the CT exists so `pct set
                 // --description` has a target. Non-fatal: a notes failure must
@@ -12883,7 +12884,7 @@ pub async fn lxc_clone(
 
     // Remote clone: export → transfer → import on target node
     if let Some(ref target_node_id) = body.target_node {
-        return lxc_remote_clone(&state, &name, &body.new_name, target_node_id, body.storage.as_deref(), body.wolfnet_ip.as_deref(), None, None).await;
+        return lxc_remote_clone(&state, &name, &body.new_name, target_node_id, body.storage.as_deref(), body.wolfnet_ip.as_deref(), (None, None)).await;
     }
 
     // Local clone — a full clone requires the source stopped; restart it after.
@@ -12984,9 +12985,9 @@ async fn lxc_remote_clone(
     target_node_id: &str,
     storage: Option<&str>,
     wolfnet_ip: Option<&str>,
-    fallback_address: Option<&str>,
-    fallback_port: Option<u16>,
+    fallback: (Option<&str>, Option<u16>),
 ) -> HttpResponse {
+    let (fallback_address, fallback_port) = fallback;
     // 1. Find target node — fall back to address/port if node ID not in local cluster state
     //    (can happen when request is proxied to a remote node with different cluster state)
     let node = match resolve_target_node(state, target_node_id, fallback_address, fallback_port) {
@@ -15662,7 +15663,7 @@ async fn lxc_import_endpoint_inner(
                 }
                 archive_path = Some(dest);
             }
-            _ => { while let Some(_) = field.next().await {} }
+            _ => { while field.next().await.is_some() {} }
         }
     }
 
@@ -15957,7 +15958,7 @@ pub async fn migration_tasks_list(
         Ok(map) => map.values().cloned().collect(),
         Err(_) => Vec::new(),
     };
-    tasks.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    tasks.sort_by_key(|task| std::cmp::Reverse(task.started_at));
     HttpResponse::Ok().json(serde_json::json!({ "tasks": tasks }))
 }
 
@@ -19595,12 +19596,6 @@ pub async fn vlan_parse_config(
     HttpResponse::Ok().json(serde_json::json!({ "parsed": parsed }))
 }
 
-/// GET /api/networking/vlan/discover — read kernel state and report
-/// any VLAN topologies already configured on this host. Lets the
-/// operator import existing config rather than re-creating it (or, in
-/// the case of incompatible topologies like vlan-aware bridges, gives
-/// them a clear "don't add this through WolfStack, you'd conflict"
-/// warning).
 // ────────────────────────────────────────────────────────────────────
 // Emergency security actions
 // ────────────────────────────────────────────────────────────────────
@@ -20904,27 +20899,36 @@ fn sanitize_yes_no_or_prohibit(v: &str, fallback: &str) -> String {
 /// True iff at least one user with a real shell has a non-empty
 /// authorized_keys file. Used by the SSH-hardening lock-out guard.
 fn any_authorized_keys_present() -> bool {
-    use std::io::BufRead;
-    let passwd = match std::fs::File::open("/etc/passwd") {
-        Ok(f) => f,
-        Err(_) => return true, // can't tell — fail open (don't refuse)
+    authorized_keys_present_from(
+        std::fs::File::open("/etc/passwd").map(std::io::BufReader::new),
+        |path| std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0),
+    )
+}
+
+fn authorized_keys_present_from(
+    passwd: std::io::Result<impl std::io::BufRead>,
+    mut has_keys: impl FnMut(&str) -> bool,
+) -> bool {
+    let passwd = match passwd {
+        Ok(reader) => reader,
+        Err(_) => return true, // can't tell — preserve the existing open-failure policy
     };
-    for line in std::io::BufReader::new(passwd).lines().flatten() {
+    for line in passwd.lines() {
+        let line = match line {
+            Ok(line) => line,
+            // The invalid line was consumed; valid users can still follow it.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => break,
+        };
         let parts: Vec<&str> = line.split(':').collect();
         if parts.len() < 7 { continue; }
-        let user = parts[0];
         let home = parts[5];
         let shell = parts[6];
         if !shell.ends_with("sh") { continue; } // skip nologin / false
-        let _ = user;
-        let path = format!("{}/.ssh/authorized_keys", home);
-        if let Ok(meta) = std::fs::metadata(&path)
-            && meta.len() > 0 { return true; }
+        if has_keys(&format!("{}/.ssh/authorized_keys", home)) { return true; }
     }
     // Check /root specifically (might not be in /etc/passwd loop above).
-    if let Ok(meta) = std::fs::metadata("/root/.ssh/authorized_keys")
-        && meta.len() > 0 { return true; }
-    false
+    has_keys("/root/.ssh/authorized_keys")
 }
 
 /// POST /api/fleet/security/ssh-hardening — push the same SSH
@@ -21004,7 +21008,7 @@ pub async fn fleet_security_ssh_hardening(
 
 /// Inline copy of the core SSH-hardening logic (write file + sshd -t
 /// + reload). Used by both the local endpoint and the fleet endpoint
-/// to apply locally without an HTTP round-trip to ourselves.
+///   to apply locally without an HTTP round-trip to ourselves.
 fn apply_ssh_hardening_local_inline(cfg: &SshHardeningConfig) -> Result<(), String> {
     if cfg.password_authentication == "no" && !cfg.force && !any_authorized_keys_present() {
         return Err("REFUSED: disabling password auth with no SSH keys present would lock you out (pass force=true to override)".into());
@@ -23227,7 +23231,8 @@ pub async fn galera_apply_tuning(req: HttpRequest, state: web::Data<AppState>, p
     let persist = web::block(move || crate::galera::persist_tuning_cluster(&cluster2, &key2, &val2, &ctx)).await
         .unwrap_or_else(|e| vec![(String::new(), Err(e.to_string()))]);
 
-    let mut map: std::collections::HashMap<String, (Option<bool>, Option<String>, Option<bool>, Option<String>)> = std::collections::HashMap::new();
+    type TuningOutcome = (Option<bool>, Option<String>, Option<bool>, Option<String>);
+    let mut map: std::collections::HashMap<String, TuningOutcome> = std::collections::HashMap::new();
     for (c, r) in live { let e = map.entry(c).or_default(); e.0 = Some(r.is_ok()); e.1 = r.err(); }
     for (c, r) in persist { let e = map.entry(c).or_default(); e.2 = Some(r.is_ok()); e.3 = r.err(); }
     let nodes: Vec<_> = map.into_iter().map(|(c, (lo, le, po, pe))| serde_json::json!({
@@ -23718,7 +23723,6 @@ pub async fn backup_mount_check(
     }
 }
 
-/// GET /api/backups/schedules — list schedules
 // ─── Fleet-scope backup configuration ───
 //
 // A schedule saved at FLEET scope in the GUI landed only on the node that
@@ -24414,7 +24418,7 @@ pub async fn pbs_restore(
                 progress.progress_text = text;
                 progress.percentage = pct;
             }
-        }, overwrite, &new_name, &target_storage) {
+        }, backup::PbsRestoreOptions { overwrite, new_name: &new_name, target_storage: &target_storage }) {
             Ok(msg) => {
                 if let Ok(mut progress) = state_clone.pbs_restore_progress.lock() {
                     progress.active = false;
@@ -28987,7 +28991,6 @@ async fn sync_mount_to_cluster(
     Ok(results)
 }
 
-/// POST /api/upgrade — run the WolfStack upgrade script in the background
 // ─── Config Export / Import ───
 
 /// Build the full config-export bundle. Shared by the HTTP export, the daily
@@ -30716,14 +30719,11 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
 
     let effective_source_id = if source_node_id.is_empty() { self_id } else { source_node_id };
 
-    match crate::wolfusb::assign_device(
-        &mut config, busid, label, usb_id,
-        effective_source_id,
-        source_hostname, &effective_address,
-        target_type, target_name,
-        target_node_id, target_hostname,
-        is_local_source,
-    ) {
+    match crate::wolfusb::assign_device(&mut config, crate::wolfusb::DeviceAssignmentRequest {
+        busid, label, usb_id, source_node_id: effective_source_id,
+        source_hostname, source_address: &effective_address,
+        target_type, target_name, target_node_id, target_hostname, is_local_source,
+    }) {
         Ok(msg) => {
             wolfusb_broadcast_sync(&state);
 
@@ -30971,9 +30971,9 @@ pub async fn wolfusb_prepare_for_export(
 ///      to claim it.
 ///   2. Run wolfusb::reattach_local which wipes any stale mount unit
 ///      and re-runs the attach chain.
-/// Returns the combined step list so the UI shows everything that
-/// happened — this is the UI for fixing Papa's "migration orphaned
-/// my USB" scenario without SSHing into nodes.
+///      Returns the combined step list so the UI shows everything that
+///      happened — this is the UI for fixing Papa's "migration orphaned
+///      my USB" scenario without SSHing into nodes.
 pub async fn wolfusb_reattach(
     req: HttpRequest, state: web::Data<AppState>,
     path: web::Path<String>,
@@ -31882,8 +31882,12 @@ pub async fn appstore_prepare_install(
     let cpu_limit = body.cpu_limit.clone();
 
     match web::block(move || {
-        appstore::prepare_install(&id, &target, &container_name, &inputs, storage_path.as_deref(), custom_ports.as_deref(),
-            extra_env.as_deref(), extra_volumes.as_deref(), memory_limit.as_deref(), cpu_limit.as_deref())
+        appstore::prepare_install(appstore::PrepareInstallOptions {
+            app_id: &id, target: &target, container_name: &container_name, user_inputs: &inputs,
+            storage_path: storage_path.as_deref(), custom_ports: custom_ports.as_deref(),
+            extra_env: extra_env.as_deref(), extra_volumes: extra_volumes.as_deref(),
+            memory_limit: memory_limit.as_deref(), cpu_limit: cpu_limit.as_deref(),
+        })
     }).await {
         Ok(Ok((session_id, _script_path))) => HttpResponse::Ok().json(serde_json::json!({
             "session_id": session_id,
@@ -32444,19 +32448,19 @@ pub async fn k8s_create_pvc(req: HttpRequest, state: web::Data<AppState>, path: 
             }
         }
         "host_path" => {
-            match crate::kubernetes::create_pv_and_pvc(
-                &cluster.kubeconfig_path, &body.name, &body.namespace, &body.size, &body.access_mode,
-                "host_path", body.host_path.as_deref(), None, None,
-            ) {
+            match crate::kubernetes::create_pv_and_pvc(&cluster.kubeconfig_path, crate::kubernetes::PersistentVolumeRequest {
+                name: &body.name, namespace: &body.namespace, size: &body.size, access_mode: &body.access_mode,
+                storage_type: "host_path", host_path: body.host_path.as_deref(), nfs_server: None, nfs_path: None,
+            }) {
                 Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
                 Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
             }
         }
         "nfs" => {
-            match crate::kubernetes::create_pv_and_pvc(
-                &cluster.kubeconfig_path, &body.name, &body.namespace, &body.size, &body.access_mode,
-                "nfs", None, body.nfs_server.as_deref(), body.nfs_path.as_deref(),
-            ) {
+            match crate::kubernetes::create_pv_and_pvc(&cluster.kubeconfig_path, crate::kubernetes::PersistentVolumeRequest {
+                name: &body.name, namespace: &body.namespace, size: &body.size, access_mode: &body.access_mode,
+                storage_type: "nfs", host_path: None, nfs_server: body.nfs_server.as_deref(), nfs_path: body.nfs_path.as_deref(),
+            }) {
                 Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
                 Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
             }
@@ -32480,20 +32484,20 @@ pub async fn k8s_create_pvc(req: HttpRequest, state: web::Data<AppState>, path: 
                     if parts.len() != 2 {
                         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid NFS source format" }));
                     }
-                    match crate::kubernetes::create_pv_and_pvc(
-                        &cluster.kubeconfig_path, &body.name, &body.namespace, &body.size, &body.access_mode,
-                        "nfs", None, Some(parts[0]), Some(parts[1]),
-                    ) {
+                    match crate::kubernetes::create_pv_and_pvc(&cluster.kubeconfig_path, crate::kubernetes::PersistentVolumeRequest {
+                        name: &body.name, namespace: &body.namespace, size: &body.size, access_mode: &body.access_mode,
+                        storage_type: "nfs", host_path: None, nfs_server: Some(parts[0]), nfs_path: Some(parts[1]),
+                    }) {
                         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
                         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
                     }
                 }
                 _ => {
                     // Use mount_point as hostPath
-                    match crate::kubernetes::create_pv_and_pvc(
-                        &cluster.kubeconfig_path, &body.name, &body.namespace, &body.size, &body.access_mode,
-                        "host_path", Some(&mount.mount_point), None, None,
-                    ) {
+                    match crate::kubernetes::create_pv_and_pvc(&cluster.kubeconfig_path, crate::kubernetes::PersistentVolumeRequest {
+                        name: &body.name, namespace: &body.namespace, size: &body.size, access_mode: &body.access_mode,
+                        storage_type: "host_path", host_path: Some(&mount.mount_point), nfs_server: None, nfs_path: None,
+                    }) {
                         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
                         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
                     }
@@ -32744,11 +32748,11 @@ pub async fn k8s_deploy_app(req: HttpRequest, state: web::Data<AppState>, path: 
         }
         val
     }).collect();
-    match crate::kubernetes::deploy_app_to_k8s(
-        &cluster.kubeconfig_path, &app.name, &body.container_name,
-        &body.namespace, &docker.image, &docker.ports, &env,
-        &docker.volumes, body.replicas,
-    ) {
+    match crate::kubernetes::deploy_app_to_k8s(&cluster.kubeconfig_path, crate::kubernetes::AppDeployment {
+        app_name: &app.name, container_name: &body.container_name,
+        namespace: &body.namespace, image: &docker.image, ports: &docker.ports, env: &env,
+        volumes: &docker.volumes, replicas: body.replicas,
+    }) {
         Ok(msg) => {
             // Auto-allocate WolfNet IP if configured and the app exposes ports
             let mut wolfnet_ip = None;
@@ -35191,13 +35195,13 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
     }
     if let Some(i) = v.get("check_interval_secs").and_then(|v| v.as_u64()) {
         // Clamp to sensible range: 30 seconds to 1 hour
-        config.check_interval_secs = i.max(30).min(3600);
+        config.check_interval_secs = i.clamp(30, 3600);
     }
     if let Some(i) = v.get("security_scan_interval_secs").and_then(|v| v.as_u64()) {
         // Clamp to 1 hour minimum (matches the UI dropdown floor) and
         // 24 hours maximum to keep at least one scan per day even if
         // a user picks the highest setting offered.
-        config.security_scan_interval_secs = i.max(3600).min(24 * 3600);
+        config.security_scan_interval_secs = i.clamp(3600, 24 * 3600);
     }
     // Notification verbosity. Anything other than the exact string
     // "verbose" falls back to Simple — defensive against typos and
@@ -35221,7 +35225,7 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
     if let Some(i) = v.get("cooldown_secs").and_then(|v| v.as_u64()) {
         // Floor at 60s — cooldown shorter than that defeats the purpose
         // and risks alert storms. Ceiling at 24h to keep it usable.
-        config.cooldown_secs = i.max(60).min(24 * 3600);
+        config.cooldown_secs = i.clamp(60, 24 * 3600);
     }
     if let Some(i) = v.get("max_alerts_per_hour").and_then(|v| v.as_u64()) {
         // 0 = no cap. Ceiling at 10_000 to avoid integer surprises.
@@ -35530,7 +35534,8 @@ async fn build_cluster_response(
     // `peer.id` (the locally-assigned cluster key) for peers that
     // haven't reported a self_id yet.
     let secret = state.cluster_secret.clone();
-    let mut handles: Vec<(String, String, String, tokio::task::JoinHandle<Result<Vec<crate::predictive::Proposal>, String>>)> =
+    type ProposalFetch = tokio::task::JoinHandle<Result<Vec<crate::predictive::Proposal>, String>>;
+    let mut handles: Vec<(String, String, String, ProposalFetch)> =
         Vec::with_capacity(peers.len());
     for peer in &peers {
         let urls = build_node_urls(&peer.address, peer.port, "/api/proposals");
@@ -35709,18 +35714,24 @@ pub async fn predictive_proposal_snooze(
     let id = path.into_inner();
     let hours = body.into_inner().hours.clamp(1, 24 * 30);
     let until = chrono::Utc::now() + chrono::Duration::hours(hours);
-    let mut store = match state.predictive_proposals.write() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    match store.snooze(&id, until) {
-        Ok(()) => {
+    let result = {
+        let mut store = match state.predictive_proposals.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let result = store.snooze(&id, until);
+        if result.is_ok() {
+            // Persist before releasing the lock and invalidating the cache.
             let _ = store.save();
+        }
+        result
+    };
+    match result {
+        Ok(()) => {
             // Order matters: save first (so on-disk is fresh), then
             // invalidate the cluster cache. The opposite order races
             // — a concurrent /api/proposals/cluster could rebuild
             // and re-cache the stale state in the gap.
-            drop(store);
             invalidate_cluster_cache(&state);
             HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
@@ -35735,7 +35746,6 @@ pub async fn predictive_proposal_snooze(
             // proposal cluster-wide via the aggregate, so operators
             // have no way of knowing they're looking at a peer-owned
             // one until they click an action and see it fail.
-            drop(store);
             // Cycle-breaker: a forwarded peer request must not re-fan-out
             // (see `is_inter_node_forward`).
             if is_inter_node_forward(&caller) {
@@ -35775,19 +35785,24 @@ pub async fn predictive_proposal_dismiss(
                       and AI feedback have something to learn from",
         }));
     }
-    let mut store = match state.predictive_proposals.write() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    match store.dismiss(&id, reason.clone()) {
-        Ok(()) => {
+    let result = {
+        let mut store = match state.predictive_proposals.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let result = store.dismiss(&id, reason.clone());
+        if result.is_ok() {
+            // Persist before releasing the lock and invalidating the cache.
             let _ = store.save();
-            drop(store);
+        }
+        result
+    };
+    match result {
+        Ok(()) => {
             invalidate_cluster_cache(&state);
             HttpResponse::Ok().json(serde_json::json!({ "success": true }))
         }
         Err(_) => {
-            drop(store);
             // Cycle-breaker: a forwarded peer request must not re-fan-out
             // (see `is_inter_node_forward`).
             if is_inter_node_forward(&caller) {
@@ -35816,19 +35831,24 @@ pub async fn predictive_proposal_approve(
         Err(resp) => return resp,
     };
     let id = path.into_inner();
-    let mut store = match state.predictive_proposals.write() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    match store.record_approval(&id, crate::predictive::ApprovalOutcome::Applied) {
-        Ok(()) => {
+    let result = {
+        let mut store = match state.predictive_proposals.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let result = store.record_approval(&id, crate::predictive::ApprovalOutcome::Applied);
+        if result.is_ok() {
+            // Persist before releasing the lock and invalidating the cache.
             let _ = store.save();
-            drop(store);
+        }
+        result
+    };
+    match result {
+        Ok(()) => {
             invalidate_cluster_cache(&state);
             HttpResponse::Ok().json(serde_json::json!({ "success": true }))
         }
         Err(_) => {
-            drop(store);
             // Cycle-breaker: a forwarded peer request must not re-fan-out
             // (see `is_inter_node_forward`) — that recursion is the
             // fleet-wide CPU storm on "Mark applied".
@@ -38274,7 +38294,7 @@ pub struct WolfRunSettingsRequest {
 pub async fn wolfrun_settings(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<WolfRunSettingsRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
-    if state.wolfrun.update_settings(&id, body.min_replicas, body.max_replicas, body.desired, body.lb_policy.clone(), body.allowed_nodes.clone(), body.failover) {
+    if state.wolfrun.update_settings(&id, crate::wolfrun::ServiceSettingsUpdate { min: body.min_replicas, max: body.max_replicas, desired: body.desired, lb_policy: body.lb_policy.clone(), allowed_nodes: body.allowed_nodes.clone(), failover: body.failover }) {
         let wolfrun = Arc::clone(&state.wolfrun);
         let cluster = Arc::clone(&state.cluster);
         let secret = state.cluster_secret.clone();
@@ -38331,17 +38351,12 @@ pub async fn wolfrun_adopt(req: HttpRequest, state: web::Data<AppState>, body: w
         _ => crate::wolfrun::Runtime::Docker,
     };
 
-    let svc = state.wolfrun.adopt(
-        body.name.clone(),
-        body.container_name.clone(),
-        body.node_id.clone(),
-        body.image.clone(),
-        runtime,
-        body.cluster_name.clone(),
-        body.env.clone(),
-        body.ports.clone(),
-        body.volumes.clone(),
-    );
+    let svc = state.wolfrun.adopt(crate::wolfrun::AdoptService {
+        name: body.name.clone(), container_name: body.container_name.clone(),
+        node_id: body.node_id.clone(), image: body.image.clone(), runtime,
+        cluster_name: body.cluster_name.clone(), env: body.env.clone(),
+        ports: body.ports.clone(), volumes: body.volumes.clone(),
+    });
 
     // Broadcast to cluster peers
     let wolfrun = Arc::clone(&state.wolfrun);
@@ -40137,10 +40152,7 @@ fn is_supporter(
 async fn value_receipt(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
-    let install_epoch = match web::block(install_date_epoch).await {
-        Ok(v) => v,
-        Err(_) => None,
-    };
+    let install_epoch = web::block(install_date_epoch).await.unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -45262,7 +45274,7 @@ fn gateway_audit(
 /// "open the originating cluster" message otherwise — only the owner
 /// node serves the SMB/NFS daemons, so a remote mutation here would
 /// lie about taking effect.
-fn require_owner<'a>(
+fn require_owner(
     state: &web::Data<AppState>,
     id: &str,
 ) -> Result<crate::gateway::Gateway, HttpResponse> {
@@ -45485,10 +45497,12 @@ pub async fn truenas_update(
         return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
     }
     let mut store = crate::truenas::TrueNasStore::load();
-    match store.update(&id, r.label.trim().to_string(),
-        r.cluster.filter(|c| !c.trim().is_empty()),
-        r.api_url.trim().trim_end_matches('/').to_string(),
-        r.pool_name.trim().to_string(), r.insecure_tls, r.cache_ttl_secs, r.api_key)
+    match store.update(&id, crate::truenas::TrueNasUpdate {
+        label: r.label.trim().to_string(), cluster: r.cluster.filter(|c| !c.trim().is_empty()),
+        api_url: r.api_url.trim().trim_end_matches('/').to_string(),
+        pool_name: r.pool_name.trim().to_string(), insecure_tls: r.insecure_tls,
+        cache_ttl_secs: r.cache_ttl_secs, new_key: r.api_key,
+    })
     {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "updated"})),
         // Same 400-vs-404 split as the Unraid handler (code review 2026-06-11).
@@ -49408,9 +49422,7 @@ pub async fn sql_connections_query(
         &id, &body.query, perm,
         crate::sql_connections::Caller::Ui(username),
         &state.cluster_secret,
-        timeout,
-        Some(&state.cluster),
-        schema,
+        crate::sql_connections::ExecutionOptions { exec_timeout: timeout, cluster: Some(&state.cluster), schema },
     ).await {
         Ok(r) => {
             // Record in per-user history (non-blocking — failure just
@@ -49496,8 +49508,8 @@ pub async fn sql_connections_query_multi(
         if s.is_empty() { results.push(serde_json::json!({ "skipped": true })); continue; }
         let caller = crate::sql_connections::Caller::Ui(username.clone());
         match crate::sql_connections::execute_with_schema(
-            &id, s, perm, caller, &state.cluster_secret, timeout, Some(&state.cluster),
-            body.schema.as_deref(),
+            &id, s, perm, caller, &state.cluster_secret,
+            crate::sql_connections::ExecutionOptions { exec_timeout: timeout, cluster: Some(&state.cluster), schema: body.schema.as_deref() },
         ).await {
             Ok(r) => results.push(serde_json::json!({
                 "ok": true,
@@ -51084,5 +51096,64 @@ mod transfer_token_tests {
         }
         assert!(!peek_transfer_token(stale));
         assert!(!validate_transfer_token(stale));
+    }
+}
+
+#[cfg(test)]
+mod authorized_keys_reader_tests {
+    use super::authorized_keys_present_from;
+    use std::io::{self, BufReader, Cursor, Read};
+
+    #[test]
+    fn malformed_utf8_does_not_hide_a_later_users_key() {
+        let passwd = Cursor::new(b"bad:\xff\nadmin:x:1000:1000::/home/admin:/bin/bash\n");
+        assert!(authorized_keys_present_from(Ok(passwd), |path| {
+            path == "/home/admin/.ssh/authorized_keys"
+        }));
+    }
+
+    #[test]
+    fn persistent_read_error_stops_and_does_not_imply_keys_exist() {
+        struct FailingReader { reads: usize }
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                assert_eq!(self.reads, 1, "a persistent error must not be polled again");
+                Err(io::Error::other("persistent read failure"))
+            }
+        }
+        let mut source = FailingReader { reads: 0 };
+        assert!(!authorized_keys_present_from(Ok(BufReader::new(&mut source)), |path| {
+            assert_eq!(path, "/root/.ssh/authorized_keys");
+            false
+        }));
+        assert_eq!(source.reads, 1);
+    }
+
+    #[test]
+    fn no_keys_does_not_bypass_hardening_guard() {
+        let passwd = Cursor::new(b"bad:\xff\nadmin:x:1000:1000::/home/admin:/bin/bash\n");
+        assert!(!authorized_keys_present_from(Ok(passwd), |_| false));
+    }
+
+    #[test]
+    fn root_fallback_and_non_login_shell_filter_are_preserved() {
+        let passwd = b"service:x:1000:1000::/srv/service:/usr/sbin/nologin\n";
+        assert!(!authorized_keys_present_from(Ok(Cursor::new(passwd)), |path| {
+            path == "/srv/service/.ssh/authorized_keys"
+        }));
+        assert!(authorized_keys_present_from(Ok(Cursor::new(passwd)), |path| {
+            path == "/root/.ssh/authorized_keys"
+        }));
+    }
+
+    #[test]
+    fn passwd_open_failure_preserves_existing_policy() {
+        let passwd: io::Result<Cursor<&[u8]>> = Err(io::Error::new(
+            io::ErrorKind::PermissionDenied, "cannot open passwd",
+        ));
+        assert!(authorized_keys_present_from(passwd, |_| {
+            panic!("open failures must preserve the immediate return")
+        }));
     }
 }

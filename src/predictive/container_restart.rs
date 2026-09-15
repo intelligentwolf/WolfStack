@@ -44,7 +44,7 @@ use crate::predictive::{
     Context,
     metrics::MetricsHistory,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
     container_disk::{Runtime, resource_id, maybe_reset_history, ContainerDiskFact},
@@ -333,9 +333,8 @@ fn build_proposal(fact: &RestartFact, scope: &ProposalScope, v: &Verdict) -> Pro
         ],
     };
 
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         v.severity,
         title,
         why,

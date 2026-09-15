@@ -38,7 +38,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
     container_disk::{Runtime, resource_id},
@@ -235,8 +235,8 @@ fn build_proposal(fact: &MemoryFact, scope: &ProposalScope, severity: Severity) 
         },
     };
 
-    Proposal::new(
-        fact.finding_type(), ProposalSource::Rule, severity,
+    Proposal::new_rule(
+        fact.finding_type(), severity,
         title, why, evidence, remediation, scope.clone(),
     )
 }

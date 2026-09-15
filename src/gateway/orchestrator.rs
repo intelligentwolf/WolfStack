@@ -53,10 +53,9 @@ pub fn apply(g: &Gateway) -> Result<GatewayRuntime, ApplyError> {
     let share = sources::share_path(&g.id);
     std::fs::create_dir_all(&share)?;
 
-    let active_index;
     let mut last_error: Option<String> = None;
 
-    match g.mode {
+    let active_index = match g.mode {
         GatewayMode::Single => {
             // Mount source 0 and bind it to share/.
             let s = &g.sources[0];
@@ -66,12 +65,12 @@ pub fn apply(g: &Gateway) -> Result<GatewayRuntime, ApplyError> {
             // Samba/NFS see a stable path that survives source-mount
             // reconfigs.
             ensure_bind(&mounted, &share)?;
-            active_index = 0;
+            0
         }
         GatewayMode::Failover  => return Err(ApplyError::UnsupportedMode("failover")),
         GatewayMode::Aggregate => return Err(ApplyError::UnsupportedMode("aggregate")),
         GatewayMode::Sharded   => return Err(ApplyError::UnsupportedMode("sharded")),
-    }
+    };
 
     // Daemon configs.
     if g.protocols.contains(&Protocol::Smb) {

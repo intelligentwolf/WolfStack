@@ -250,9 +250,7 @@ pub fn ensure_default_zones(state: &RouterState, node_id: &str) -> bool {
                 _ => continue,
             };
             if cfg.zones.get(node_id, &name).is_some() { continue; }
-            let auto_zone = if name.starts_with("wn") || name.starts_with("wolfnet") {
-                Some(Zone::Wolfnet)
-            } else if name.starts_with("wg-") {
+            let auto_zone = if name.starts_with("wn") || name.starts_with("wolfnet") || name.starts_with("wg-") {
                 Some(Zone::Wolfnet)
             } else if name == primary {
                 Some(Zone::Wan)
@@ -445,7 +443,8 @@ fn identify_vendor(text: &str, router: &mut DiscoveredRouter) {
         .map(|l| l[7..].trim().to_string());
 
     // Vendor-specific fingerprints — most reliable to least.
-    let patterns: &[(&str, &str, fn(&Option<String>, &Option<String>) -> (String, String))] = &[
+    type VendorExtractor = fn(&Option<String>, &Option<String>) -> (String, String);
+    let patterns: &[(&str, &str, VendorExtractor)] = &[
         ("fritz", "AVM", |title, _| {
             let model = title.as_deref().unwrap_or("Fritz!Box").to_string();
             ("AVM Fritz!Box".into(), model)

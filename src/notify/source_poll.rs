@@ -254,7 +254,7 @@ mod tests {
         let m = parse_qm_list(text);
         assert_eq!(m.get("web").map(String::as_str), Some("running"));
         assert_eq!(m.get("db").map(String::as_str), Some("stopped"));
-        assert!(m.get("100").is_none(), "should key by name, not VMID");
+        assert!(!m.contains_key("100"), "should key by name, not VMID");
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
 };
 use crate::vms::manager::{VmManager, WolfnetTapHealth, probe_wolfnet_tap_health};
@@ -205,9 +205,8 @@ fn build_proposal(h: &WolfnetTapHealth, scope: &ProposalScope, vm_label: &str) -
         format!("# To force a clean restart of WolfNet plumbing on this VM:"),
         format!("# (stop the VM from the UI, then start it again — WolfStack re-runs setup_wolfnet_routing)"),
     ];
-    Proposal::new(
+    Proposal::new_rule(
         FINDING_TYPE,
-        ProposalSource::Rule,
         Severity::Critical,
         title,
         why,

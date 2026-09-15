@@ -41,7 +41,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context, NetworkReachability, NetworkSnapshot, classify_bind,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
 };
@@ -288,8 +288,8 @@ fn build_listening_proposal(
         NetworkReachability::PublicInternet => "the public internet",
         NetworkReachability::LocalNetwork   => "the local network",
         NetworkReachability::OverlayOnly { network } => {
-            return Proposal::new(
-                FINDING_SERVICE_PUBLIC, ProposalSource::Rule, severity,
+            return Proposal::new_rule(
+                FINDING_SERVICE_PUBLIC, severity,
                 format!("{} ({}/{}) on overlay {}", service, proto, sock.port, network),
                 format!(
                     "{} is listening on overlay '{}'. Overlay-only \
@@ -434,8 +434,8 @@ fn build_listening_proposal(
         }
     };
 
-    Proposal::new(
-        FINDING_SERVICE_PUBLIC, ProposalSource::Rule, severity,
+    Proposal::new_rule(
+        FINDING_SERVICE_PUBLIC, severity,
         title, why, evidence, remediation, scope.clone(),
     )
 }
@@ -515,9 +515,8 @@ fn analyze_scan_detector(
     {
         return Vec::new();
     }
-    vec![Proposal::new(
+    vec![Proposal::new_rule(
         FINDING_SCAN_DETECTOR_DISABLED,
-        ProposalSource::Rule,
         Severity::Warn,
         "Outbound scan detection is disabled".to_string(),
         "The outbound scan detector is turned off on this node. It ships \
@@ -584,8 +583,8 @@ fn build_sshd_root_proposal(
     severity: Severity,
     scope: &ProposalScope,
 ) -> Proposal {
-    Proposal::new(
-        FINDING_SSHD_ROOT_LOGIN, ProposalSource::Rule, severity,
+    Proposal::new_rule(
+        FINDING_SSHD_ROOT_LOGIN, severity,
         format!("sshd allows root login (sshd reachable from: {:?})", reach),
         format!(
             "/etc/ssh/sshd_config has `PermitRootLogin yes`. Severity \
@@ -619,8 +618,8 @@ fn build_sshd_password_proposal(
     severity: Severity,
     scope: &ProposalScope,
 ) -> Proposal {
-    Proposal::new(
-        FINDING_SSHD_PASSWORD_AUTH, ProposalSource::Rule, severity,
+    Proposal::new_rule(
+        FINDING_SSHD_PASSWORD_AUTH, severity,
         format!("sshd accepts password auth (sshd reachable from: {:?})", reach),
         format!(
             "/etc/ssh/sshd_config has `PasswordAuthentication yes`. \

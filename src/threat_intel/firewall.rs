@@ -26,9 +26,9 @@
 /// Jumped from all three WolfRouter chains:
 /// - `WOLFROUTER_IN`  — packets destined for this host
 /// - `WOLFROUTER_FWD` — packets routed/bridged through this host
-///                       (Docker published ports, LXC, VMs on bridges)
+///   (Docker published ports, LXC, VMs on bridges)
 /// - `WOLFROUTER_OUT` — packets originating from this host (incl.
-///                       host-networked containers)
+///   host-networked containers)
 pub fn iptables_lines_v4() -> String {
     let cfg = super::ThreatIntelConfig::load();
     if !super::enforcement_active(&cfg) {

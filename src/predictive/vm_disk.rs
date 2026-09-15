@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
 };
@@ -239,8 +239,8 @@ fn build_proposal(fact: &VmDiskFact, scope: &ProposalScope, severity: Severity) 
             "sudo fstrim -av     # reclaim qcow2 space if TRIM enabled".into(),
         ],
     };
-    Proposal::new(
-        FINDING_TYPE, ProposalSource::Rule, severity,
+    Proposal::new_rule(
+        FINDING_TYPE, severity,
         title, why, evidence, remediation, scope.clone(),
     )
 }

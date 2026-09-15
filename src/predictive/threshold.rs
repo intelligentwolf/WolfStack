@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::predictive::{
     Context,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
     ack::AckStore,
 };
@@ -229,8 +229,8 @@ fn check_cpu(
     if acks.suppresses(FINDING_HOST_CPU, &scope) { return None; }
     if proposals.is_suppressed(FINDING_HOST_CPU, &scope) { return None; }
 
-    Some(Proposal::new(
-        FINDING_HOST_CPU, ProposalSource::Rule, sev,
+    Some(Proposal::new_rule(
+        FINDING_HOST_CPU, sev,
         format!("CPU usage at {:.1}%", pct),
         format!(
             "CPU is at {:.1}% — the system may be unresponsive to \
@@ -284,8 +284,8 @@ fn check_memory(
     let used_gb = metrics.memory_used_bytes as f64 / 1_073_741_824.0;
     let total_gb = metrics.memory_total_bytes as f64 / 1_073_741_824.0;
 
-    Some(Proposal::new(
-        FINDING_HOST_MEMORY, ProposalSource::Rule, sev,
+    Some(Proposal::new_rule(
+        FINDING_HOST_MEMORY, sev,
         format!("Memory usage at {:.1}%", pct),
         format!(
             "Memory is at {:.1}% ({:.1} GB used of {:.1} GB). At >90 % \
@@ -355,8 +355,8 @@ fn check_disks(
         let total_gb = d.total_bytes as f64 / 1_073_741_824.0;
         let used_gb = d.used_bytes as f64 / 1_073_741_824.0;
 
-        out.push(Proposal::new(
-            FINDING_HOST_DISK_FREE, ProposalSource::Rule, sev,
+        out.push(Proposal::new_rule(
+            FINDING_HOST_DISK_FREE, sev,
             format!("{} has {:.1} GB free", d.mount_point, free_gb),
             format!(
                 "{} has {:.1} GB free of {:.1} GB total ({:.1}% used). \
@@ -423,8 +423,8 @@ fn check_swap(
     let used_gb = metrics.swap_used_bytes as f64 / 1_073_741_824.0;
     let total_gb = metrics.swap_total_bytes as f64 / 1_073_741_824.0;
 
-    Some(Proposal::new(
-        FINDING_HOST_SWAP, ProposalSource::Rule, Severity::Warn,
+    Some(Proposal::new_rule(
+        FINDING_HOST_SWAP, Severity::Warn,
         format!("Swap usage at {:.0}%", pct),
         format!(
             "{:.1} GB of {:.1} GB swap is in use ({:.0}%). Heavy swap \
@@ -472,8 +472,8 @@ fn check_load(
     if acks.suppresses(FINDING_HOST_LOAD, &scope) { return None; }
     if proposals.is_suppressed(FINDING_HOST_LOAD, &scope) { return None; }
 
-    Some(Proposal::new(
-        FINDING_HOST_LOAD, ProposalSource::Rule, sev,
+    Some(Proposal::new_rule(
+        FINDING_HOST_LOAD, sev,
         format!("Load average {:.2} ({:.1}× CPU count)", load1, mult),
         format!(
             "1-minute load average is {:.2} on a {}-CPU host \
@@ -517,8 +517,8 @@ fn check_failed_units(
         if acks.suppresses(FINDING_SYSTEMD_FAILED, &scope) { return None; }
         if proposals.is_suppressed(FINDING_SYSTEMD_FAILED, &scope) { return None; }
 
-        Some(Proposal::new(
-            FINDING_SYSTEMD_FAILED, ProposalSource::Rule, Severity::Warn,
+        Some(Proposal::new_rule(
+            FINDING_SYSTEMD_FAILED, Severity::Warn,
             format!("Systemd unit '{}' failed", unit),
             format!(
                 "{} is in `failed` state per `systemctl --failed`. \
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn a_repaired_systemd_unit_retires_when_the_scan_succeeded() {
         use crate::predictive::proposal::{
-            ApprovalOutcome, ProposalStatus, ProposalSource, RemediationPlan, vanished_scopes,
+            ApprovalOutcome, ProposalStatus, RemediationPlan, vanished_scopes,
         };
         let m = metrics(10.0, 10.0, 100.0, 200.0);
         let scope = ProposalScope {
@@ -760,8 +760,8 @@ mod tests {
             resource_id: Some("broken.timer".into()),
         };
         let mut store = crate::predictive::proposal::ProposalStore::default();
-        store.upsert(Proposal::new(
-            FINDING_SYSTEMD_FAILED, ProposalSource::Rule, Severity::Warn,
+        store.upsert(Proposal::new_rule(
+            FINDING_SYSTEMD_FAILED, Severity::Warn,
             "Systemd unit 'broken.timer' failed", "why", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
             scope.clone(),
@@ -783,8 +783,8 @@ mod tests {
         // Now the safety case: systemd never answered (no systemd, timeout).
         // Identical empty unit list, but the finding must survive.
         let mut store2 = crate::predictive::proposal::ProposalStore::default();
-        store2.upsert(Proposal::new(
-            FINDING_SYSTEMD_FAILED, ProposalSource::Rule, Severity::Warn,
+        store2.upsert(Proposal::new_rule(
+            FINDING_SYSTEMD_FAILED, Severity::Warn,
             "Systemd unit 'broken.timer' failed", "why", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
             scope.clone(),

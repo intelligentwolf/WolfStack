@@ -92,7 +92,7 @@ pub struct NodeAggregateStatus {
 /// so ascending `cmp` puts Critical first. The inner `b.updated_at
 /// .cmp(&a.updated_at)` is reversed-arg order to get descending
 /// recency within a tier.
-pub fn sort_proposals(proposals: &mut Vec<Proposal>) {
+pub fn sort_proposals(proposals: &mut [Proposal]) {
     proposals.sort_by(|a, b| {
         a.severity.rank().cmp(&b.severity.rank())
             .then_with(|| b.updated_at.cmp(&a.updated_at))
@@ -103,13 +103,12 @@ pub fn sort_proposals(proposals: &mut Vec<Proposal>) {
 mod tests {
     use super::*;
     use crate::predictive::proposal::{
-        ProposalScope, ProposalSource, RemediationPlan, Severity,
+        ProposalScope, RemediationPlan, Severity,
     };
 
     fn p(node: &str, sev: Severity, finding: &str) -> Proposal {
-        Proposal::new(
+        Proposal::new_rule(
             finding,
-            ProposalSource::Rule,
             sev,
             "title", "why", vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },

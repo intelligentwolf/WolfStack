@@ -138,12 +138,12 @@ fn format_for_channel(p: &Proposal) -> (String, String) {
 mod tests {
     use super::*;
     use crate::predictive::proposal::{
-        ApprovalOutcome, ProposalSource, ProposalStatus, RemediationPlan,
+        ApprovalOutcome, ProposalStatus, RemediationPlan,
     };
 
     fn p(finding: &str, sev: Severity, status: ProposalStatus) -> Proposal {
-        let mut x = Proposal::new(
-            finding, ProposalSource::Rule, sev,
+        let mut x = Proposal::new_rule(
+            finding, sev,
             "title", "why".repeat(50),
             vec![],
             RemediationPlan::Manual { instructions: "x".into(), commands: vec![] },
