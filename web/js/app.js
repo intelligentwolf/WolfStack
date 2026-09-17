@@ -2427,6 +2427,7 @@ function selectServerView(nodeId, view) {
         'wolfkube': 'WolfKube',
         'wolfram': 'Wolfram',
         'wolfrouter': 'WolfRouter',
+        'local-ai': 'Local AI',
     };
     // Page title is just the view name — the server name already lives in the
     // cluster pill beside it, so "wolfstack-2 — LXC" became plain "LXC". The
@@ -2451,7 +2452,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'shares', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram', 'wolfrouter', 'ups'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'shares', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram', 'wolfrouter', 'ups', 'local-ai'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -2538,12 +2539,139 @@ function selectServerView(nodeId, view) {
     if (view === 'wolfkube') loadNodeWolfKube().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfram') loadWolframStatus().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfusb') loadWolfUsbPage().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'local-ai') loadLocalAiPage().finally(() => hidePageLoadingOverlay(el));
     // XCP-ng / Xen Orchestra pools and Tenants are *cluster-wide*
     // views (not per-node) so they only dispatch from the
     // top-level selectView, never from selectServerView. The
     // drawer click → appDrawerNav → selectView path is the only
     // way they're reached. Listing them here would be dead code
     // and a confusing noise hint to anyone reading.
+}
+
+// ─── Per-server Local AI ───
+let localAiMode = 'ollama';
+
+function localAiNodeUrl(path) {
+    return nodeApiUrl(currentNodeId, path);
+}
+
+function localAiModeLabel(mode) {
+    return mode === 'colibri' ? 'Colibri' : 'Ollama';
+}
+
+function localAiRenderRows(items, emptyText, render) {
+    if (!Array.isArray(items) || !items.length) return `<div style="padding:14px;color:var(--text-muted);">${emptyText}</div>`;
+    return items.map(render).join('');
+}
+
+async function localAiLoadModels(selected) {
+    const select = document.getElementById('local-ai-model');
+    if (!select) return;
+    select.innerHTML = '<option>Loading models…</option>';
+    try {
+        const resp = await fetch(localAiNodeUrl('/api/ai/models?provider=local'));
+        const data = await resp.json();
+        const models = Array.isArray(data.models) ? data.models : [];
+        select.innerHTML = models.length
+            ? models.map(m => `<option value="${escapeAttr(m)}">${escapeHtml(m)}</option>`).join('')
+            : '<option value="">No models reported</option>';
+        if (selected && models.includes(selected)) select.value = selected;
+        else if (selected) {
+            const opt = document.createElement('option');
+            opt.value = selected; opt.textContent = `${selected} (saved)`;
+            select.insertBefore(opt, select.firstChild); select.value = selected;
+        }
+    } catch (e) {
+        select.innerHTML = '<option value="">Could not load models</option>';
+        localAiShowError('Could not load models: ' + ((e && e.message) || e));
+    }
+}
+
+function localAiShowError(message) {
+    const el = document.getElementById('local-ai-error');
+    if (el) { el.hidden = false; el.textContent = message; }
+}
+
+function localAiSetMode(mode) {
+    localAiMode = mode === 'colibri' ? 'colibri' : 'ollama';
+    try { localStorage.setItem('wolfstack_local_ai_mode_' + currentNodeId, localAiMode); } catch (_) {}
+    const hint = document.getElementById('local-ai-endpoint-hint');
+    if (hint) hint.textContent = localAiMode === 'ollama'
+        ? 'Ollama exposes its OpenAI-compatible API at this endpoint.'
+        : 'Colibri must expose an OpenAI-compatible /v1 endpoint.';
+}
+
+async function localAiSave() {
+    const url = (document.getElementById('local-ai-url') || {}).value?.trim() || '';
+    const model = (document.getElementById('local-ai-model') || {}).value?.trim() || '';
+    if (!url) { localAiShowError('Enter the Local AI endpoint before saving.'); return; }
+    if (!model) { localAiShowError('Select a model before saving.'); return; }
+    const button = document.getElementById('local-ai-save');
+    if (button) button.disabled = true;
+    try {
+        const resp = await fetch(localAiNodeUrl('/api/ai/config'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider: 'local', local_url: url, model, agent_enabled: true }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.status !== 'saved') throw new Error(data.error || `HTTP ${resp.status}`);
+        localAiShowError('');
+        const error = document.getElementById('local-ai-error'); if (error) error.hidden = true;
+        showToast(`${localAiModeLabel(localAiMode)} settings saved`, 'success');
+        await localAiLoadPageData();
+    } catch (e) { localAiShowError('Could not save Local AI settings: ' + ((e && e.message) || e)); }
+    finally { if (button) button.disabled = false; }
+}
+
+async function localAiTest() {
+    const button = document.getElementById('local-ai-test');
+    if (button) { button.disabled = true; button.textContent = 'Testing…'; }
+    try {
+        const resp = await fetch(localAiNodeUrl('/api/ai/test-connection'), { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        showToast(`${localAiModeLabel(localAiMode)} responded in ${data.elapsed_ms || 0} ms`, 'success');
+        await localAiLoadPageData();
+    } catch (e) { localAiShowError('Connection test failed: ' + ((e && e.message) || e)); }
+    finally { if (button) { button.disabled = false; button.textContent = 'Test connection'; } }
+}
+
+async function localAiLoadPageData() {
+    try {
+        const [diagResp, configResp] = await Promise.all([
+            fetch(localAiNodeUrl('/api/ai/diagnostics')),
+            fetch(localAiNodeUrl('/api/ai/config')),
+        ]);
+        if (!diagResp.ok || !configResp.ok) throw new Error(`HTTP ${diagResp.status}/${configResp.status}`);
+        const diag = await diagResp.json();
+        const config = await configResp.json();
+        const status = document.getElementById('local-ai-status');
+        if (status) status.textContent = config.provider === 'local' && config.model ? `Configured · ${config.model}` : 'Not configured';
+        const stats = document.getElementById('local-ai-stats');
+        if (stats) stats.innerHTML = [
+            ['History', (diag.history || []).length],
+            ['Requests', (diag.requests || []).length],
+            ['Alerts', (diag.alerts || []).length],
+        ].map(([label, value]) => `<div class="card" style="padding:14px;"><div style="font-size:24px;font-weight:700;">${value}</div><div style="font-size:12px;color:var(--text-muted);">${label}</div></div>`).join('');
+        const history = document.getElementById('local-ai-history');
+        if (history) history.innerHTML = localAiRenderRows((diag.history || []).slice().reverse(), 'No chat history on this server.', m => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(m.role)}</strong> <span style="color:var(--text-muted);font-size:12px;">${new Date(m.timestamp * 1000).toLocaleString()}</span><div style="margin-top:4px;white-space:pre-wrap;">${escapeHtml(m.content)}</div></div>`);
+        const requests = document.getElementById('local-ai-requests');
+        if (requests) requests.innerHTML = localAiRenderRows((diag.requests || []).slice().reverse(), 'No pending or recent agent requests.', a => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(a.title || 'Agent request')}</strong> <span style="color:var(--text-muted);">${escapeHtml(a.status || '')}</span><div style="margin-top:4px;color:var(--text-secondary);">${escapeHtml(a.explanation || '')}</div></div>`);
+        const alerts = document.getElementById('local-ai-alerts');
+        if (alerts) alerts.innerHTML = localAiRenderRows((diag.alerts || []).slice().reverse(), 'No alerts recorded on this server.', a => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(a.severity || 'info')}</strong> ${escapeHtml(a.message || '')}<div style="font-size:12px;color:var(--text-muted);">${escapeHtml(a.hostname || '')} · ${new Date(a.timestamp * 1000).toLocaleString()}</div></div>`);
+        const url = document.getElementById('local-ai-url'); if (url) url.value = config.local_url || '';
+        localAiSetMode(localAiMode);
+        await localAiLoadModels(config.model || '');
+    } catch (e) { localAiShowError('Could not load Local AI diagnostics: ' + ((e && e.message) || e)); }
+}
+
+async function loadLocalAiPage() {
+    try { localAiMode = localStorage.getItem('wolfstack_local_ai_mode_' + currentNodeId) || 'ollama'; } catch (_) { localAiMode = 'ollama'; }
+    const el = document.getElementById('local-ai-content');
+    if (!el) return;
+    el.innerHTML = `<div class="card" style="margin-bottom:18px;"><div class="card-body"><div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;"><div><h2 style="margin:0 0 6px;">Local AI</h2><p style="margin:0;color:var(--text-secondary);">Inspect this server’s local model service, history, requests and alerts.</p></div><div id="local-ai-status" role="status" style="padding:7px 10px;border-radius:999px;background:var(--bg-input);color:var(--text-secondary);">Checking status…</div></div><div id="local-ai-error" role="alert" aria-live="assertive" hidden style="margin-top:14px;padding:10px;border:1px solid var(--danger);border-radius:8px;color:var(--danger);"></div></div></div><div id="local-ai-stats" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:18px;"></div><div class="card" style="margin-bottom:18px;"><div class="card-body"><h3 style="margin-top:0;">Provider and model</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;"><label>Local provider<select class="form-control" onchange="localAiSetMode(this.value)"><option value="ollama">Ollama</option><option value="colibri">Colibri</option></select></label><label>OpenAI-compatible endpoint<input id="local-ai-url" class="form-control" placeholder="http://localhost:11434"><small id="local-ai-endpoint-hint" style="color:var(--text-muted);display:block;margin-top:4px;"></small></label><label>Model<select id="local-ai-model" class="form-control"></select></label></div><div style="display:flex;gap:8px;margin-top:14px;"><button id="local-ai-save" class="btn btn-primary" onclick="localAiSave()">Save changes</button><button id="local-ai-test" class="btn" onclick="localAiTest()">Test connection</button></div></div></div><div class="grid-2"><div class="card"><div class="card-header"><h3>History</h3></div><div id="local-ai-history" class="card-body"></div></div><div class="card"><div class="card-header"><h3>Requests</h3></div><div id="local-ai-requests" class="card-body"></div></div></div><div class="card" style="margin-top:18px;"><div class="card-header"><h3>Alerts</h3></div><div id="local-ai-alerts" class="card-body"></div></div>`;
+    el.querySelector('select').value = localAiMode;
+    await localAiLoadPageData();
 }
 
 // ─── Tenant federation aggregator (SP-side dashboard) ────────────
@@ -4399,6 +4527,9 @@ function buildServerTree(nodes) {
                     <div class="server-node-children ${shouldExpandNode ? 'expanded' : ''}" id="children-${node.id}">
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
                             <span class="icon ws-icon-clean-wrap" data-icon="home"></span> Dashboard
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="local-ai" onclick="selectServerView('${node.id}', 'local-ai')">
+                            <span class="icon ws-icon-clean-wrap" data-icon="brain"></span> Local AI
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="backups" onclick="selectServerView('${node.id}', 'backups')">
                             <span class="icon ws-icon-clean-wrap" data-icon="save"></span> Backups
