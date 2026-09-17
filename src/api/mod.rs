@@ -18385,6 +18385,20 @@ pub async fn ai_alerts(
     HttpResponse::Ok().json(alerts)
 }
 
+/// GET /api/ai/diagnostics — read-only operator view of the local agent.
+pub async fn ai_diagnostics(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = state.ai_agent.config.lock().unwrap().masked();
+    let history = state.ai_agent.chat_history.lock().unwrap().clone();
+    let alerts = state.ai_agent.alerts.lock().unwrap().clone();
+    let requests = state.ai_agent.pending_actions.lock().unwrap().clone();
+    HttpResponse::Ok().json(serde_json::json!({
+        "config": config, "history": history, "alerts": alerts, "requests": requests,
+    }))
+}
+
 /// GET /api/ai/models?provider=claude|gemini — list available models
 pub async fn ai_models(
     req: HttpRequest, state: web::Data<AppState>,
@@ -48130,6 +48144,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/chat/result", web::get().to(ai_chat_result))
         .route("/api/ai/status", web::get().to(ai_status))
         .route("/api/ai/alerts", web::get().to(ai_alerts))
+        .route("/api/ai/diagnostics", web::get().to(ai_diagnostics))
         .route("/api/ai/models", web::get().to(ai_models))
         .route("/api/ai/models", web::post().to(ai_models))
         .route("/api/ai/exec", web::post().to(ai_exec))
