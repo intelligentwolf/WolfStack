@@ -18390,12 +18390,30 @@ pub async fn ai_diagnostics(
     req: HttpRequest, state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let metrics_state = state.clone();
+    let resource = tokio::task::spawn_blocking(move || {
+        let metrics = metrics_state.monitor.lock().unwrap().collect();
+        let (gpu, active_compute_processes) = crate::monitoring::collect_gpu_metrics();
+        (metrics, gpu, active_compute_processes)
+    }).await;
+    let (metrics, gpu, active_compute_processes) = match resource {
+        Ok(resource) => resource,
+        Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": "Resource telemetry unavailable"})),
+    };
     let config = state.ai_agent.config.lock().unwrap().masked();
-    let history = state.ai_agent.chat_history.lock().unwrap().clone();
-    let alerts = state.ai_agent.alerts.lock().unwrap().clone();
-    let requests = state.ai_agent.pending_actions.lock().unwrap().clone();
+    let history_count = state.ai_agent.chat_history.lock().unwrap().len();
+    let alert_count = state.ai_agent.alerts.lock().unwrap().len();
+    let request_counts = {
+        let actions = state.ai_agent.pending_actions.lock().unwrap();
+        let pending = actions.iter().filter(|a| a.status == "pending").count();
+        serde_json::json!({"total": actions.len(), "pending": pending})
+    };
     HttpResponse::Ok().json(serde_json::json!({
-        "config": config, "history": history, "alerts": alerts, "requests": requests,
+        "config": config,
+        "activity": {"history_messages": history_count, "alerts": alert_count, "requests": request_counts},
+        "metrics": metrics,
+        "gpu": gpu,
+        "active_compute_processes": active_compute_processes,
     }))
 }
 
