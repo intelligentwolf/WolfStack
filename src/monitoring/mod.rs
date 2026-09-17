@@ -36,6 +36,50 @@ pub struct SystemMetrics {
     pub hardware_tier: String,
 }
 
+/// NVIDIA GPU telemetry returned by `nvidia-smi`, when the NVIDIA utility is
+/// installed and the driver responds. Memory values are reported in bytes so
+/// the dashboard can format them consistently with host RAM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuMetrics {
+    pub name: String,
+    pub utilization_percent: f32,
+    pub memory_total_bytes: u64,
+    pub memory_used_bytes: u64,
+}
+
+/// Read current NVIDIA telemetry without making GPU support a hard runtime
+/// dependency. The query field names and MiB units are defined by nvidia-smi's
+/// `--help-query-gpu` output; an unavailable command yields an empty snapshot.
+pub fn collect_gpu_metrics() -> (Vec<GpuMetrics>, usize) {
+    let output = match std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return (Vec::new(), 0),
+    };
+    let gpus = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(',').map(str::trim);
+            Some(GpuMetrics {
+                name: fields.next()?.to_string(),
+                memory_total_bytes: fields.next()?.parse::<u64>().ok()?.saturating_mul(1024 * 1024),
+                memory_used_bytes: fields.next()?.parse::<u64>().ok()?.saturating_mul(1024 * 1024),
+                utilization_percent: fields.next()?.parse::<f32>().ok()?,
+            })
+        })
+        .collect();
+    let active_compute_processes = std::process::Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    (gpus, active_compute_processes)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskMetrics {
     pub name: String,

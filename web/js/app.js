@@ -2559,11 +2559,6 @@ function localAiModeLabel(mode) {
     return mode === 'colibri' ? 'Colibri' : 'Ollama';
 }
 
-function localAiRenderRows(items, emptyText, render) {
-    if (!Array.isArray(items) || !items.length) return `<div style="padding:14px;color:var(--text-muted);">${emptyText}</div>`;
-    return items.map(render).join('');
-}
-
 async function localAiLoadModels(selected) {
     const select = document.getElementById('local-ai-model');
     if (!select) return;
@@ -2647,18 +2642,26 @@ async function localAiLoadPageData() {
         const config = await configResp.json();
         const status = document.getElementById('local-ai-status');
         if (status) status.textContent = config.provider === 'local' && config.model ? `Configured · ${config.model}` : 'Not configured';
+        const activity = diag.activity || {};
+        const requests = activity.requests || {};
+        const metrics = diag.metrics || {};
         const stats = document.getElementById('local-ai-stats');
         if (stats) stats.innerHTML = [
-            ['History', (diag.history || []).length],
-            ['Requests', (diag.requests || []).length],
-            ['Alerts', (diag.alerts || []).length],
-        ].map(([label, value]) => `<div class="card" style="padding:14px;"><div style="font-size:24px;font-weight:700;">${value}</div><div style="font-size:12px;color:var(--text-muted);">${label}</div></div>`).join('');
-        const history = document.getElementById('local-ai-history');
-        if (history) history.innerHTML = localAiRenderRows((diag.history || []).slice().reverse(), 'No chat history on this server.', m => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(m.role)}</strong> <span style="color:var(--text-muted);font-size:12px;">${new Date(m.timestamp * 1000).toLocaleString()}</span><div style="margin-top:4px;white-space:pre-wrap;">${escapeHtml(m.content)}</div></div>`);
-        const requests = document.getElementById('local-ai-requests');
-        if (requests) requests.innerHTML = localAiRenderRows((diag.requests || []).slice().reverse(), 'No pending or recent agent requests.', a => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(a.title || 'Agent request')}</strong> <span style="color:var(--text-muted);">${escapeHtml(a.status || '')}</span><div style="margin-top:4px;color:var(--text-secondary);">${escapeHtml(a.explanation || '')}</div></div>`);
-        const alerts = document.getElementById('local-ai-alerts');
-        if (alerts) alerts.innerHTML = localAiRenderRows((diag.alerts || []).slice().reverse(), 'No alerts recorded on this server.', a => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(a.severity || 'info')}</strong> ${escapeHtml(a.message || '')}<div style="font-size:12px;color:var(--text-muted);">${escapeHtml(a.hostname || '')} · ${new Date(a.timestamp * 1000).toLocaleString()}</div></div>`);
+            ['History messages', activity.history_messages || 0],
+            ['Requests total', requests.total || 0],
+            ['Requests pending', requests.pending || 0],
+            ['Alerts', activity.alerts || 0],
+            ['CPU', `${(metrics.cpu_usage_percent || 0).toFixed(1)}%`],
+            ['RAM', `${(metrics.memory_percent || 0).toFixed(1)}% · ${formatBytes(metrics.memory_used_bytes || 0)}`],
+            ['Swap', `${formatBytes(metrics.swap_used_bytes || 0)} / ${formatBytes(metrics.swap_total_bytes || 0)}`],
+            ['Processes', metrics.processes || 0],
+        ].map(([label, value]) => `<div class="card" style="padding:14px;"><div style="font-size:22px;font-weight:700;">${value}</div><div style="font-size:12px;color:var(--text-muted);">${label}</div></div>`).join('');
+        const gpu = document.getElementById('local-ai-gpu');
+        if (gpu) gpu.innerHTML = diag.gpu?.length
+            ? diag.gpu.map(g => `<div style="padding:10px 0;border-bottom:1px solid var(--border);"><strong>${escapeHtml(g.name)}</strong><span style="float:right;">${(g.utilization_percent || 0).toFixed(1)}% · ${formatBytes(g.memory_used_bytes || 0)} / ${formatBytes(g.memory_total_bytes || 0)}</span></div>`).join('')
+            : '<div style="color:var(--text-muted);">No NVIDIA GPU telemetry available.</div>';
+        const gpuProcesses = document.getElementById('local-ai-gpu-processes');
+        if (gpuProcesses) gpuProcesses.textContent = diag.active_compute_processes || 0;
         const url = document.getElementById('local-ai-url'); if (url) url.value = config.local_url || '';
         localAiSetMode(localAiMode);
         await localAiLoadModels(config.model || '');
@@ -2669,7 +2672,7 @@ async function loadLocalAiPage() {
     try { localAiMode = localStorage.getItem('wolfstack_local_ai_mode_' + currentNodeId) || 'ollama'; } catch (_) { localAiMode = 'ollama'; }
     const el = document.getElementById('local-ai-content');
     if (!el) return;
-    el.innerHTML = `<div class="card" style="margin-bottom:18px;"><div class="card-body"><div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;"><div><h2 style="margin:0 0 6px;">Local AI</h2><p style="margin:0;color:var(--text-secondary);">Inspect this server’s local model service, history, requests and alerts.</p></div><div id="local-ai-status" role="status" style="padding:7px 10px;border-radius:999px;background:var(--bg-input);color:var(--text-secondary);">Checking status…</div></div><div id="local-ai-error" role="alert" aria-live="assertive" hidden style="margin-top:14px;padding:10px;border:1px solid var(--danger);border-radius:8px;color:var(--danger);"></div></div></div><div id="local-ai-stats" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:18px;"></div><div class="card" style="margin-bottom:18px;"><div class="card-body"><h3 style="margin-top:0;">Provider and model</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;"><label>Local provider<select class="form-control" onchange="localAiSetMode(this.value)"><option value="ollama">Ollama</option><option value="colibri">Colibri</option></select></label><label>OpenAI-compatible endpoint<input id="local-ai-url" class="form-control" placeholder="http://localhost:11434"><small id="local-ai-endpoint-hint" style="color:var(--text-muted);display:block;margin-top:4px;"></small></label><label>Model<select id="local-ai-model" class="form-control"></select></label></div><div style="display:flex;gap:8px;margin-top:14px;"><button id="local-ai-save" class="btn btn-primary" onclick="localAiSave()">Save changes</button><button id="local-ai-test" class="btn" onclick="localAiTest()">Test connection</button></div></div></div><div class="grid-2"><div class="card"><div class="card-header"><h3>History</h3></div><div id="local-ai-history" class="card-body"></div></div><div class="card"><div class="card-header"><h3>Requests</h3></div><div id="local-ai-requests" class="card-body"></div></div></div><div class="card" style="margin-top:18px;"><div class="card-header"><h3>Alerts</h3></div><div id="local-ai-alerts" class="card-body"></div></div>`;
+    el.innerHTML = `<div class="card" style="margin-bottom:18px;"><div class="card-body"><div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;"><div><h2 style="margin:0 0 6px;">Local AI</h2><p style="margin:0;color:var(--text-secondary);">Monitor model activity and this server’s resource usage. Chat content is never displayed.</p></div><div id="local-ai-status" role="status" style="padding:7px 10px;border-radius:999px;background:var(--bg-input);color:var(--text-secondary);">Checking status…</div></div><div id="local-ai-error" role="alert" aria-live="assertive" hidden style="margin-top:14px;padding:10px;border:1px solid var(--danger);border-radius:8px;color:var(--danger);"></div></div></div><div id="local-ai-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px;"></div><div class="card" style="margin-bottom:18px;"><div class="card-body"><h3 style="margin-top:0;">Provider and model</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;"><label>Local provider<select class="form-control" onchange="localAiSetMode(this.value)"><option value="ollama">Ollama</option><option value="colibri">Colibri</option></select></label><label>OpenAI-compatible endpoint<input id="local-ai-url" class="form-control" placeholder="http://localhost:11434"><small id="local-ai-endpoint-hint" style="color:var(--text-muted);display:block;margin-top:4px;"></small></label><label>Model<select id="local-ai-model" class="form-control"></select></label></div><div style="display:flex;gap:8px;margin-top:14px;"><button id="local-ai-save" class="btn btn-primary" onclick="localAiSave()">Save changes</button><button id="local-ai-test" class="btn" onclick="localAiTest()">Test connection</button></div></div></div><div class="card" style="margin-bottom:18px;"><div class="card-header"><h3>GPU</h3></div><div class="card-body"><div id="local-ai-gpu"></div><div style="margin-top:10px;color:var(--text-muted);">Active GPU compute processes: <strong id="local-ai-gpu-processes">0</strong></div></div></div>`;
     el.querySelector('select').value = localAiMode;
     await localAiLoadPageData();
 }
