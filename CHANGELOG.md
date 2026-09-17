@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.30.0: add per-server Local AI monitoring** _(2026-09-17 — [`3ccc585a`](https://github.com/intelligentwolf/WolfStack/commit/3ccc585a5eff469844c13245ab23100c2297da02))_
 - **v25.29.1: stop unblock fanout storms and clear all clippy findings** _(2026-09-15 — [`03771e83`](https://github.com/intelligentwolf/WolfStack/commit/03771e83e591979fb971d5d6ca5b14333d8d09f9))_
 - **v25.29.0: Global View shows every container and VM the moment it opens, with search, filters, sorting and bulk actions, and Control Panel VM actions reach a real route** _(2026-09-11 — [`d6e2c95d`](https://github.com/intelligentwolf/WolfStack/commit/d6e2c95d4551ea780c3dd5f00cabe11a71da0215))_
 - **v25.28.1: WolfNet can be started, stopped and restarted on an Unraid agent, and the page no longer calls it "Not Installed"** _(2026-09-10 — [`a3096729`](https://github.com/intelligentwolf/WolfStack/commit/a30967292ac2409d4a29958196ab529f2fd83936))_
