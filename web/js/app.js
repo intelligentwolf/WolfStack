@@ -37762,7 +37762,7 @@ async function fetchLargeMounts(targets) {
 /// is pre-focused and styled as the primary button — an accidental Enter should
 /// abandon the save, never silently strip mounts out of a backup or start the
 /// very copy being warned about. Escape and a click outside both cancel.
-function showLargeMountWarning(findings, thresholdBytes, unchecked, canExclude) {
+function showLargeMountWarning(findings, thresholdBytes, unchecked) {
     const rows = findings.map(f => {
         if (f.error) {
             return `<div style="margin-top:8px;"><strong>${escapeHtml(f.name)}</strong>
@@ -37780,13 +37780,6 @@ function showLargeMountWarning(findings, thresholdBytes, unchecked, canExclude) 
              measured in time and ${unchecked.length === 1 ? 'was' : 'were'} not checked:
              ${escapeHtml(unchecked.join(', '))}.</div>`
         : '';
-    const excludeNote = canExclude
-        ? ''
-        : `<div style="margin-top:12px; font-size:12px; color:var(--text-muted);">
-             This schedule backs up everything, so it has no per-container mount list to
-             exclude these from. To leave a mount out, select the containers individually
-             instead of "back up everything".</div>`;
-
     return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center';
@@ -37803,7 +37796,6 @@ function showLargeMountWarning(findings, thresholdBytes, unchecked, canExclude) 
                 copied into the archive in full:
                 ${rows}
                 ${uncheckedNote}
-                ${excludeNote}
             </div>`;
         const btnWrap = document.createElement('div');
         btnWrap.style.cssText = 'margin-top:18px;display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap';
@@ -37829,12 +37821,10 @@ function showLargeMountWarning(findings, thresholdBytes, unchecked, canExclude) 
         cancelBtn.onclick = () => done('cancel');
         const includeBtn = mk('Include them anyway', false);
         includeBtn.onclick = () => done('include');
+        const excludeBtn = mk('Exclude these mounts', false);
+        excludeBtn.onclick = () => done('exclude');
         btnWrap.appendChild(cancelBtn);
-        if (canExclude) {
-            const excludeBtn = mk('Exclude these mounts', false);
-            excludeBtn.onclick = () => done('exclude');
-            btnWrap.appendChild(excludeBtn);
-        }
+        btnWrap.appendChild(excludeBtn);
         btnWrap.appendChild(includeBtn);
         modal.appendChild(btnWrap);
         overlay.onclick = (e) => { if (e.target === overlay) done('cancel'); };
@@ -37849,15 +37839,14 @@ function showLargeMountWarning(findings, thresholdBytes, unchecked, canExclude) 
 /// Returns true when the caller should go ahead. On "exclude" the mounts are
 /// added to each target's own exclude_mounts (and to `prefix`'s exclude map, so
 /// the picker's panel agrees with what was just sent) and the caller goes ahead
-/// with the smaller backup. `canExclude` is false for a "back up everything"
-/// schedule, which resolves its targets at run time and so has nowhere to store
-/// a per-container exclusion.
-async function confirmLargeMounts(targets, prefix = '', canExclude = true) {
+/// with the smaller backup. A "back up everything" schedule stores the result
+/// as per-container overrides (scheduleMountOverrides), so it can exclude too.
+async function confirmLargeMounts(targets, prefix = '') {
     const result = await fetchLargeMounts(targets);
     if (!result || !result.findings.length) return true;
 
     const answer = await showLargeMountWarning(
-        result.findings, result.threshold_bytes, result.unchecked, canExclude);
+        result.findings, result.threshold_bytes, result.unchecked);
     if (answer === 'cancel') return false;
     if (answer === 'include') return true;
 
@@ -37984,14 +37973,56 @@ function getScheduleTargets() {
     return out;
 }
 
+// What the schedule table shows for a "back up everything" schedule. Its
+// targets, when it has any, are mount-exclusion overrides — say so, or the
+// exclusion the operator just saved is invisible until they reopen Edit.
+function scheduleAllLabel(s) {
+    const n = (s.targets || []).filter(t => t && Array.isArray(t.exclude_mounts) && t.exclude_mounts.length).length;
+    return n ? `All (mounts excluded on ${n})` : 'All';
+}
+
+// Copies of every live item with the modal's mount exclusions merged in —
+// what a "back up everything" schedule would archive right now. Copies, so the
+// large-mount dialog's "Exclude these mounts" (which writes exclude_mounts onto
+// the objects it is given) never edits the page's shared target list.
+function scheduleLiveTargetsWithExclusions() {
+    const live = Array.isArray(window._backupTargets) ? window._backupTargets : [];
+    return live.map(t => {
+        const excl = _scheduleExcludeMap[`${t.type}:${t.name}`];
+        return Object.assign({}, t, { exclude_mounts: Array.isArray(excl) ? excl.slice() : [] });
+    });
+}
+
+// The `targets` a "back up everything" schedule stores: one override per
+// container that has mounts excluded, and nothing else — the backend reads
+// only exclude_mounts off these (BackupSchedule::targets). Overrides on
+// containers the picker could not show (offline / on another node) are kept
+// from the schedule being edited, as the item picker does for its targets: the
+// operator never saw them, so dropping them would lose an exclusion silently.
+function scheduleMountOverrides(liveTargets, editing) {
+    const isContainer = t => t && (t.type === 'docker' || t.type === 'lxc');
+    const hasExcludes = t => Array.isArray(t.exclude_mounts) && t.exclude_mounts.length > 0;
+    const override = t => ({ type: t.type, name: t.name, exclude_mounts: t.exclude_mounts.slice() });
+    const out = liveTargets.filter(t => isContainer(t) && hasExcludes(t)).map(override);
+    const seen = new Set(liveTargets.map(t => `${t.type}:${t.name}`));
+    ((editing && editing.targets) || [])
+        .filter(t => isContainer(t) && hasExcludes(t) && !seen.has(`${t.type}:${t.name}`))
+        .forEach(t => out.push(override(t)));
+    return out;
+}
+
 // "Back up everything" ticks + freezes the per-item checkboxes (the schedule
 // stores backup_all=true and resolves the live set each run). Turning it back OFF
 // restores whatever the operator had individually selected beforehand.
 //
+// "Choose mounts" stays live: exclusions are saved as per-container overrides
+// on the schedule (scheduleMountOverrides) and applied to the live set at run
+// time, so they are the one per-item setting that survives "everything".
+//
 // It also swaps which cold-backup control is live. Under "everything" the
-// schedule has no stored targets, so the per-container ticks cannot be saved —
-// they used to be accepted and then silently dropped (JJ 2026-08-19). They go
-// disabled and the one schedule-level flag takes over.
+// per-container stop ticks cannot be saved — they used to be accepted and then
+// silently dropped (JJ 2026-08-19). They go disabled and the one
+// schedule-level flag takes over.
 function onScheduleBackupAllToggle(checked) {
     document.querySelectorAll('#schedule-target-list .schedule-target-cb').forEach(cb => {
         if (checked) {
@@ -38426,7 +38457,7 @@ function renderSchedules(schedules) {
     _backupSchedules = Array.isArray(schedules) ? schedules : [];
 
     tbody.innerHTML = schedules.map(s => {
-        const targets = s.backup_all ? 'All' : (s.targets || []).map(t => `${t.type}:${t.name}`).join(', ');
+        const targets = s.backup_all ? scheduleAllLabel(s) : (s.targets || []).map(t => `${t.type}:${t.name}`).join(', ');
         const storageLabel = formatStorageLabel(s.storage);
         const retention = s.retention > 0 ? `Keep ${s.retention}` : 'Unlimited';
         const enabled = s.enabled
@@ -38773,7 +38804,7 @@ async function backupSelected() {
 
     // One question before terabytes move: a container bound to an array copies
     // the whole array into the archive unless the mount is excluded.
-    if (!(await confirmLargeMounts(targets, '', true))) return;
+    if (!(await confirmLargeMounts(targets, ''))) return;
 
     const storage = await getSelectedStorage();
     // Pre-flight the destination — pops the install-in-terminal prompt if
@@ -39406,6 +39437,9 @@ async function createSchedule() {
         storage = editing.storage;
     } else {
         // Item picker (create or edit): the modal's own list is the source of truth.
+        // Under "back up everything" the list is resolved at run time, so
+        // finalTargets holds only mount-exclusion overrides — filled in below,
+        // after the large-mount check has had its say.
         const allCb = document.getElementById('schedule-backup-all');
         backup_all = !!(allCb && allCb.checked);
         finalTargets = backup_all ? [] : getScheduleTargets();
@@ -39431,12 +39465,14 @@ async function createSchedule() {
     // it runs unattended tonight, so this is the last moment anyone is looking.
     // Non-container targets are filtered out inside the check, so folder and
     // config schedules pass straight through. Under "back up everything" the
-    // target list is resolved at each run, which leaves nowhere to store a
-    // per-container exclusion: warn about what is present now, and say so.
+    // check runs over what is present now, carrying the exclusions the operator
+    // picked in the modal, so a mount they have just unticked is not asked
+    // about again (JJ 2026-09-18: it was — the exclusions were never sent).
     const mountCheckTargets = backup_all
-        ? (Array.isArray(window._backupTargets) ? window._backupTargets : [])
+        ? scheduleLiveTargetsWithExclusions()
         : finalTargets;
-    if (!(await confirmLargeMounts(mountCheckTargets, 'sched-', !backup_all))) return;
+    if (!(await confirmLargeMounts(mountCheckTargets, 'sched-'))) return;
+    if (backup_all) finalTargets = scheduleMountOverrides(mountCheckTargets, editing);
 
     _scheduleFolderTarget = null; // consumed — don't leak into the next schedule
     _editingSchedule = null;
@@ -41644,7 +41680,7 @@ function renderClusterSchedules(schedules) {
     if (empty) empty.style.display = 'none';
 
     tbody.innerHTML = schedules.map(s => {
-        const targets = s.backup_all ? 'All' : (s.targets || []).map(t => `${t.type}:${t.name}`).join(', ');
+        const targets = s.backup_all ? scheduleAllLabel(s) : (s.targets || []).map(t => `${t.type}:${t.name}`).join(', ');
         const storageLabel = formatStorageLabel(s.storage);
         const retention = s.retention > 0 ? `Keep ${s.retention}` : 'Unlimited';
         const enabled = s.enabled

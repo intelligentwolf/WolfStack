@@ -1121,7 +1121,16 @@ pub struct BackupSchedule {
     pub retention: u32,
     /// Backup all targets or specific list
     pub backup_all: bool,
-    /// Specific targets if backup_all is false
+    /// The targets to back up when `backup_all` is false.
+    ///
+    /// When `backup_all` is true the list is resolved live at each run, and
+    /// any entries here are per-container OVERRIDES for that live set: a
+    /// Docker/LXC entry whose `exclude_mounts` is non-empty keeps those mounts
+    /// out of that container's archive (`mount_overrides_for`). Nothing else
+    /// on an override is read. Before this, "back up everything" had nowhere
+    /// to store an exclusion at all — the modal offered "Choose mounts",
+    /// accepted the unticks, then saved `targets: []` and lost them (JJ
+    /// 2026-09-18: unticking a storage mount, then Save, changed nothing).
     #[serde(default)]
     pub targets: Vec<BackupTarget>,
     /// Where to store backups
@@ -3875,6 +3884,19 @@ pub fn restore_system_path(entry: &BackupEntry, target_dir: &str) -> Result<Stri
     Ok(format!("System folder restored into {}", dest))
 }
 
+/// The mount exclusions a "back up everything" run applies to the container
+/// `(kind, name)`, from the schedule's stored overrides. Matched on type AND
+/// name: a Docker container and an LXC container may share a name and their
+/// mounts have nothing to do with each other. No override, or an override with
+/// nothing excluded, means the container archives in full.
+fn mount_overrides_for(overrides: &[BackupTarget], kind: &BackupTargetType, name: &str) -> Vec<String> {
+    overrides
+        .iter()
+        .find(|t| &t.target_type == kind && t.name == name)
+        .map(|t| t.exclude_mounts.clone())
+        .unwrap_or_default()
+}
+
 /// Backup everything on the server.
 ///
 /// `stop_containers` makes every Docker/LXC container a COLD backup — stopped
@@ -3883,7 +3905,18 @@ pub fn restore_system_path(entry: &BackupEntry, target_dir: &str) -> Result<Stri
 /// its target list is resolved here, at run time, so there are no per-target
 /// `stop_for_backup` flags to read (JJ 2026-08-19). VMs and the config target
 /// are unaffected by it.
-pub fn backup_all(storage: &BackupStorage, stop_containers: bool) -> Vec<BackupEntry> {
+///
+/// `overrides` are the schedule's stored `targets` (see
+/// `BackupSchedule::targets`): the one per-container setting that DOES have to
+/// survive run-time resolution is the mount exclusion list, because "everything
+/// except that 20 TB array" is the whole reason it exists. A live container
+/// with a matching override archives without those mounts; one without an
+/// override archives in full, as before. On-demand "everything" passes none.
+pub fn backup_all(
+    storage: &BackupStorage,
+    stop_containers: bool,
+    overrides: &[BackupTarget],
+) -> Vec<BackupEntry> {
     let mut entries = Vec::new();
 
     // Backup all Docker containers
@@ -3897,10 +3930,12 @@ pub fn backup_all(storage: &BackupStorage, stop_containers: bool) -> Vec<BackupE
             .map(|l| l.to_string())
             .collect();
         for name in names {
+            let exclude_mounts = mount_overrides_for(overrides, &BackupTargetType::Docker, &name);
             entries.push(create_backup_entry(
                 BackupTarget {
                     target_type: BackupTargetType::Docker,
                     name: name.clone(),
+                    exclude_mounts,
                     stop_for_backup: stop_containers,
                     ..Default::default()
                 },
@@ -3934,11 +3969,13 @@ pub fn backup_all(storage: &BackupStorage, stop_containers: bool) -> Vec<BackupE
     // container name natively.
     for container in crate::containers::lxc_list_all() {
         if container.name.is_empty() { continue; }
+        let exclude_mounts = mount_overrides_for(overrides, &BackupTargetType::Lxc, &container.name);
         entries.push(create_backup_entry(
             BackupTarget {
                 target_type: BackupTargetType::Lxc,
                 name: container.name.clone(),
                 hostname: if container.hostname.is_empty() { None } else { Some(container.hostname.clone()) },
+                exclude_mounts,
                 stop_for_backup: stop_containers,
                 ..Default::default()
             },
@@ -7357,7 +7394,7 @@ pub fn create_backup(target: Option<BackupTarget>, storage: BackupStorage) -> Ve
         // On-demand "everything" from the UI: live (crash-consistent) container
         // archives, as it always has been — cold backups are a scheduling
         // decision, made per schedule.
-        None => backup_all(&storage, false),
+        None => backup_all(&storage, false, &[]),
     };
 
     config.entries.extend(new_entries.clone());
@@ -8627,7 +8664,7 @@ fn execute_schedule_run(schedule: &BackupSchedule) -> (Vec<BackupEntry>, Schedul
         let mut storage = schedule.storage.clone();
         merge_pbs_secrets(&mut storage);
         let backups: Vec<BackupEntry> = if schedule.backup_all {
-            backup_all(&storage, schedule.stop_containers)
+            backup_all(&storage, schedule.stop_containers, &schedule.targets)
         } else {
             schedule.targets.iter()
                 .map(|t| create_backup_entry(t.clone(), &storage))
@@ -11288,6 +11325,58 @@ mod schedule_day_tests {
 #[cfg(test)]
 mod large_mount_tests {
     use super::*;
+
+    fn override_for(kind: BackupTargetType, name: &str, excludes: &[&str]) -> BackupTarget {
+        BackupTarget {
+            target_type: kind,
+            name: name.to_string(),
+            exclude_mounts: excludes.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// JJ 2026-09-18: a "back up everything" schedule's per-container mount
+    /// exclusions have to reach the container they were set on — and only it.
+    #[test]
+    fn backup_all_overrides_apply_by_type_and_name() {
+        let overrides = vec![
+            override_for(BackupTargetType::Docker, "nextcloud", &["/mnt/media"]),
+            override_for(BackupTargetType::Lxc, "nextcloud", &["/mnt/lxc-array"]),
+            override_for(BackupTargetType::Docker, "plain", &[]),
+        ];
+        assert_eq!(
+            mount_overrides_for(&overrides, &BackupTargetType::Docker, "nextcloud"),
+            vec!["/mnt/media".to_string()],
+        );
+        // Same name, other type: its own override, never the Docker one.
+        assert_eq!(
+            mount_overrides_for(&overrides, &BackupTargetType::Lxc, "nextcloud"),
+            vec!["/mnt/lxc-array".to_string()],
+        );
+        // An override with nothing excluded, and a container with no override
+        // at all, both archive in full.
+        assert!(mount_overrides_for(&overrides, &BackupTargetType::Docker, "plain").is_empty());
+        assert!(mount_overrides_for(&overrides, &BackupTargetType::Docker, "other").is_empty());
+        assert!(mount_overrides_for(&[], &BackupTargetType::Docker, "nextcloud").is_empty());
+    }
+
+    /// The overrides ride in `targets` next to `backup_all: true` — the same
+    /// JSON the schedule editor already re-reads to show "(1 excluded)", so
+    /// this is the persistence contract for both directions.
+    #[test]
+    fn a_backup_all_schedule_round_trips_its_mount_overrides() {
+        let json = r#"{"id":"x","name":"all","frequency":"daily","time":"02:00",
+            "retention":7,"backup_all":true,"storage":{"type":"local"},"enabled":true,
+            "targets":[{"type":"docker","name":"nextcloud","exclude_mounts":["/mnt/media"]}]}"#;
+        let s: BackupSchedule = serde_json::from_str(json).unwrap();
+        assert!(s.backup_all);
+        assert_eq!(
+            mount_overrides_for(&s.targets, &BackupTargetType::Docker, "nextcloud"),
+            vec!["/mnt/media".to_string()],
+        );
+        let back: BackupSchedule = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.targets[0].exclude_mounts, vec!["/mnt/media".to_string()]);
+    }
 
     fn mount(basis: &str, size: u64, fs_used: u64) -> DiscoveredMount {
         DiscoveredMount {
