@@ -4865,7 +4865,10 @@
                              have nothing to attach to. This one flag covers them
                              all (JJ 2026-08-19 — the per-container ticks were
                              silently discarded here). Only shown while
-                             "everything" is on. -->
+                             "everything" is on. Per-container "Choose mounts"
+                             exclusions DO survive it: they are saved as
+                             overrides on the schedule and applied at run time
+                             (JJ 2026-09-18). -->
                         <label id="schedule-stop-containers-row"
                                style="display:none; align-items:center; gap:8px; margin-top:6px; padding-left:22px; font-size:12px; color:var(--text-secondary); cursor:pointer;"
                                title="Ticked: every container is stopped while it is archived, then restarted — fully consistent (quiesced databases). Unticked (default): archived while running (crash-consistent). Proxmox LXC ignores this — vzdump snapshots there.">
