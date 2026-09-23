@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.32.0: make Predictive Inbox snooze, dismiss and ack findable, and make them stick** _(2026-09-23 — [`5eda28fd`](https://github.com/intelligentwolf/WolfStack/commit/5eda28fd3cf9585241fe97989287541c7f8a0f04))_
 - **v25.31.0: keep mount exclusions on "back up everything" schedules** _(2026-09-19 — [`f9e99143`](https://github.com/intelligentwolf/WolfStack/commit/f9e99143ab4900fb96693aed5095ca2c1180b157))_
 - **v25.30.1: show Local AI resource usage without chat content** _(2026-09-17 — [`54fc3c1f`](https://github.com/intelligentwolf/WolfStack/commit/54fc3c1f9c9dc4107052f9b26a0512cba0cb983c))_
 - **v25.30.0: add per-server Local AI monitoring** _(2026-09-17 — [`3ccc585a`](https://github.com/intelligentwolf/WolfStack/commit/3ccc585a5eff469844c13245ab23100c2297da02))_
