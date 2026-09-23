@@ -170,6 +170,16 @@ impl AckStore {
         id
     }
 
+    /// Store a copy of an ack created on another cluster node. Keyed by
+    /// id so a repeated push (retry, or the operator acking twice from
+    /// two tabs) replaces rather than duplicates.
+    pub fn upsert_replica(&mut self, ack: Ack) {
+        match self.acks.iter_mut().find(|a| a.id == ack.id) {
+            Some(existing) => *existing = ack,
+            None => self.acks.push(ack),
+        }
+    }
+
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.acks.len();
         self.acks.retain(|a| a.id != id);
@@ -244,6 +254,20 @@ mod tests {
         assert!(!s.covers(&pscope("a", Some("/etc"))));
         assert!(!s.covers(&pscope("a", None)));
         assert!(!s.covers(&pscope("b", Some("/var"))));
+    }
+
+    // ── Replication ────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_replica_is_idempotent_by_id() {
+        let mut store = AckStore::default();
+        let ack = Ack::new("disk_fill_eta", AckScope::Cluster, "x", "paul", None);
+        store.upsert_replica(ack.clone());
+        let mut changed = ack.clone();
+        changed.reason = "y".into();
+        store.upsert_replica(changed);
+        assert_eq!(store.acks.len(), 1);
+        assert_eq!(store.acks[0].reason, "y");
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────

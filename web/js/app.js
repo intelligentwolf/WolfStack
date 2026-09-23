@@ -76526,6 +76526,7 @@ function renderPredictiveInbox() {
                         </div>
                     </div>
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <button class="btn btn-sm" onclick="predictiveSuppressedOpen(this)" id="predictive-suppressed-btn" title="Findings you have dismissed or acknowledged — see them and undo">Suppressed</button>
                         <button class="btn btn-sm" onclick="predictiveRunNow()" id="predictive-run-now">Run analyzer now</button>
                         <span id="threat-intel-toggle-wrap" style="display:none;align-items:center;gap:8px;padding:6px 10px;background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.25);border-radius:6px;font-size:12px;color:var(--text-secondary);">
                             <span id="threat-intel-status-label" style="font-weight:600;">Threat-intel blocklist</span>
@@ -77403,25 +77404,39 @@ function predictiveExpandedBody(p) {
             ${checkedPart}
         </div>`;
 
+    // The actions sit at the TOP of the card. They used to sit below the
+    // evidence and remediation, which on a CVE finding is several screens
+    // down — JJ (2026-09-22) couldn't find Snooze/Dismiss/Ack at all and
+    // asked whether the Inbox could acknowledge findings.
+    const isSnoozed = p.status && p.status.kind === 'snoozed';
+    const hasResource = !!(p.scope.resource_id && String(p.scope.resource_id).trim());
+    const ackTitle = hasResource
+        ? 'Accepted risk: hide this finding on this resource for 180 days, on every node. Undo from Suppressed.'
+        : 'This finding is not tied to one resource, so an acknowledgement would hide it for the whole node — use Dismiss instead.';
+    const actions = `
+        <div role="group" aria-label="Actions for this finding" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+            <button class="btn btn-sm btn-primary" onclick="predictiveApprove('${escapeAttr(p.id)}')">Mark applied</button>
+            <button class="btn btn-sm" onclick="predictiveOpenTerm('${escapeAttr(p.id)}')" title="Open an interactive shell on this proposal's target — host, container, or VM">Open terminal</button>
+            ${isSnoozed
+                ? `<button class="btn btn-sm" onclick="predictiveRestore('${escapeAttr(p.id)}', 'unsnooze')" title="End the snooze now">Unsnooze</button>`
+                : `<button class="btn btn-sm" onclick="predictiveSnoozeMenu('${escapeAttr(p.id)}', this)" title="Hide for a while — it comes back when the snooze ends">Snooze ▾</button>`}
+            <button class="btn btn-sm" onclick="predictiveDismiss('${escapeAttr(p.id)}')" title="Hide this finding until you restore it from Suppressed">Dismiss</button>
+            <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')" title="${escapeAttr(ackTitle)}">Ack as intentional</button>
+        </div>`;
+
     return `
         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
             <span style="background:${runtime.color};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;display:inline-flex;align-items:center;gap:4px;">${runtime.icon} ${runtime.label}</span>
             ${sourceBadge}
             <span style="opacity:0.5;font-size:11px;color:var(--text-muted);margin-left:auto;">${escapeHtml(p.finding_type)}</span>
         </div>
+        ${actions}
         ${snoozeNotice}
         <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px;">${escapeHtml(p.why)}</div>
         ${timeline}
         ${predictiveHistorySlot(p)}
         ${evidence ? `<div style="margin-bottom:12px;">${evidence}</div>` : ''}
         ${remediation}
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button class="btn btn-sm btn-primary" onclick="predictiveApprove('${escapeAttr(p.id)}')">Mark applied</button>
-            <button class="btn btn-sm" onclick="predictiveOpenTerm('${escapeAttr(p.id)}')" title="Open an interactive shell on this proposal's target — host, container, or VM">Open terminal</button>
-            <button class="btn btn-sm" onclick="predictiveSnoozeMenu('${escapeAttr(p.id)}', this)">Snooze</button>
-            <button class="btn btn-sm" onclick="predictiveDismiss('${escapeAttr(p.id)}')">Dismiss</button>
-            <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')">Ack as intentional</button>
-        </div>
     `;
 }
 
@@ -78339,11 +78354,11 @@ async function predictiveSnooze(id, hours) {
         if (!r.ok) {
             const data = await r.json().catch(() => ({}));
             predictiveOptimisticRestore(point);
-            showToast(`Snooze failed: ${data.error || r.statusText}`, 'error');
+            showToast(`Snooze failed: ${data.error || r.statusText}`, 'error', 0);
         }
     } catch (e) {
         predictiveOptimisticRestore(point);
-        showToast(`Snooze errored: ${e.message || String(e)}`, 'error');
+        showToast(`Snooze errored: ${e.message || String(e)}`, 'error', 0);
     }
 }
 
@@ -78388,7 +78403,7 @@ function predictiveOptimisticRestore(point, opts) {
 
 async function predictiveDismiss(id) {
     const reason = await showPrompt(
-        'Why are you dismissing this proposal? The reason is logged for the audit trail and helps the analyzer learn (eg. "false positive — this disk fills weekly and a cron clears it").',
+        'Why are you dismissing this finding? It stays hidden until you restore it from Suppressed. The reason is logged for the audit trail (eg. "false positive — this disk fills weekly and a cron clears it").',
         'Dismiss proposal',
         '',
     );
@@ -78409,12 +78424,190 @@ async function predictiveDismiss(id) {
         if (!r.ok) {
             const data = await r.json().catch(() => ({}));
             predictiveOptimisticRestore(point);
-            showToast(`Dismiss failed: ${data.error || r.statusText}`, 'error');
+            showToast(`Dismiss failed: ${data.error || r.statusText}`, 'error', 0);
         }
     } catch (e) {
         predictiveOptimisticRestore(point);
-        showToast(`Dismiss errored: ${e.message || String(e)}`, 'error');
+        showToast(`Dismiss errored: ${e.message || String(e)}`, 'error', 0);
     }
+}
+
+/// Undo a Dismiss or a Snooze (`mode` = 'restore' | 'unsnooze'): the
+/// finding goes back to pending on its own node and reappears in the inbox.
+/// Returns true on success so the Suppressed dialog can refresh itself.
+async function predictiveRestore(id, mode) {
+    const verb = mode === 'unsnooze' ? 'Unsnooze' : 'Restore';
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            showToast(`${verb} failed: ${data.error || r.statusText}`, 'error', 0);
+            return false;
+        }
+    } catch (e) {
+        showToast(`${verb} errored: ${e.message || String(e)}`, 'error', 0);
+        return false;
+    }
+    showToast(mode === 'unsnooze' ? 'Snooze ended' : 'Restored to the inbox', 'success', 2500);
+    predictiveLoad();
+    return true;
+}
+
+/// Revoke an acknowledgement on every node that holds a copy.
+async function predictiveRevokeAck(id) {
+    try {
+        const r = await fetch(`/api/proposal-acks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Revoke failed: ${data.error || r.statusText}`, 'error', 0);
+            return false;
+        }
+        if (Array.isArray(data.unreached) && data.unreached.length) {
+            showToast(`Revoked, but these nodes could not be reached and still hold it: ${data.unreached.join(', ')}. Revoke it again once they are back.`, 'warning', 0);
+        } else {
+            showToast('Acknowledgement revoked — the finding shows again if the analyzer still sees it', 'success', 3500);
+        }
+    } catch (e) {
+        showToast(`Revoke errored: ${e.message || String(e)}`, 'error', 0);
+        return false;
+    }
+    predictiveLoad();
+    return true;
+}
+
+/// "Suppressed" dialog: every finding the operator has dismissed and every
+/// active acknowledgement, cluster-wide, each with its undo. Before this
+/// there was no way to see a dismissal or ack again once made (JJ,
+/// 2026-09-22). Snoozed findings aren't listed — they stay in the inbox
+/// with a SNOOZED badge and an Unsnooze button.
+async function predictiveSuppressedOpen(trigger) {
+    // Tear down an open instance through its own close() so its document
+    // keydown listener goes with it.
+    const prev = document.getElementById('predictive-suppressed-dialog');
+    if (prev) { if (typeof prev._wsClose === 'function') prev._wsClose(); else prev.remove(); }
+    const overlay = document.createElement('div');
+    overlay.id = 'predictive-suppressed-dialog';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px;';
+    overlay.innerHTML = `
+        <div role="dialog" aria-modal="true" aria-labelledby="pred-supp-title" aria-describedby="pred-supp-desc"
+             style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:20px 24px;max-width:760px;width:100%;max-height:88vh;overflow-y:auto;color:var(--text-primary,#e4e4e7);box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;">
+                <h2 id="pred-supp-title" tabindex="-1" style="margin:0;font-size:18px;outline:none;">Suppressed findings</h2>
+                <button type="button" class="btn btn-sm" id="pred-supp-close" style="margin-left:auto;">Close</button>
+            </div>
+            <p id="pred-supp-desc" style="margin:0 0 14px 0;font-size:13px;color:var(--text-secondary);line-height:1.55;">
+                Findings you dismissed or acknowledged, on every node in this cluster. Restore or revoke one to see it in the inbox again —
+                if the analyzer still detects the problem it reappears on the next check.
+            </p>
+            <div id="pred-supp-body" aria-busy="true" style="font-size:13px;color:var(--text-muted);padding:16px 0;">Loading…</div>
+        </div>`;
+    const host = document.fullscreenElement || document.body;
+    host.appendChild(overlay);
+    const dialog = overlay.querySelector('[role="dialog"]');
+
+    const close = () => {
+        overlay.remove();
+        document.removeEventListener('keydown', onKey, true);
+        if (trigger && document.contains(trigger)) trigger.focus();
+    };
+    const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+        if (e.key !== 'Tab') return;
+        const focusable = Array.from(dialog.querySelectorAll('button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'));
+        if (focusable.length === 0) return;
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (e.shiftKey && (document.activeElement === first || document.activeElement === dialog.querySelector('#pred-supp-title'))) {
+            e.preventDefault(); last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault(); first.focus();
+        }
+    };
+    document.addEventListener('keydown', onKey, true);
+    overlay._wsClose = close;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('#pred-supp-close').onclick = close;
+    overlay.querySelector('#pred-supp-title').focus();
+
+    await predictiveSuppressedLoad();
+}
+
+async function predictiveSuppressedLoad() {
+    const body = document.getElementById('pred-supp-body');
+    if (!body) return;
+    let data;
+    try {
+        const r = await fetch('/api/proposals/suppressed/cluster');
+        data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || r.statusText);
+    } catch (e) {
+        body.setAttribute('aria-busy', 'false');
+        body.innerHTML = `<div role="alert" style="color:#fca5a5;padding:8px 0;">Could not load suppressed findings: ${escapeHtml(e.message || String(e))}
+            <button type="button" class="btn btn-sm" style="margin-left:8px;" onclick="predictiveSuppressedLoad()">Retry</button></div>`;
+        return;
+    }
+    const nodes = data.nodes || [];
+    const hostOf = {};
+    nodes.forEach(n => { hostOf[n.node_id] = n.hostname || n.node_id; });
+    const dismissed = data.dismissed || [];
+    const acks = data.acks || [];
+    const when = (iso) => iso ? new Date(iso).toLocaleString() : '—';
+
+    let html = '';
+    const failed = nodes.filter(n => !n.responded);
+    if (failed.length) {
+        html += `<div role="alert" style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;color:var(--text-secondary);line-height:1.5;">
+            <strong style="color:#fbbf24;">List may be incomplete</strong> — could not read: ${failed.map(n => `${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(n.error || 'unreachable')})`).join(', ')}.
+        </div>`;
+    }
+
+    const section = (title, count, inner, empty) => `
+        <h3 style="font-size:14px;margin:14px 0 8px 0;color:var(--text-primary);">${title} <span style="color:var(--text-muted);font-weight:normal;">(${count})</span></h3>
+        ${count ? inner : `<div style="color:var(--text-muted);padding:4px 0 8px 0;">${empty}</div>`}`;
+    const card = (content, action) => `
+        <div style="display:flex;gap:12px;align-items:flex-start;background:var(--bg-tertiary,#2d2f3a);border-radius:8px;padding:10px 12px;margin-bottom:6px;">
+            <div style="flex:1;min-width:0;line-height:1.5;">${content}</div>
+            <div style="flex-shrink:0;">${action}</div>
+        </div>`;
+
+    html += section('Dismissed', dismissed.length, dismissed.map(p => card(`
+            <div style="color:var(--text-primary);font-weight:500;overflow-wrap:anywhere;">${escapeHtml(p.title)}</div>
+            <div style="color:var(--text-muted);font-size:12px;overflow-wrap:anywhere;">${escapeHtml(hostOf[p.scope.node_id] || p.scope.node_id)}${p.scope.resource_id ? ' · ' + escapeHtml(p.scope.resource_id) : ''} · dismissed ${escapeHtml(when(p.status && p.status.dismissed_at))}</div>
+            <div style="color:var(--text-secondary);font-size:12px;overflow-wrap:anywhere;">Reason: ${escapeHtml((p.status && p.status.reason) || '—')}</div>`,
+        `<button type="button" class="btn btn-sm" onclick="predictiveSuppressedAct(this, 'restore', '${escapeAttr(p.id)}')" aria-label="Restore ${escapeAttr(p.title)} to the inbox">Restore</button>`,
+    )).join(''), 'Nothing dismissed.');
+
+    html += section('Acknowledged as intentional', acks.length, acks.map(a => {
+        const where = a.scope.kind === 'resource'
+            ? `${escapeHtml(hostOf[a.scope.node_id] || a.scope.node_id)} · ${escapeHtml(a.scope.resource_id)}`
+            : a.scope.kind === 'node' ? `all of ${escapeHtml(hostOf[a.scope.node_id] || a.scope.node_id)}` : 'whole cluster';
+        const missing = nodes.filter(n => n.responded && !(a.held_on || []).includes(n.hostname));
+        return card(`
+            <div style="color:var(--text-primary);font-weight:500;overflow-wrap:anywhere;"><code>${escapeHtml(a.finding_type)}</code> — ${where}</div>
+            <div style="color:var(--text-muted);font-size:12px;">by ${escapeHtml(a.acknowledged_by || '—')} on ${escapeHtml(when(a.created_at))} · expires ${escapeHtml(a.expires ? new Date(a.expires).toLocaleDateString() : 'never')}</div>
+            <div style="color:var(--text-secondary);font-size:12px;overflow-wrap:anywhere;">Reason: ${escapeHtml(a.reason || '—')}</div>
+            ${missing.length ? `<div style="color:#fbbf24;font-size:12px;margin-top:2px;">Not on: ${missing.map(n => escapeHtml(n.hostname || n.node_id)).join(', ')} — the finding still shows when the Inbox is opened there. Revoke and acknowledge it again to copy it everywhere.</div>` : ''}`,
+            `<button type="button" class="btn btn-sm" onclick="predictiveSuppressedAct(this, 'revoke', '${escapeAttr(a.id)}')" aria-label="Revoke acknowledgement of ${escapeAttr(a.finding_type)}">Revoke</button>`,
+        );
+    }).join(''), 'No acknowledgements.');
+
+    body.setAttribute('aria-busy', 'false');
+    body.style.color = 'var(--text-secondary)';
+    body.style.padding = '0';
+    body.innerHTML = html;
+}
+
+async function predictiveSuppressedAct(btn, kind, id) {
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = kind === 'restore' ? 'Restoring…' : 'Revoking…';
+    const ok = kind === 'restore' ? await predictiveRestore(id, 'restore') : await predictiveRevokeAck(id);
+    if (!ok) {
+        btn.disabled = false;
+        btn.textContent = label;
+        return;
+    }
+    await predictiveSuppressedLoad();
+    document.getElementById('pred-supp-title')?.focus();
 }
 
 /// Mark applied — instant action with a 6 s Undo window. The
@@ -79008,7 +79201,7 @@ async function predictiveAck(findingType, nodeId, resourceId) {
         return;
     }
     const reason = await showPrompt(
-        `Acknowledge "${findingType}" on ${resourceId} as intentional? Future findings with the SAME finding type AND resource will be suppressed for 180 days. Other findings on this node are not affected.`,
+        `Acknowledge "${findingType}" on ${resourceId} as intentional? Findings with the SAME finding type AND resource will be hidden for 180 days on every node in the cluster. Other findings are not affected. Undo any time from Suppressed.`,
         'Permanent acknowledgement',
         '',
     );
@@ -79040,14 +79233,18 @@ async function predictiveAck(findingType, nodeId, resourceId) {
                 reason: reason.trim(),
             }),
         });
+        const data = await r.json().catch(() => ({}));
         if (!r.ok) {
-            const data = await r.json().catch(() => ({}));
             if (point) predictiveOptimisticRestore(point);
-            showToast(`Ack failed: ${data.error || r.statusText}`, 'error');
+            showToast(`Ack failed: ${data.error || r.statusText}`, 'error', 0);
+        } else if (Array.isArray(data.unreached) && data.unreached.length) {
+            // Saved here, but a node that didn't get a copy will still show
+            // the finding if you open the Inbox from it.
+            showToast(`Acknowledged, but these nodes didn't get a copy and will still show it: ${data.unreached.join(', ')}. Once they are back, revoke it from Suppressed and acknowledge it again.`, 'warning', 0);
         }
     } catch (e) {
         if (point) predictiveOptimisticRestore(point);
-        showToast(`Ack errored: ${e.message || String(e)}`, 'error');
+        showToast(`Ack errored: ${e.message || String(e)}`, 'error', 0);
     }
 }
 
@@ -79684,6 +79881,11 @@ window.predictiveRunNow = predictiveRunNow;
 window.predictiveSnooze = predictiveSnooze;
 window.predictiveSnoozeMenu = predictiveSnoozeMenu;
 window.predictiveDismiss = predictiveDismiss;
+window.predictiveRestore = predictiveRestore;
+window.predictiveRevokeAck = predictiveRevokeAck;
+window.predictiveSuppressedOpen = predictiveSuppressedOpen;
+window.predictiveSuppressedLoad = predictiveSuppressedLoad;
+window.predictiveSuppressedAct = predictiveSuppressedAct;
 window.predictiveApprove = predictiveApprove;
 window.predictiveAck = predictiveAck;
 window.predictiveCopyCmd = predictiveCopyCmd;

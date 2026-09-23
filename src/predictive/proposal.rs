@@ -634,11 +634,34 @@ impl ProposalStore {
         Ok(())
     }
 
-    /// Drop `Approved` and `Dismissed` proposals whose
-    /// `updated_at` is older than `days`. Pending and active-Snoozed
-    /// entries are never pruned regardless of age — they're still
-    /// surfaced in the inbox and dropping them would drop live
-    /// state. Returns the number of entries removed.
+    /// Undo an operator suppression: a `Dismissed` or `Snoozed` proposal
+    /// goes back to `Pending` so it shows in the inbox again. If the
+    /// condition has cleared in the meantime, the next analyzer tick that
+    /// covers it auto-resolves it as usual. Any other status is refused —
+    /// there's nothing to restore.
+    pub fn restore(&mut self, id: &str) -> Result<(), String> {
+        let p = self.proposals.iter_mut().find(|p| p.id == id)
+            .ok_or_else(|| format!("proposal {} not found", id))?;
+        match p.status {
+            ProposalStatus::Dismissed { .. } | ProposalStatus::Snoozed { .. } => {
+                p.status = ProposalStatus::Pending;
+                p.updated_at = Utc::now();
+                Ok(())
+            }
+            _ => Err("only a dismissed or snoozed finding can be restored".to_string()),
+        }
+    }
+
+    /// Drop `Approved` proposals whose `updated_at` is older than `days`.
+    /// Returns the number of entries removed.
+    ///
+    /// `Dismissed` entries are deliberately NOT pruned: the entry IS the
+    /// suppression (`upsert` / `is_suppressed` key off it), so pruning it
+    /// silently re-raised a finding the operator had dismissed as soon as
+    /// the analyzer next saw the condition — JJ, 2026-09-22: "can't
+    /// acknowledge so keep coming back". A dismissal stands until the
+    /// operator restores it from the inbox's Suppressed view. Pending and
+    /// Snoozed entries are live state and never pruned either.
     ///
     /// Called periodically from the orchestrator so the store
     /// doesn't grow unboundedly across years of operator use.
@@ -646,9 +669,7 @@ impl ProposalStore {
         let cutoff = Utc::now() - chrono::Duration::days(days);
         let before = self.proposals.len();
         self.proposals.retain(|p| match &p.status {
-            ProposalStatus::Approved { .. } | ProposalStatus::Dismissed { .. } => {
-                p.updated_at >= cutoff
-            }
+            ProposalStatus::Approved { .. } => p.updated_at >= cutoff,
             _ => true,
         });
         before - self.proposals.len()
@@ -945,6 +966,38 @@ mod tests {
     }
 
     #[test]
+    fn old_dismissal_still_suppresses_after_prune() {
+        let mut store = ProposalStore::default();
+        let sc = scope("n", Some("/var"));
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Warn, sc.clone()));
+        let id = store.proposals[0].id.clone();
+        store.dismiss(&id, "known, accepted").unwrap();
+        store.proposals[0].updated_at = Utc::now() - Duration::days(400);
+        store.prune_resolved_older_than(90);
+        assert!(store.is_suppressed("disk_fill_eta", &sc));
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Warn, sc.clone()));
+        assert!(store.inbox().is_empty(), "a re-detection must not resurface a dismissal");
+    }
+
+    #[test]
+    fn restore_returns_dismissed_and_snoozed_to_pending() {
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal("a", Severity::Warn, scope("n", Some("/d"))));
+        store.upsert(fake_proposal("a", Severity::Warn, scope("n", Some("/s"))));
+        store.upsert(fake_proposal("a", Severity::Warn, scope("n", Some("/p"))));
+        let (d, s, p) = (store.proposals[0].id.clone(), store.proposals[1].id.clone(),
+                         store.proposals[2].id.clone());
+        store.dismiss(&d, "x").unwrap();
+        store.snooze(&s, Utc::now() + Duration::hours(4)).unwrap();
+        store.restore(&d).unwrap();
+        store.restore(&s).unwrap();
+        assert!(matches!(store.proposals[0].status, ProposalStatus::Pending));
+        assert!(matches!(store.proposals[1].status, ProposalStatus::Pending));
+        assert!(store.restore(&p).is_err(), "a pending finding has nothing to restore");
+        assert!(store.restore("missing").is_err());
+    }
+
+    #[test]
     fn prune_drops_old_resolved_keeps_pending() {
         let mut store = ProposalStore::default();
         store.upsert(fake_proposal("a", Severity::Warn, scope("n", Some("/old-dismissed"))));
@@ -964,11 +1017,14 @@ mod tests {
         store.proposals[1].updated_at = Utc::now() - Duration::days(100);
 
         let dropped = store.prune_resolved_older_than(30);
-        assert_eq!(dropped, 2, "old resolved entries should be pruned");
+        assert_eq!(dropped, 1, "only the old approved entry should be pruned");
 
         let remaining: Vec<&str> = store.proposals.iter()
             .map(|p| p.scope.resource_id.as_deref().unwrap_or(""))
             .collect();
+        assert!(!remaining.contains(&"/old-approved"));
+        assert!(remaining.contains(&"/old-dismissed"),
+            "a dismissal is the suppression itself — pruning it re-raises the finding");
         assert!(remaining.contains(&"/recent-dismissed"));
         assert!(remaining.contains(&"/pending"),
             "pending entries must NEVER be pruned regardless of age");
