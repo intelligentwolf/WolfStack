@@ -88,10 +88,12 @@ const VULN_SAMPLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// even a slow OSV response can't blow past the 5-min cadence.
 const OSV_SAMPLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Resolved (Approved/Dismissed) proposals are pruned on every
-/// tick once they're older than this. Pending and active-Snoozed
-/// entries are never touched. Keeps the on-disk file bounded over
-/// years of operation.
+/// Approved proposals are pruned on every tick once they're older
+/// than this. Pending, Snoozed and Dismissed entries are never touched
+/// (a dismissal is the suppression itself — see
+/// `ProposalStore::prune_resolved_older_than`). Dismissed entries
+/// therefore accumulate — one per distinct dismissed finding — until the
+/// operator restores them from the inbox's Suppressed view.
 const RESOLVED_RETENTION_DAYS: i64 = 90;
 
 /// Run forever. Spawned once from `main.rs`; never returns under

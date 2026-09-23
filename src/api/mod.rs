@@ -35848,6 +35848,63 @@ pub async fn predictive_proposal_dismiss(
     }
 }
 
+/// POST /api/proposals/{id}/restore — undo a Dismiss or Snooze: the
+/// finding goes back to Pending and shows in the inbox again. Forwarded to
+/// the owning peer like the other proposal actions.
+pub async fn predictive_proposal_restore(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let caller = match require_auth(&req, &state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let id = path.into_inner();
+    let result = {
+        let mut store = match state.predictive_proposals.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if store.get(&id).is_none() {
+            None
+        } else {
+            let r = store.restore(&id);
+            if r.is_ok() {
+                // Persist before releasing the lock and invalidating the cache.
+                let _ = store.save();
+            }
+            Some(r)
+        }
+    };
+    match result {
+        Some(Ok(())) => {
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+        }
+        // Owned here but not dismissed/snoozed — nothing to forward.
+        Some(Err(e)) => HttpResponse::Conflict().json(serde_json::json!({ "error": e })),
+        None => {
+            // Cycle-breaker: a forwarded peer request must not re-fan-out
+            // (see `is_inter_node_forward`).
+            if is_inter_node_forward(&caller) {
+                return HttpResponse::NotFound().json(serde_json::json!({
+                    "error": "proposal not found on this node",
+                }));
+            }
+            let resp = forward_proposal_action_to_peers(&state, &id, "restore",
+                serde_json::json!({}), is_operator_request(&caller)).await;
+            // The owning peer dropped its own cache; ours still holds the
+            // aggregate without this finding, and the UI reloads straight
+            // after a restore — it would stay hidden for up to 30 s.
+            if resp.status().is_success() {
+                invalidate_cluster_cache(&state);
+            }
+            resp
+        }
+    }
+}
+
 /// POST /api/proposals/{id}/approve — record that the operator
 /// applied the remediation. v1 proposals are always
 /// `RemediationPlan::Manual`, so "approve" means "I ran the
@@ -36739,39 +36796,339 @@ pub async fn predictive_acks_create(
     let lifetime = r.lifetime_days
         .map(|d| chrono::Duration::days(d.clamp(1, 3650)));
     let ack = crate::predictive::Ack::new(
-        r.finding_type, r.scope, r.reason, user, lifetime,
+        r.finding_type, r.scope, r.reason, user.clone(), lifetime,
     );
     let id = ack.id.clone();
-    let mut store = match state.predictive_acks.write() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
+    // Serialisation of plain strings/timestamps can't fail; if it ever
+    // does, skip replication loudly rather than POST an empty body.
+    let replica = match serde_json::to_vec(&ack) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            warn!("predictive ack {}: could not serialise for peers: {}", ack.id, e);
+            None
+        }
     };
-    store.add(ack);
-    let _ = store.save();
-    drop(store);
+    {
+        let mut store = match state.predictive_acks.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        store.add(ack);
+        let _ = store.save();
+    }
     invalidate_cluster_cache(&state);
-    HttpResponse::Ok().json(serde_json::json!({ "success": true, "id": id }))
+
+    // An ack used to live only on the node the browser was logged into.
+    // The finding's OWN node never saw it, so opening the inbox from any
+    // other node brought the finding straight back (JJ, 2026-09-22). Copy
+    // it to every peer so each node's inbox and analyzer honour it. Local
+    // cluster only, by design: the inbox aggregate is cluster-local, and a
+    // federated cluster keeps its own acks. A request forwarded from a
+    // peer never re-fans-out.
+    let unreached = if is_inter_node_forward(&user) {
+        Vec::new()
+    } else if let Some(replica) = replica {
+        let outcomes = fan_out_to_peers(
+            &state, reqwest::Method::POST, "/api/proposal-acks/replica", Some(replica),
+        ).await;
+        outcomes.into_iter()
+            .filter_map(|(peer, o)| match o {
+                PeerOutcome::Ok(_) => None,
+                PeerOutcome::NotFound => Some(format!(
+                    "{} (too old to share acknowledgements — upgrade it)", peer.hostname)),
+                PeerOutcome::Failed(e) => Some(format!("{} ({})", peer.hostname, e)),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec!["every peer (the acknowledgement could not be encoded — see the WolfStack log)".to_string()]
+    };
+    if !unreached.is_empty() {
+        warn!("predictive ack {} not copied to: {}", id, unreached.join(", "));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true, "id": id, "unreached": unreached,
+    }))
 }
 
+/// POST /api/proposal-acks/replica — a peer copying an ack it created to
+/// this node (see `predictive_acks_create`). Peer-only: an operator
+/// creates acks through `POST /api/proposal-acks`, which owns the reason
+/// check and stamps who acknowledged it.
+pub async fn predictive_acks_replica(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::predictive::Ack>,
+) -> HttpResponse {
+    let caller = match require_auth(&req, &state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    if !is_inter_node_forward(&caller) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "ack replicas are only accepted from cluster peers",
+        }));
+    }
+    let ack = body.into_inner();
+    if ack.reason.trim().is_empty() || ack.id.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "ack replica is missing its id or reason",
+        }));
+    }
+    {
+        let mut store = match state.predictive_acks.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        store.upsert_replica(ack);
+        let _ = store.save();
+    }
+    invalidate_cluster_cache(&state);
+    HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+}
+
+/// DELETE /api/proposal-acks/{id} — revoke an ack. From an operator this
+/// removes it on this node AND every peer (acks are copied cluster-wide,
+/// and ones made before that only exist on the node they were made on);
+/// from a peer it removes the local copy only.
 pub async fn predictive_acks_remove(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let id = path.into_inner();
-    let mut store = match state.predictive_acks.write() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
+    let caller = match require_auth(&req, &state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
-    if store.remove(&id) {
-        let _ = store.save();
-        drop(store);
+    let id = path.into_inner();
+    let removed_here = {
+        let mut store = match state.predictive_acks.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let removed = store.remove(&id);
+        if removed {
+            let _ = store.save();
+        }
+        removed
+    };
+    if removed_here {
         invalidate_cluster_cache(&state);
-        HttpResponse::Ok().json(serde_json::json!({ "success": true }))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({ "error": "ack not found" }))
     }
+    if is_inter_node_forward(&caller) {
+        return if removed_here {
+            HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+        } else {
+            HttpResponse::NotFound().json(serde_json::json!({ "error": "ack not found" }))
+        };
+    }
+
+    let path = format!("/api/proposal-acks/{}", urlencoding::encode(&id));
+    let outcomes = fan_out_to_peers(&state, reqwest::Method::DELETE, &path, None).await;
+    let mut removed_on_peers = 0usize;
+    let mut unreached = Vec::new();
+    for (peer, o) in outcomes {
+        match o {
+            PeerOutcome::Ok(_) => removed_on_peers += 1,
+            PeerOutcome::NotFound => {}
+            PeerOutcome::Failed(e) => unreached.push(format!("{} ({})", peer.hostname, e)),
+        }
+    }
+    if !removed_here && removed_on_peers == 0 {
+        if !unreached.is_empty() {
+            // Not found anywhere we could reach — but a node that could hold
+            // it didn't answer, so "not found" would be a lie.
+            return HttpResponse::BadGateway().json(serde_json::json!({
+                "error": format!(
+                    "acknowledgement not found on any reachable node; could not reach {}",
+                    unreached.join(", "),
+                ),
+            }));
+        }
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "ack not found" }));
+    }
+    if !unreached.is_empty() {
+        warn!("predictive ack {} revoke did not reach: {}", id, unreached.join(", "));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "success": true, "unreached": unreached }))
+}
+
+/// Result of one peer call in `fan_out_to_peers`.
+enum PeerOutcome {
+    /// 2xx; the JSON body, or `Null` when the body wasn't JSON.
+    Ok(serde_json::Value),
+    /// HTTP 404 — the peer doesn't hold the thing, or predates the endpoint.
+    NotFound,
+    /// Unreachable, timed out, or any other status. Short, operator-readable.
+    Failed(String),
+}
+
+/// Send one request to every WolfStack peer in this cluster, concurrently,
+/// authenticated with the cluster secret. Each peer's candidate URLs
+/// (`build_node_urls`) are tried in order until one answers. Returns
+/// `(peer, outcome)` per peer. Peers the cluster already knows are offline
+/// aren't called but ARE returned (`Failed("offline")`), so a caller can
+/// tell the operator which nodes an ack or revoke never reached.
+async fn fan_out_to_peers(
+    state: &web::Data<AppState>,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> Vec<(crate::agent::Node, PeerOutcome)> {
+    let peers: Vec<_> = state.cluster.get_all_nodes().into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack")
+        .collect();
+    let secret = state.cluster_secret.clone();
+    let calls = peers.into_iter().map(|peer| {
+        let urls = build_node_urls(&peer.address, peer.port, path);
+        let method = method.clone();
+        let body = body.clone();
+        let secret = secret.clone();
+        async move {
+            if !peer.online {
+                return (peer, PeerOutcome::Failed("offline".to_string()));
+            }
+            let mut outcome = PeerOutcome::Failed("unreachable".to_string());
+            for url in urls {
+                let mut rb = API_HTTP_CLIENT.request(method.clone(), &url)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .peer_auth(&secret);
+                if let Some(b) = &body {
+                    rb = rb.header("content-type", "application/json").body(b.clone());
+                }
+                let resp = match rb.send().await {
+                    Ok(r) => r,
+                    Err(e) if e.is_timeout() => {
+                        outcome = PeerOutcome::Failed("timed out".to_string());
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                let status = resp.status();
+                outcome = if status.is_success() {
+                    PeerOutcome::Ok(resp.json::<serde_json::Value>().await
+                        .unwrap_or(serde_json::Value::Null))
+                } else if status == reqwest::StatusCode::NOT_FOUND {
+                    let _ = resp.bytes().await;
+                    PeerOutcome::NotFound
+                } else {
+                    let _ = resp.bytes().await;
+                    PeerOutcome::Failed(format!("HTTP {}", status.as_u16()))
+                };
+                break;
+            }
+            (peer, outcome)
+        }
+    });
+    futures::future::join_all(calls).await
+}
+
+/// GET /api/proposals/suppressed — what this node is keeping out of its
+/// inbox on the operator's say-so: dismissed findings and active acks.
+/// Snoozed findings aren't listed; they stay in the inbox with a
+/// SNOOZED badge and their own Unsnooze button.
+pub async fn predictive_proposals_suppressed(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(local_suppressed(&state))
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SuppressedSet {
+    dismissed: Vec<crate::predictive::Proposal>,
+    acks: Vec<crate::predictive::Ack>,
+}
+
+fn local_suppressed(state: &web::Data<AppState>) -> SuppressedSet {
+    let now = chrono::Utc::now();
+    let dismissed = {
+        let store = state.predictive_proposals.read().unwrap_or_else(|e| e.into_inner());
+        store.proposals.iter()
+            .filter(|p| matches!(p.status, crate::predictive::proposal::ProposalStatus::Dismissed { .. }))
+            .cloned()
+            .collect()
+    };
+    let acks = {
+        let store = state.predictive_acks.read().unwrap_or_else(|e| e.into_inner());
+        store.acks.iter().filter(|a| a.is_active(now)).cloned().collect()
+    };
+    SuppressedSet { dismissed, acks }
+}
+
+/// An active ack plus the hostnames of the nodes holding a copy, so the
+/// operator can see one that didn't reach a node and revoke or redo it.
+#[derive(Serialize)]
+struct HeldAck {
+    #[serde(flatten)]
+    ack: crate::predictive::Ack,
+    held_on: Vec<String>,
+}
+
+/// GET /api/proposals/suppressed/cluster — `suppressed` from this node and
+/// every peer, for the inbox's Suppressed view. Dismissals live on the
+/// finding's own node so they concatenate; acks are copied cluster-wide
+/// so they're merged by id. Unreachable peers are listed in `nodes` like
+/// the inbox aggregate, never dropped silently.
+pub async fn predictive_proposals_suppressed_cluster(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    use crate::predictive::cluster::NodeAggregateStatus;
+
+    let nodes_snapshot = state.cluster.get_all_nodes();
+    let self_node = nodes_snapshot.iter().find(|n| n.is_self).cloned();
+    let self_host = self_node.as_ref().map(|n| n.hostname.clone()).unwrap_or_default();
+    let mut nodes = vec![NodeAggregateStatus {
+        node_id: state.node_id.clone(),
+        hostname: self_host.clone(),
+        is_self: true,
+        responded: true,
+        error: None,
+        cluster_name: self_node.as_ref().map(resolve_cluster_label).unwrap_or_default(),
+    }];
+
+    let mut sets = vec![(self_host, local_suppressed(&state))];
+    for (peer, outcome) in fan_out_to_peers(
+        &state, reqwest::Method::GET, "/api/proposals/suppressed", None,
+    ).await {
+        // Same canonical id the peer stamps on its proposals' scopes.
+        let node_id = peer.self_id.clone().unwrap_or_else(|| peer.id.clone());
+        let cluster_name = resolve_cluster_label(&peer);
+        let host = peer.hostname;
+        let error = match outcome {
+            PeerOutcome::Ok(v) => match serde_json::from_value::<SuppressedSet>(v) {
+                Ok(set) => { sets.push((host.clone(), set)); None }
+                Err(e) => Some(format!("invalid response shape: {}", e)),
+            },
+            PeerOutcome::NotFound => Some("too old to list suppressions — upgrade it".to_string()),
+            PeerOutcome::Failed(e) => Some(e),
+        };
+        nodes.push(NodeAggregateStatus {
+            node_id, hostname: host, is_self: false,
+            responded: error.is_none(), error, cluster_name,
+        });
+    }
+
+    let mut dismissed = Vec::new();
+    let mut acks: Vec<HeldAck> = Vec::new();
+    for (host, set) in sets {
+        dismissed.extend(set.dismissed);
+        for ack in set.acks {
+            match acks.iter_mut().find(|h| h.ack.id == ack.id) {
+                Some(h) => h.held_on.push(host.clone()),
+                None => acks.push(HeldAck { ack, held_on: vec![host.clone()] }),
+            }
+        }
+    }
+    dismissed.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
+    acks.sort_by_key(|h| std::cmp::Reverse(h.ack.created_at));
+    HttpResponse::Ok().json(serde_json::json!({
+        "dismissed": dismissed,
+        "acks": acks,
+        "nodes": nodes,
+    }))
 }
 
 // ─── Tamper-detection baselines ───────────────────────────────────
@@ -48845,6 +49202,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/proposals/cluster", web::get().to(predictive_proposals_cluster))
         .route("/api/proposals/history", web::get().to(predictive_proposals_history))
         .route("/api/proposals/run-now", web::post().to(predictive_proposals_run_now))
+        // Before /api/proposals/{id}: "suppressed" would otherwise match {id}.
+        .route("/api/proposals/suppressed", web::get().to(predictive_proposals_suppressed))
+        .route("/api/proposals/suppressed/cluster", web::get().to(predictive_proposals_suppressed_cluster))
         .route("/api/proposals/{id}", web::get().to(predictive_proposal_get))
         .route("/api/proposals/{id}/command/{idx}", web::get().to(predictive_proposal_command))
         .route("/api/proposals/{id}/autofix-command", web::get().to(predictive_proposal_autofix_command))
@@ -48852,10 +49212,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/proposals/{id}/history", web::get().to(predictive_proposal_history))
         .route("/api/proposals/{id}/snooze", web::post().to(predictive_proposal_snooze))
         .route("/api/proposals/{id}/dismiss", web::post().to(predictive_proposal_dismiss))
+        .route("/api/proposals/{id}/restore", web::post().to(predictive_proposal_restore))
         .route("/api/proposals/{id}/approve", web::post().to(predictive_proposal_approve))
         .route("/api/proposals/{id}/apply", web::post().to(predictive_proposal_apply))
         .route("/api/proposal-acks", web::get().to(predictive_acks_list))
         .route("/api/proposal-acks", web::post().to(predictive_acks_create))
+        .route("/api/proposal-acks/replica", web::post().to(predictive_acks_replica))
         .route("/api/proposal-acks/{id}", web::delete().to(predictive_acks_remove))
         .route("/api/predictive/osv-config", web::get().to(predictive_osv_config_get))
         .route("/api/predictive/osv-config", web::put().to(predictive_osv_config_put))
