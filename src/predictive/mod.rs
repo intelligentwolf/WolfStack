@@ -60,6 +60,8 @@ pub mod boot_partition;
 pub mod boot_health;
 /// One WolfNet IP with two live owners (two nodes, or a node and a peer).
 pub mod wolfnet_ip_conflict;
+/// UPS reporting a battery that needs replacing (NUT `RB`).
+pub mod ups_battery;
 pub mod cert_expiry;
 pub mod backup_freshness;
 pub mod vm_disk;
