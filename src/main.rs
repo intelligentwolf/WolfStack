@@ -83,6 +83,7 @@ mod ups;
 mod systemcheck;
 mod security;
 mod ssh_keys;
+mod wol;
 mod secret_audit;
 mod secret_rotation;
 mod at_rest_crypto;

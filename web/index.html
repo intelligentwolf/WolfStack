@@ -4504,6 +4504,34 @@
         </div>
 
         <!-- ═══ Cluster Backups Page ═══ -->
+        <!-- Wake-on-LAN (cluster). Each node keeps the machines on its own
+             LAN (src/wol.rs); this page lists every node's through the proxy. -->
+        <div id="page-wol" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:24px; flex-wrap:wrap; gap:16px;">
+                    <div style="display:flex; align-items:center; gap:16px; min-width:0;">
+                        <div aria-hidden="true" style="width:56px; height:56px; flex-shrink:0; background:linear-gradient(135deg,#3b82f6,#10b981); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:28px;">
+                            <span class="ws-icon-clean-wrap" data-icon="power"></span></div>
+                        <div style="min-width:0;">
+                            <h2 style="font-size:22px; margin:0 0 4px; color:var(--text-primary); font-weight:700;">
+                                Wake-on-LAN <span id="wol-cluster-label" style="font-size:14px; font-weight:400; color:var(--text-secondary);"></span></h2>
+                            <p style="color:var(--text-secondary); font-size:14px; margin:0; max-width:70ch;">Turn on machines on your network from wherever you can reach this dashboard. The wake signal is sent by the node you choose, so pick a node on the same network as the machine.</p>
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                        <button class="btn" onclick="loadWolPage()"><span class="ws-icon-clean-wrap" data-icon="refresh"></span> Refresh</button>
+                        <button class="btn btn-primary" id="wol-add-btn" onclick="openWolDialog()" style="font-weight:600;">+ Add machine</button>
+                    </div>
+                </div>
+            </div>
+            <div id="wol-notice" role="status" aria-live="polite"></div>
+            <div class="card">
+                <div class="card-body" id="wol-content" style="padding:0;" aria-busy="true">
+                    <p style="padding:20px; color:var(--text-secondary); margin:0;">Loading machines…</p>
+                </div>
+            </div>
+        </div>
+
         <div id="page-cluster-backups" class="page-view" style="display:none;">
             <!-- Header -->
             <div class="card"

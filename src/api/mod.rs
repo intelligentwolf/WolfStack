@@ -20027,6 +20027,144 @@ fn resolve_key_actor(auth_user: &str, forwarded: &str) -> String {
     }
 }
 
+// ═══════════════════════════════════════════════════
+// ─── Wake-on-LAN ───
+// ═══════════════════════════════════════════════════
+//
+// Every endpoint acts on THIS node's targets only. The cluster page
+// reaches each node through /api/nodes/{id}/proxy, so a Wake click is
+// sent by the node on the target's LAN. Changes and wakes use
+// require_operator_auth: it refuses viewers and a bare cluster secret,
+// and names the operator behind a proxied call for the log line.
+
+fn wol_error(status: actix_web::http::StatusCode, e: impl Into<String>) -> HttpResponse {
+    HttpResponse::build(status).json(serde_json::json!({ "error": e.into() }))
+}
+
+fn wol_task_panicked(e: tokio::task::JoinError) -> HttpResponse {
+    wol_error(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+        format!("wake-on-lan task failed: {}", e))
+}
+
+/// GET /api/wol/targets — this node's Wake-on-LAN targets.
+pub async fn wol_targets_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match tokio::task::spawn_blocking(crate::wol::load).await {
+        Ok(cfg) => HttpResponse::Ok().json(serde_json::json!({ "targets": cfg.targets })),
+        Err(e) => wol_task_panicked(e),
+    }
+}
+
+/// GET /api/wol/status — ping every target that has a host set, from
+/// this node, in parallel. `{ "<id>": true | false | null }`, null =
+/// no host configured.
+pub async fn wol_targets_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let cfg = match tokio::task::spawn_blocking(crate::wol::load).await {
+        Ok(c) => c,
+        Err(e) => return wol_task_panicked(e),
+    };
+    let checks = cfg.targets.iter().map(|t| async move {
+        (t.id.clone(), crate::wol::is_up(t).await)
+    });
+    let statuses: serde_json::Map<String, serde_json::Value> =
+        futures::future::join_all(checks).await.into_iter()
+            .map(|(id, up)| (id, serde_json::json!(up)))
+            .collect();
+    HttpResponse::Ok().json(statuses)
+}
+
+/// POST /api/wol/targets — add a target to this node.
+pub async fn wol_targets_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::wol::WolTargetInput>,
+) -> HttpResponse {
+    let actor = match require_operator_auth(&req, &state) { Ok(a) => a, Err(e) => return e };
+    let input = body.into_inner();
+    match tokio::task::spawn_blocking(move || crate::wol::add(&input)).await {
+        Ok(Ok(t)) => {
+            tracing::info!("wol: '{}' added target '{}' ({})", actor, t.name, t.mac);
+            HttpResponse::Ok().json(t)
+        }
+        Ok(Err(e)) => wol_error(actix_web::http::StatusCode::BAD_REQUEST, e),
+        Err(e) => wol_task_panicked(e),
+    }
+}
+
+/// PUT /api/wol/targets/{id} — edit a target on this node.
+pub async fn wol_targets_update(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<crate::wol::WolTargetInput>,
+) -> HttpResponse {
+    let actor = match require_operator_auth(&req, &state) { Ok(a) => a, Err(e) => return e };
+    let id = path.into_inner();
+    let input = body.into_inner();
+    match tokio::task::spawn_blocking(move || crate::wol::update(&id, &input)).await {
+        Ok(Ok(t)) => {
+            tracing::info!("wol: '{}' updated target '{}' ({})", actor, t.name, t.mac);
+            HttpResponse::Ok().json(t)
+        }
+        Ok(Err(e)) if e == "target not found" =>
+            wol_error(actix_web::http::StatusCode::NOT_FOUND, e),
+        Ok(Err(e)) => wol_error(actix_web::http::StatusCode::BAD_REQUEST, e),
+        Err(e) => wol_task_panicked(e),
+    }
+}
+
+/// DELETE /api/wol/targets/{id} — remove a target from this node.
+pub async fn wol_targets_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let actor = match require_operator_auth(&req, &state) { Ok(a) => a, Err(e) => return e };
+    let id = path.into_inner();
+    match tokio::task::spawn_blocking(move || crate::wol::remove(&id)).await {
+        Ok(Ok(t)) => {
+            tracing::info!("wol: '{}' removed target '{}' ({})", actor, t.name, t.mac);
+            HttpResponse::Ok().json(serde_json::json!({ "deleted": t.id }))
+        }
+        Ok(Err(e)) if e == "target not found" =>
+            wol_error(actix_web::http::StatusCode::NOT_FOUND, e),
+        Ok(Err(e)) => wol_error(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => wol_task_panicked(e),
+    }
+}
+
+/// POST /api/wol/targets/{id}/wake — send the magic packet from this
+/// node. Success means the packet left this node; whether the machine
+/// woke is what GET /api/wol/status then shows.
+pub async fn wol_targets_wake(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let actor = match require_operator_auth(&req, &state) { Ok(a) => a, Err(e) => return e };
+    let id = path.into_inner();
+    // Err carries (is_not_found, message) so the two failures map to 404 / 500.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let target = crate::wol::load().targets.into_iter().find(|t| t.id == id)
+            .ok_or_else(|| (true, "target not found".to_string()))?;
+        crate::wol::wake(&target).map(|r| (target.name, r)).map_err(|e| (false, e))
+    }).await;
+    match outcome {
+        Ok(Ok((name, r))) => {
+            tracing::info!("wol: '{}' woke '{}' ({}) via {} on port {}",
+                actor, name, r.mac, r.sent_to.join(", "), r.port);
+            HttpResponse::Ok().json(r)
+        }
+        Ok(Err((true, e))) => wol_error(actix_web::http::StatusCode::NOT_FOUND, e),
+        Ok(Err((false, e))) => {
+            tracing::warn!("wol: '{}' wake failed: {}", actor, e);
+            wol_error(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+        Err(e) => wol_task_panicked(e),
+    }
+}
+
 /// GET /api/ssh-keys — root's authorised keys on THIS node.
 pub async fn ssh_keys_list(
     req: HttpRequest,
@@ -48797,6 +48935,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ssh-keys/fleet", web::get().to(ssh_keys_fleet_list))
         .route("/api/ssh-keys/add-fleet", web::post().to(ssh_keys_add_fleet))
         .route("/api/ssh-keys/remove-fleet", web::post().to(ssh_keys_remove_fleet))
+        // Wake-on-LAN — targets live on the node on their LAN; see src/wol.rs
+        .route("/api/wol/targets", web::get().to(wol_targets_list))
+        .route("/api/wol/targets", web::post().to(wol_targets_create))
+        .route("/api/wol/targets/{id}", web::put().to(wol_targets_update))
+        .route("/api/wol/targets/{id}", web::delete().to(wol_targets_delete))
+        .route("/api/wol/targets/{id}/wake", web::post().to(wol_targets_wake))
+        .route("/api/wol/status", web::get().to(wol_targets_status))
         // Brute-force lockout management
         .route("/api/security/auth-config", web::get().to(security_auth_config_get))
         .route("/api/security/auth-config", web::post().to(security_auth_config_set))
