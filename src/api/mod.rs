@@ -34550,6 +34550,28 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
         }
     }
 
+    // ── UPS battery needing replacement ──
+    // Same verdict as the UPS page and the predictive finding
+    // (ups::parse_upsc → replace_battery: NUT `RB` status flag or
+    // battery.packs.bad > 0). Only the UPS this node is configured to
+    // monitor is read; an unreadable UPS raises nothing here — the UPS
+    // page already shows the comms error.
+    let ups_target = crate::ups::UpsConfig::load().ups.trim().to_string();
+    if !ups_target.is_empty() && crate::ups::upsc_installed()
+        && let Ok(live) = crate::ups::query_ups(&ups_target)
+        && let Some(why) = crate::ups::battery_fault_summary(&live)
+    {
+        issues.push(Issue {
+            severity: "critical".into(),
+            category: "ups".into(),
+            title: format!("UPS '{}' battery needs replacing", ups_target),
+            detail: format!(
+                "{} — the UPS may not hold the load through the next power cut; replace the battery",
+                why,
+            ),
+        });
+    }
+
     // ── Swap check ──
     if metrics.swap_total_bytes > 0 {
         let swap_pct = (metrics.swap_used_bytes as f64 / metrics.swap_total_bytes as f64) * 100.0;

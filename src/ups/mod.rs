@@ -149,6 +149,29 @@ pub struct UpsLiveStatus {
     pub runtime_secs: Option<u64>,
     /// ups.load %, when reported.
     pub load: Option<u8>,
+    /// The UPS says its battery is worn out: the `RB` status token
+    /// ("The battery needs to be replaced", NUT docs/new-drivers.txt
+    /// "Status data" — the flag upsmon turns into its REPLBATT notice,
+    /// clients/upsmon.c upsreplbatt()), battery.packs.bad > 0, OR
+    /// [`test_failed`](Self::test_failed).
+    pub replace_battery: bool,
+    /// The last battery self-test failed, per [`self_test_failed`]. Kept
+    /// separate from RB because on most drivers the two are independent:
+    /// usbhid-ups only raises RB from the UPS's own NeedReplacement bit
+    /// (drivers/usbhid-ups.c ups_status_set), so a failed test with the
+    /// bit unset reads "OL" plus "Done and error" and nothing else.
+    pub test_failed: bool,
+    /// battery.packs.bad ("Number of bad battery packs", nut-names.txt),
+    /// when the driver reports it.
+    pub battery_packs_bad: Option<u32>,
+    /// ups.test.result — opaque per nut-names.txt, and every driver words
+    /// it differently, so it is always shown verbatim; only the exact
+    /// strings in [`self_test_failed`] are read as a verdict.
+    pub test_result: Option<String>,
+    /// ups.alarm — opaque, possibly several sentences (nut-names.txt).
+    pub alarm: Option<String>,
+    /// battery.date — installation / last-change date, opaque string.
+    pub battery_date: Option<String>,
     pub model: String,
     /// Unix time of this reading.
     pub read_at: u64,
@@ -193,26 +216,102 @@ pub fn query_ups(target: &str) -> Result<UpsLiveStatus, String> {
             err
         });
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_upsc(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse `upsc <target>` stdout ("key: value" per line). Split out of
+/// [`query_ups`] so the status-token handling is unit-testable.
+fn parse_upsc(text: &str) -> UpsLiveStatus {
     let get = |key: &str| -> Option<String> {
         text.lines()
             .find_map(|l| l.strip_prefix(&format!("{}: ", key)))
             .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     };
-    // ups.status is a space-separated token list per the NUT docs:
-    // OL = online, OB = on battery, LB = low battery.
+    // ups.status is a space-separated token list (NUT docs/new-drivers.txt
+    // "Status data"): OL = on line, OB = on battery, LB = low battery,
+    // RB = the battery needs to be replaced. upsmon matches the tokens
+    // case-insensitively (clients/upsmon.c parse_status, strcasecmp), so
+    // do the same.
     let status = get("ups.status").unwrap_or_default();
-    let tokens: Vec<&str> = status.split_whitespace().collect();
-    Ok(UpsLiveStatus {
-        on_battery: tokens.contains(&"OB"),
-        low_battery: tokens.contains(&"LB"),
+    let has = |tok: &str| status.split_whitespace().any(|t| t.eq_ignore_ascii_case(tok));
+    let battery_packs_bad = get("battery.packs.bad").and_then(|v| v.parse::<f64>().ok()).map(|v| v as u32);
+    let test_result = get("ups.test.result");
+    let test_failed = test_result.as_deref().is_some_and(self_test_failed);
+    UpsLiveStatus {
+        on_battery: has("OB"),
+        low_battery: has("LB"),
+        replace_battery: has("RB") || battery_packs_bad.is_some_and(|n| n > 0) || test_failed,
+        test_failed,
+        battery_packs_bad,
+        test_result,
+        alarm: get("ups.alarm"),
+        battery_date: get("battery.date"),
         charge: get("battery.charge").and_then(|v| v.parse::<f64>().ok()).map(|v| v.round() as u8),
         runtime_secs: get("battery.runtime").and_then(|v| v.parse::<f64>().ok()).map(|v| v as u64),
         load: get("ups.load").and_then(|v| v.parse::<f64>().ok()).map(|v| v.round() as u8),
         model: get("device.model").or_else(|| get("ups.model")).unwrap_or_default(),
         status,
         read_at: now_secs(),
-    })
+    }
+}
+
+/// ups.test.result values that mean the battery self-test FAILED. Only
+/// strings a NUT driver is known to emit for that outcome are listed —
+/// ups.test.result is otherwise free text, and matching loosely (say, any
+/// "fail" substring) would also catch "Bad Inverter"-style results that
+/// are not about the battery. Anything not listed stays display-only.
+///
+/// Exact values:
+///   "Done and error"        usbhid-ups test_read_info[] value 3 — used by
+///                           the apc, cps (CyberPower), mge (Eaton), tripplite,
+///                           liebert, delta_ups, powercom and salicru HID
+///                           subdrivers (drivers/usbhid-ups.c)
+///   "Battery Bad (Replace)" tripplite.c (serial Tripp Lite), which never
+///                           sets RB
+///   "10s test failed", "deep test failed"
+///                           belkin.c (serial Belkin), which never sets RB
+///   "Failed"                apc-mib.c apcc_testdiag_results and
+///                           cyberpower-mib.c cyberpower_testdiag_results
+///                           (SNMP network cards)
+/// Plus the first ", "-separated field being "Failed": apc_modbus.c joins
+/// result, source and modifier with ", " ("Failed, Source: Internal")
+/// in every release that reports the test (2.8.2 onward;
+/// _apc_modbus_string_join / apc_common.c apc_format_test_status_value).
+pub fn self_test_failed(result: &str) -> bool {
+    const EXACT: [&str; 5] = [
+        "Done and error",
+        "Battery Bad (Replace)",
+        "10s test failed",
+        "deep test failed",
+        "Failed",
+    ];
+    let r = result.trim();
+    EXACT.contains(&r) || r.split(", ").next() == Some("Failed")
+}
+
+/// Why the UPS wants a new battery, in operator words — shared by the
+/// Issues scan, the predictive finding and the UPS action log so all
+/// three say the same thing. None when the battery is not flagged.
+pub fn battery_fault_summary(live: &UpsLiveStatus) -> Option<String> {
+    if !live.replace_battery {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if live.status.split_whitespace().any(|t| t.eq_ignore_ascii_case("RB")) {
+        parts.push(format!("the UPS reports \"replace battery\" (status {})", live.status));
+    }
+    if let Some(n) = live.battery_packs_bad.filter(|n| *n > 0) {
+        parts.push(format!("{} bad battery pack(s)", n));
+    }
+    if let Some(t) = &live.test_result {
+        if live.test_failed {
+            parts.push(format!("the last battery self-test failed (\"{}\")", t));
+        } else {
+            parts.push(format!("last self-test: {}", t));
+        }
+    }
+    Some(parts.join("; "))
 }
 
 /// `upsc -l` — names of UPSes served by the local upsd. Empty when
@@ -236,7 +335,7 @@ pub fn upsc_installed() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsLogEntry {
     pub timestamp: u64,
-    /// "on_battery" | "online" | "stage" | "action" | "error"
+    /// "on_battery" | "online" | "stage" | "action" | "error" | "battery"
     pub kind: String,
     pub message: String,
 }
@@ -251,6 +350,10 @@ pub struct UpsRuntime {
     pub fired: HashSet<u8>,
     pub last_status: Option<UpsLiveStatus>,
     pub last_error: Option<String>,
+    /// Whether the last good reading flagged the battery for
+    /// replacement — edge-detects the fault so the action log gets one
+    /// entry when it appears and one when it clears, not one per poll.
+    pub battery_fault: bool,
     pub log: VecDeque<UpsLogEntry>,
 }
 
@@ -302,9 +405,15 @@ fn log_event(state: &UpsState, kind: &str, message: String) {
 
 /// One poll cycle. Called from the background loop in main.rs; all
 /// blocking work (upsc, stop commands) runs inside spawn_blocking.
+///
+/// Monitoring (live reading, comms errors, battery health) runs whenever
+/// a UPS target is set. `enabled` arms only the power-event side: the
+/// on-battery / restored alerts and the shutdown stages. A saved but
+/// disarmed target used to go unpolled, so a failed battery on it
+/// was never shown (RutgerDiehard, 2026-09-25).
 pub async fn engine_tick(state: &std::sync::Arc<UpsState>, app: &std::sync::Arc<crate::api::AppState>) {
     let config = UpsConfig::load();
-    if !config.enabled || config.ups.trim().is_empty() {
+    if config.ups.trim().is_empty() {
         return;
     }
 
@@ -325,10 +434,32 @@ pub async fn engine_tick(state: &std::sync::Arc<UpsState>, app: &std::sync::Arc<
         }
     };
 
+    // Battery-health edge, logged whether or not the stages are armed.
+    // Notification is the predictive `ups_battery_replace` finding's job
+    // (High → first-appearance dispatch), so this only writes the log.
+    let fault_changed = {
+        let mut rt = state.runtime.write().unwrap();
+        rt.last_error = None;
+        let changed = rt.battery_fault != status.replace_battery;
+        rt.battery_fault = status.replace_battery;
+        rt.last_status = Some(status.clone());
+        changed
+    };
+    if fault_changed {
+        match battery_fault_summary(&status) {
+            Some(why) => log_event(state, "battery",
+                format!("UPS '{}' battery needs replacing: {}", config.ups, why)),
+            None => log_event(state, "battery",
+                format!("UPS '{}' no longer reports a battery fault", config.ups)),
+        }
+    }
+    if !config.enabled {
+        return;
+    }
+
     // Transition detection under one short lock, actions after.
     let (went_on_battery, recovered, outage_secs) = {
         let mut rt = state.runtime.write().unwrap();
-        rt.last_error = None;
         let went_on = status.on_battery && rt.on_battery_since.is_none();
         let recovered = !status.on_battery && rt.on_battery_since.is_some();
         let outage_secs = rt.on_battery_since.map(|t| now_secs().saturating_sub(t)).unwrap_or(0);
@@ -339,7 +470,6 @@ pub async fn engine_tick(state: &std::sync::Arc<UpsState>, app: &std::sync::Arc<
             rt.on_battery_since = None;
             rt.fired.clear();
         }
-        rt.last_status = Some(status.clone());
         (went_on, recovered, outage_secs)
     };
 
@@ -573,5 +703,78 @@ fn shutdown_host(state: &UpsState) {
         .map(|s| s.success()).unwrap_or(false);
     if !ok {
         run_logged(state, "shutdown -h now", "shutdown", &["-h", "now"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthy_online_ups_has_no_battery_fault() {
+        let s = parse_upsc("battery.charge: 100\nups.status: OL CHRG\nups.test.result: Done and passed\n");
+        assert!(!s.on_battery && !s.replace_battery);
+        assert_eq!(battery_fault_summary(&s), None);
+        assert_eq!(s.test_result.as_deref(), Some("Done and passed"));
+    }
+
+    #[test]
+    fn rb_token_flags_battery_replacement() {
+        let s = parse_upsc("ups.status: OL RB\nups.test.result: Battery Bad (Replace)\n");
+        assert!(s.replace_battery);
+        assert!(!s.on_battery);
+        let why = battery_fault_summary(&s).unwrap();
+        assert!(why.contains("OL RB") && why.contains("Battery Bad (Replace)"), "{why}");
+    }
+
+    #[test]
+    fn status_tokens_match_case_insensitively_like_upsmon() {
+        let s = parse_upsc("ups.status: ob lb rb\n");
+        assert!(s.on_battery && s.low_battery && s.replace_battery);
+    }
+
+    #[test]
+    fn rb_is_a_whole_token_not_a_substring() {
+        // A token that merely contains the letters must not trip it.
+        let s = parse_upsc("ups.status: OL ALARM\n");
+        assert!(!s.replace_battery);
+    }
+
+    #[test]
+    fn bad_battery_packs_flag_replacement_without_rb() {
+        let s = parse_upsc("ups.status: OL\nbattery.packs.bad: 1\n");
+        assert!(s.replace_battery);
+        assert_eq!(s.battery_packs_bad, Some(1));
+        assert!(battery_fault_summary(&s).unwrap().contains("1 bad battery pack"));
+        let ok = parse_upsc("ups.status: OL\nbattery.packs.bad: 0\n");
+        assert!(!ok.replace_battery);
+    }
+
+    #[test]
+    fn usbhid_failed_self_test_without_rb_is_caught() {
+        // usbhid-ups with the UPS's NeedReplacement bit unset: no RB,
+        // only the test result says the battery failed.
+        let s = parse_upsc("ups.status: OL\nups.test.result: Done and error\n");
+        assert!(s.test_failed && s.replace_battery);
+        assert!(battery_fault_summary(&s).unwrap().contains("self-test failed"));
+    }
+
+    #[test]
+    fn self_test_verdicts_come_only_from_known_driver_strings() {
+        for failed in ["Done and error", "Battery Bad (Replace)", "10s test failed",
+                       "deep test failed", "Failed", "Failed, Source: Internal"] {
+            assert!(self_test_failed(failed), "{failed}");
+        }
+        for fine in ["Done and passed", "Done and warning", "Passed", "OK", "Ok",
+                     "No test initiated", "Aborted", "In progress", "Bad Inverter",
+                     "Passed, Source: Protocol", "Refused, Modifier: InvalidState"] {
+            assert!(!self_test_failed(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn empty_values_are_absent() {
+        let s = parse_upsc("ups.status: OL\nups.alarm: \n");
+        assert_eq!(s.alarm, None);
     }
 }

@@ -16004,10 +16004,13 @@ function upsFaceplateSvg(data) {
     const live = data.live;
     const err = data.last_error;
     const cfg = data.config || {};
-    const configured = !!(cfg.enabled && cfg.ups);
+    // A saved target is monitored whether or not the shutdown stages are
+    // armed (cfg.enabled) — the engine polls it either way.
+    const configured = !!cfg.ups;
     const online = !!(live && !err && !live.on_battery);
     const onBattery = !!(live && !err && live.on_battery);
     const lowBatt = !!(live && !err && live.low_battery);
+    const replaceBatt = !!(live && !err && live.replace_battery);
     const charge = live && live.charge != null ? live.charge : null;
     const fired = data.fired_stages || [];
 
@@ -16072,7 +16075,7 @@ function upsFaceplateSvg(data) {
     const model = (live && live.model) ? live.model : (cfg.ups || 'UPS');
     return `
     <svg viewBox="0 0 640 240" style="width:100%;max-width:820px;display:block;" role="img" aria-label="UPS front panel — ${
-        !configured ? 'not configured' : err ? 'unreachable' : lowBatt ? 'low battery' : onBattery ? 'on battery' : live ? 'online' : 'waiting for reading'}">
+        !configured ? 'not configured' : err ? 'unreachable' : lowBatt ? 'low battery' : onBattery ? 'on battery' : live ? 'online' : 'waiting for reading'}${replaceBatt ? ', battery needs replacing' : ''}">
         <defs>
             <linearGradient id="ups-chassis" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0" stop-color="#262a33"/><stop offset="1" stop-color="#14161b"/>
@@ -16103,6 +16106,7 @@ function upsFaceplateSvg(data) {
             ${led(34, 96, online, '#22c55e')}<text x="46" y="100" fill="${online ? '#22c55e' : '#5b6270'}">ONLINE</text>
             ${led(34, 122, onBattery, '#f59e0b')}<text x="46" y="126" fill="${onBattery ? '#f59e0b' : '#5b6270'}">ON BATTERY</text>
             ${led(34, 148, lowBatt || !!err, '#ef4444')}<text x="46" y="152" fill="${(lowBatt || err) ? '#ef4444' : '#5b6270'}">${err ? 'FAULT' : 'LOW BATTERY'}</text>
+            ${led(34, 172, replaceBatt, '#ef4444')}<text x="46" y="176" fill="${replaceBatt ? '#ef4444' : '#5b6270'}">REPLACE BATTERY</text>
         </g>
 
         <!-- LCD -->
@@ -16128,12 +16132,27 @@ function upsLiveCardHtml(data) {
     const err = data.last_error;
     const age = live ? Math.max(0, Math.floor(Date.now() / 1000) - live.read_at) : null;
     let footer = '';
+    if (!err && live && live.replace_battery) {
+        const why = [];
+        if (live.battery_packs_bad) why.push(`${live.battery_packs_bad} bad battery pack(s)`);
+        if (live.test_result) why.push(`${live.test_failed ? 'battery self-test FAILED' : 'last self-test'}: ${live.test_result}`);
+        if (live.battery_date) why.push(`battery installed: ${live.battery_date}`);
+        footer += `<div style="margin-top:10px;padding:10px 12px;border:1px solid var(--danger);border-radius:8px;font-size:13px;">
+            <strong style="color:var(--danger);">Battery needs replacing.</strong>
+            The UPS is flagging its battery as worn out${why.length ? ' (' + escapeHtml(why.join('; ')) + ')' : ''}.
+            It may not hold the load through the next power cut, even if the charge shows 100%.
+        </div>`;
+    }
     if (err) {
-        footer = `<div style="color:var(--danger);font-size:12px;margin-top:10px;">${escapeHtml(err)}</div>`;
+        footer += `<div style="color:var(--danger);font-size:12px;margin-top:10px;">${escapeHtml(err)}</div>`;
     } else if (live) {
-        footer = `<div style="font-size:11px;color:var(--text-muted);margin-top:10px;">Raw status: <code>${escapeHtml(live.status || '?')}</code> · read ${age}s ago${data.on_battery_since ? ` · on battery since ${new Date(data.on_battery_since * 1000).toLocaleTimeString()}` : ''}${(data.fired_stages || []).length ? ` · stages fired this outage: ${data.fired_stages.map(p => '≤' + p + '%').join(', ')}` : ''}</div>`;
-    } else if (data.config && data.config.enabled && data.config.ups) {
-        footer = `<div style="color:var(--text-muted);font-size:12px;margin-top:10px;">The engine polls every ${data.config.poll_secs}s.</div>`;
+        const extras = [
+            live.test_result ? `last self-test: ${escapeHtml(live.test_result)}` : '',
+            live.alarm ? `alarm: ${escapeHtml(live.alarm)}` : '',
+        ].filter(Boolean).map(x => ' · ' + x).join('');
+        footer += `<div style="font-size:11px;color:var(--text-muted);margin-top:10px;">Raw status: <code>${escapeHtml(live.status || '?')}</code> · read ${age}s ago${extras}${data.on_battery_since ? ` · on battery since ${new Date(data.on_battery_since * 1000).toLocaleTimeString()}` : ''}${(data.fired_stages || []).length ? ` · stages fired this outage: ${data.fired_stages.map(p => '≤' + p + '%').join(', ')}` : ''}</div>`;
+    } else if (data.config && data.config.ups) {
+        footer += `<div style="color:var(--text-muted);font-size:12px;margin-top:10px;">The engine polls every ${data.config.poll_secs}s.</div>`;
     }
     return upsFaceplateSvg(data) + footer;
 }
@@ -16142,7 +16161,7 @@ function upsLogRowsHtml(log) {
     if (!log.length) {
         return '<tr><td colspan="3" style="color:var(--text-muted);text-align:center;padding:14px;">No UPS events yet</td></tr>';
     }
-    const kindColor = { on_battery: 'var(--warning)', online: 'var(--success)', stage: 'var(--danger)', action: 'var(--info)', error: 'var(--danger)' };
+    const kindColor = { on_battery: 'var(--warning)', online: 'var(--success)', stage: 'var(--danger)', action: 'var(--info)', error: 'var(--danger)', battery: 'var(--danger)' };
     return log.map(e => `
         <tr style="border-bottom:1px solid var(--border);">
             <td style="padding:6px 10px;white-space:nowrap;font-size:12px;color:var(--text-muted);">${new Date(e.timestamp * 1000).toLocaleString()}</td>
@@ -16219,6 +16238,11 @@ function upsRenderPage(el, data) {
                     While on battery, each stage fires once when the charge drops to its threshold —
                     wind workloads down gently before the battery runs out. WolfStack only reads your
                     NUT server via <code>upsc</code>; upsd/upsmon stay exactly as you configured them.
+                </p>
+                <p style="font-size:13px;color:var(--text-secondary);">
+                    Once a UPS is saved here it is always monitored: its status and battery health show on
+                    this page, in Issues and in the Predictive Inbox. <strong>Enabled</strong> turns on the
+                    on-battery alerts and the shutdown stages below.
                 </p>
                 <div style="display:grid;grid-template-columns:auto 1fr auto auto;gap:14px;align-items:end;margin-bottom:14px;">
                     <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding-bottom:8px;">
