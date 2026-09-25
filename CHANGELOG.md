@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.33.0: Wake-on-LAN — power on machines on your network from the dashboard** _(2026-09-25 — [`a2830e95`](https://github.com/intelligentwolf/WolfStack/commit/a2830e95b91e900405203ca113705098b1c52bd4))_
 - **v25.32.0: make Predictive Inbox snooze, dismiss and ack findable, and make them stick** _(2026-09-23 — [`5eda28fd`](https://github.com/intelligentwolf/WolfStack/commit/5eda28fd3cf9585241fe97989287541c7f8a0f04))_
 - **v25.31.0: keep mount exclusions on "back up everything" schedules** _(2026-09-19 — [`f9e99143`](https://github.com/intelligentwolf/WolfStack/commit/f9e99143ab4900fb96693aed5095ca2c1180b157))_
 - **v25.30.1: show Local AI resource usage without chat content** _(2026-09-17 — [`54fc3c1f`](https://github.com/intelligentwolf/WolfStack/commit/54fc3c1f9c9dc4107052f9b26a0512cba0cb983c))_
