@@ -4508,6 +4508,9 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item networkmap-cluster-item" data-cluster="${escapedName}" data-view="network-map" onclick="showNetworkMapForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="share-2" style="font-size:15px;"></span> <span style="font-weight:600;">Network Map</span>
                 </a>
+                <a class="nav-item server-child-item wol-cluster-item" data-cluster="${escapedName}" data-view="wol" onclick="showWolPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                    <span class="icon ws-icon-clean-wrap" data-icon="power" style="font-size:15px;"></span> <span style="font-weight:600;">Wake-on-LAN</span>
+                </a>
                 <a class="nav-item server-child-item galera-cluster-item" data-cluster="${escapedName}" data-view="galera-cluster" onclick="showGaleraForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="database" style="font-size:15px;"></span> <span style="font-weight:600;">Galera</span>
                 </a>
@@ -41537,6 +41540,398 @@ async function unraidDelete(id) {
 }
 window.showUnraidForCluster = showUnraidForCluster;
 
+// ═══════════════════════════════════════════════════
+// Wake-on-LAN (cluster page)
+// ═══════════════════════════════════════════════════
+// A magic packet only reaches its own LAN, so each node stores the
+// machines it sends to (src/wol.rs) and this page gathers every node's
+// list through the node proxy. Wake is always sent by the owning node.
+
+let wolCurrentCluster = '';
+let wolRows = [];            // [{ node, target, up }] — up: true | false | null
+let wolRefreshTimer = null;
+// Node ids whose WolfStack predates Wake-on-LAN (the route 404s). They
+// are named in the notice and left out of the "Send from node" choice.
+let wolUnsupported = new Set();
+// `${nodeId}/${targetId}` → ms timestamp of the last Wake click, so a
+// machine that is still booting reads "Waking…" rather than "Offline".
+const wolWaking = new Map();
+const WOL_WAKE_WINDOW_MS = 5 * 60 * 1000;
+
+function showWolPage(clusterName) {
+    if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
+    wolCurrentCluster = clusterName;
+    currentPage = 'wol';
+    currentNodeId = null;
+    currentComponent = null;
+
+    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+    const el = document.getElementById('page-wol');
+    if (el) el.style.display = 'block';
+
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const item = document.querySelector(`.wol-cluster-item[data-cluster="${CSS.escape(clusterName)}"]`);
+    if (item) item.classList.add('active');
+
+    document.getElementById('page-title').textContent = `Wake-on-LAN — ${clusterName}`;
+    document.getElementById('wol-cluster-label').textContent = `— ${clusterName}`;
+
+    loadWolPage();
+
+    // Full reload, not just status: a node that was unreachable comes
+    // back with its machines, and machines added from another session
+    // appear. Each round is one list + one status call per node.
+    if (wolRefreshTimer) clearInterval(wolRefreshTimer);
+    wolRefreshTimer = setInterval(() => {
+        if (currentPage === 'wol') loadWolPage();
+        else { clearInterval(wolRefreshTimer); wolRefreshTimer = null; }
+    }, 10000);
+}
+
+function wolKey(nodeId, targetId) { return `${nodeId}/${targetId}`; }
+
+async function wolFetchJson(url, opts) {
+    const r = await fetch(url, opts);
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || (d && d.error)) {
+        const err = new Error((d && d.error) || `HTTP ${r.status}`);
+        err.status = r.status;
+        throw err;
+    }
+    return d;
+}
+
+async function loadWolPage() {
+    const content = document.getElementById('wol-content');
+    if (!content) return;
+    const nodes = getClusterNodes(wolCurrentCluster);
+    const online = nodes.filter(n => n.online);
+    const results = await Promise.all(online.map(async node => {
+        try {
+            const [list, status] = await Promise.all([
+                wolFetchJson(nodeApiUrl(node.id, '/api/wol/targets')),
+                wolFetchJson(nodeApiUrl(node.id, '/api/wol/status')).catch(() => ({})),
+            ]);
+            return { node, targets: list.targets || [], status };
+        } catch (e) {
+            // The list route has no id in it, so a 404 can only mean the
+            // node runs a WolfStack from before Wake-on-LAN existed.
+            if (e && e.status === 404) return { node, unsupported: true };
+            return { node, error: (e && e.message) || String(e) };
+        }
+    }));
+    if (currentPage !== 'wol') return;
+
+    wolRows = [];
+    wolUnsupported = new Set(results.filter(r => r.unsupported).map(r => r.node.id));
+    const unreachable = nodes.filter(n => !n.online).map(n => nodeName(n));
+    const outdated = results.filter(r => r.unsupported).map(r => nodeName(r.node));
+    for (const r of results) {
+        if (r.unsupported) continue;
+        if (r.error) { unreachable.push(`${nodeName(r.node)} (${r.error})`); continue; }
+        for (const t of r.targets) {
+            wolRows.push({ node: r.node, target: t, up: r.status ? r.status[t.id] : null });
+        }
+    }
+    wolRows.sort((a, b) => a.target.name.localeCompare(b.target.name));
+
+    const notice = document.getElementById('wol-notice');
+    if (notice) {
+        const box = html => `<div class="card" style="margin-bottom:16px; border-color:var(--warning);"><div class="card-body" style="padding:12px 16px; font-size:14px; color:var(--text-primary);">${html}</div></div>`;
+        notice.innerHTML =
+            (unreachable.length
+                ? box(`<strong>⚠ Machines on these nodes are not listed</strong> because the node could not be reached: ${unreachable.map(escapeHtml).join(', ')}.`)
+                : '') +
+            (outdated.length
+                ? box(`<strong>⚠ These nodes run an older WolfStack without Wake-on-LAN:</strong> ${outdated.map(escapeHtml).join(', ')}. Upgrade them to send wake signals from them.`)
+                : '');
+    }
+    renderWolTable();
+}
+
+// Status cell: a word plus a coloured dot, never colour alone.
+function wolStatusHtml(row) {
+    const key = wolKey(row.node.id, row.target.id);
+    const wokeAt = wolWaking.get(key);
+    if (row.up === true) {
+        wolWaking.delete(key);
+        return `<span style="color:var(--success); font-weight:600;">● Online</span>`;
+    }
+    if (row.up === null || row.up === undefined) {
+        return wokeAt
+            ? `<span style="color:var(--text-secondary);">Wake signal sent</span>`
+            : `<span style="color:var(--text-secondary);" title="Add an IP address or hostname to see whether this machine is up">Unknown</span>`;
+    }
+    if (wokeAt && Date.now() - wokeAt < WOL_WAKE_WINDOW_MS) {
+        return `<span style="color:var(--warning); font-weight:600;">◐ Waking…</span>`;
+    }
+    if (wokeAt) {
+        return `<span style="color:var(--danger); font-weight:600;">○ Still offline</span>
+                <div style="font-size:12px; color:var(--text-secondary); margin-top:2px; max-width:32ch;">Not up 5 minutes after waking. Check Wake-on-LAN is enabled in the BIOS and on the network card, and that this node is on the machine's network.</div>`;
+    }
+    return `<span style="color:var(--text-secondary);">○ Offline</span>`;
+}
+
+function renderWolTable() {
+    const content = document.getElementById('wol-content');
+    if (!content) return;
+    content.setAttribute('aria-busy', 'false');
+    if (!wolRows.length) {
+        content.innerHTML = `<div style="padding:32px 24px; text-align:center;">
+            <h3 style="margin:0 0 8px; font-size:16px; color:var(--text-primary);">No machines yet</h3>
+            <p style="margin:0 auto 16px; max-width:60ch; font-size:14px; color:var(--text-secondary);">Add a machine by its network card's MAC address, and choose a node on the same network to send the wake signal.</p>
+            <button class="btn btn-primary" onclick="openWolDialog()">+ Add machine</button>
+        </div>`;
+        return;
+    }
+    // The 10s refresh replaces the table; put keyboard focus back on the
+    // same button so a keyboard user is not thrown to the top of the page.
+    const focused = content.contains(document.activeElement) ? document.activeElement : null;
+    const refocus = focused && focused.dataset.wolKey
+        ? { key: focused.dataset.wolKey, action: focused.dataset.wolAction } : null;
+    const multiNode = getClusterNodes(wolCurrentCluster).length > 1;
+    const rows = wolRows.map(row => {
+        const t = row.target;
+        const key = escapeAttr(wolKey(row.node.id, t.id));
+        return `<tr>
+            <th scope="row" style="position:sticky; left:0; background:var(--bg-card); text-align:left; font-weight:600; font-size:14px; text-transform:none; letter-spacing:normal; color:var(--text-primary); padding:10px 12px; border-bottom:1px solid var(--border);">${escapeHtml(t.name)}
+                ${t.host ? `<div style="font-weight:400; font-size:12px; color:var(--text-secondary);">${escapeHtml(t.host)}</div>` : ''}</th>
+            <td class="mono">${escapeHtml(t.mac)}</td>
+            ${multiNode ? `<td>${escapeHtml(nodeName(row.node))}</td>` : ''}
+            <td>${wolStatusHtml(row)}</td>
+            <td style="white-space:nowrap; text-align:right;">
+                <button class="btn btn-primary btn-sm" data-wol-key="${key}" data-wol-action="wake" onclick="wolWake(this.dataset.wolKey, this)" aria-label="Wake ${escapeAttr(t.name)}">Wake</button>
+                <button class="btn btn-sm" data-wol-key="${key}" data-wol-action="edit" onclick="openWolDialog(this.dataset.wolKey)" aria-label="Edit ${escapeAttr(t.name)}">Edit</button>
+                <button class="btn btn-sm" style="margin-left:12px; color:var(--danger);" data-wol-key="${key}" data-wol-action="remove" onclick="wolRemove(this.dataset.wolKey)" aria-label="Remove ${escapeAttr(t.name)}">Remove</button>
+            </td>
+        </tr>`;
+    }).join('');
+    // position:relative keeps the visually-hidden caption and "Actions"
+    // label (position:absolute) inside the scroll box — without it they
+    // escape the clip and the whole page scrolls sideways on a phone.
+    content.innerHTML = `<div style="overflow-x:auto; position:relative;">
+        <table class="data-table" style="min-width:560px;">
+            <caption style="position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);">Machines that can be woken</caption>
+            <thead><tr>
+                <th scope="col" style="position:sticky; left:0; background:var(--bg-card);">Machine</th>
+                <th scope="col">MAC address</th>
+                ${multiNode ? '<th scope="col">Sent from</th>' : ''}
+                <th scope="col">Status</th>
+                <th scope="col"><span style="position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);">Actions</span></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+    </div>`;
+    if (refocus) {
+        const again = [...content.querySelectorAll('[data-wol-key]')]
+            .find(el => el.dataset.wolKey === refocus.key && el.dataset.wolAction === refocus.action);
+        if (again) again.focus();
+    }
+}
+
+function wolRowByKey(key) {
+    return wolRows.find(r => wolKey(r.node.id, r.target.id) === key) || null;
+}
+
+async function wolWake(key, btn) {
+    const row = wolRowByKey(key);
+    if (!row) return;
+    const t = row.target;
+    if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+    try {
+        await wolFetchJson(nodeApiUrl(row.node.id, `/api/wol/targets/${encodeURIComponent(t.id)}/wake`), { method: 'POST' });
+        wolWaking.set(wolKey(row.node.id, t.id), Date.now());
+        const tail = t.host
+            ? 'Its status will change to Online once it has started — usually within a minute.'
+            : 'Add an IP address to this machine to see when it comes up.';
+        showToast(`Wake signal sent to ${t.name} from ${nodeName(row.node)}. ${tail}`, 'success', 8000);
+        renderWolTable();
+    } catch (e) {
+        showToast(`Could not wake ${t.name}: ${(e && e.message) || e}`, 'error', 0);
+        if (btn) { btn.disabled = false; btn.textContent = 'Wake'; }
+    }
+}
+
+async function wolRemove(key) {
+    const row = wolRowByKey(key);
+    if (!row) return;
+    const t = row.target;
+    const ok = await wolfConfirm(
+        `Remove ${t.name} (${t.mac}) from Wake-on-LAN? The machine itself is not touched; you can add it again at any time.`,
+        'Remove machine', { okText: 'Remove', danger: true });
+    if (!ok) return;
+    try {
+        await wolFetchJson(nodeApiUrl(row.node.id, `/api/wol/targets/${encodeURIComponent(t.id)}`), { method: 'DELETE' });
+        wolWaking.delete(wolKey(row.node.id, t.id));
+        showToast(`${t.name} removed`, 'success');
+        loadWolPage();
+    } catch (e) {
+        showToast(`Could not remove ${t.name}: ${(e && e.message) || e}`, 'error', 0);
+    }
+}
+
+// ── Add / edit dialog ──────────────────────────────────────────────
+
+let wolDialogReturnFocus = null;
+
+function closeWolDialog() {
+    const overlay = document.getElementById('wol-dialog-overlay');
+    if (overlay) overlay.remove();
+    document.removeEventListener('keydown', wolDialogKeydown, true);
+    if (wolDialogReturnFocus && document.contains(wolDialogReturnFocus)) wolDialogReturnFocus.focus();
+    wolDialogReturnFocus = null;
+}
+
+// Escape closes; Tab stays inside the dialog.
+function wolDialogKeydown(e) {
+    const dialog = document.getElementById('wol-dialog');
+    if (!dialog) return;
+    if (e.key === 'Escape') { e.preventDefault(); closeWolDialog(); return; }
+    if (e.key !== 'Tab') return;
+    const focusable = [...dialog.querySelectorAll('button, input, select, summary, [tabindex]:not([tabindex="-1"])')]
+        .filter(el => !el.disabled && el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+// Same spellings src/wol.rs parse_mac accepts; the server re-checks.
+function wolMacValid(s) {
+    const hex = (s || '').trim().replace(/[:.\-]/g, '');
+    return /^[0-9a-fA-F]{12}$/.test(hex);
+}
+
+// No key = add; a row key = edit that row.
+function openWolDialog(key) {
+    closeWolDialog();
+    const editing = key ? wolRowByKey(key) : null;
+    const t = editing ? editing.target : { name: '', mac: '', host: '', broadcast: '', port: 9 };
+    const nodes = getClusterNodes(wolCurrentCluster).filter(n => n.online && !wolUnsupported.has(n.id));
+    if (!editing && !nodes.length) {
+        showToast('No node in this cluster can send wake signals: none is online with a WolfStack version that has Wake-on-LAN.', 'error', 0);
+        return;
+    }
+    wolDialogReturnFocus = document.activeElement;
+    const nodeOptions = editing
+        ? `<option value="${escapeAttr(editing.node.id)}" selected>${escapeHtml(nodeName(editing.node))}</option>`
+        : nodes.map(n => `<option value="${escapeAttr(n.id)}"${n.is_self ? ' selected' : ''}>${escapeHtml(nodeName(n))}</option>`).join('');
+    const field = (id, label, hint, input) => `
+        <div class="form-group">
+            <label for="${id}">${label}</label>
+            ${input}
+            ${hint ? `<div id="${id}-hint" style="font-size:12px; color:var(--text-secondary); margin-top:4px;">${hint}</div>` : ''}
+            <div id="${id}-error" style="display:none; font-size:13px; color:var(--danger); margin-top:4px;"></div>
+        </div>`;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'wol-dialog-overlay';
+    overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100000; display:flex; align-items:flex-start; justify-content:center; padding:5vh 16px; overflow-y:auto;';
+    overlay.addEventListener('mousedown', e => { if (e.target === overlay) closeWolDialog(); });
+    overlay.innerHTML = `
+        <div id="wol-dialog" role="dialog" aria-modal="true" aria-labelledby="wol-dialog-title"
+             style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:24px; max-width:520px; width:100%; color:var(--text-primary);">
+            <h2 id="wol-dialog-title" style="font-size:18px; margin:0 0 16px;">${editing ? `Edit ${escapeHtml(t.name)}` : 'Add machine'}</h2>
+            <div id="wol-form-error" role="alert" tabindex="-1" style="display:none; margin-bottom:16px; padding:10px 12px; border:1px solid var(--danger); border-radius:8px; background:var(--danger-bg); font-size:14px;"></div>
+            <form id="wol-form" novalidate>
+                ${field('wol-name', 'Name', '', `<input id="wol-name" class="form-control" maxlength="80" autocomplete="off" value="${escapeAttr(t.name)}" placeholder="e.g. GPU desktop">`)}
+                ${field('wol-mac', 'MAC address', 'The wired network card of the machine to wake, e.g. 3c:7c:3f:12:ab:cd. Wake-on-LAN must be enabled in its BIOS.',
+                    `<input id="wol-mac" class="form-control" autocomplete="off" spellcheck="false" value="${escapeAttr(t.mac)}" aria-describedby="wol-mac-hint">`)}
+                ${field('wol-node', 'Send from node', editing
+                        ? 'To send from a different node, remove this machine and add it again on that node.'
+                        : 'Must be on the same network as the machine — wake signals do not cross routers.',
+                    `<select id="wol-node" class="form-control" aria-describedby="wol-node-hint"${editing ? ' disabled' : ''}>${nodeOptions}</select>`)}
+                ${field('wol-host', 'IP address or hostname <span style="font-weight:400;">(optional)</span>', 'Pinged from the node to show whether the machine is up.',
+                    `<input id="wol-host" class="form-control" autocomplete="off" spellcheck="false" value="${escapeAttr(t.host)}" placeholder="e.g. 192.168.1.50" aria-describedby="wol-host-hint">`)}
+                <details style="margin-bottom:16px;"${t.broadcast || (t.port && t.port !== 9) ? ' open' : ''}>
+                    <summary style="cursor:pointer; font-size:14px; color:var(--text-secondary); margin-bottom:12px;">Advanced</summary>
+                    ${field('wol-broadcast', 'Broadcast address <span style="font-weight:400;">(optional)</span>', 'Leave blank to send on every network the node is on. Set it (e.g. 192.168.1.255) to send on one network only.',
+                        `<input id="wol-broadcast" class="form-control" autocomplete="off" spellcheck="false" value="${escapeAttr(t.broadcast)}" aria-describedby="wol-broadcast-hint">`)}
+                    ${field('wol-port', 'UDP port', 'Usually 9. Some machines listen on 7.',
+                        `<input id="wol-port" class="form-control" type="number" min="1" max="65535" value="${escapeAttr(String(t.port || 9))}" aria-describedby="wol-port-hint">`)}
+                </details>
+                <div style="display:flex; justify-content:flex-end; gap:10px;">
+                    <button type="button" class="btn" onclick="closeWolDialog()">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="wol-save-btn">${editing ? 'Save changes' : 'Add machine'}</button>
+                </div>
+            </form>
+        </div>`;
+    (document.fullscreenElement || document.body).appendChild(overlay);
+    document.addEventListener('keydown', wolDialogKeydown, true);
+    document.getElementById('wol-form').addEventListener('submit', e => { e.preventDefault(); saveWolDialog(editing); });
+    document.getElementById('wol-name').focus();
+}
+
+function wolSetFieldError(id, msg) {
+    const input = document.getElementById(id);
+    const err = document.getElementById(`${id}-error`);
+    if (!input || !err) return;
+    const hint = document.getElementById(`${id}-hint`) ? `${id}-hint` : '';
+    if (msg) {
+        err.textContent = msg;
+        err.style.display = 'block';
+        input.setAttribute('aria-invalid', 'true');
+        input.setAttribute('aria-describedby', [`${id}-error`, hint].filter(Boolean).join(' '));
+    } else {
+        err.textContent = '';
+        err.style.display = 'none';
+        input.removeAttribute('aria-invalid');
+        if (hint) input.setAttribute('aria-describedby', hint); else input.removeAttribute('aria-describedby');
+    }
+}
+
+async function saveWolDialog(editing) {
+    const val = id => (document.getElementById(id).value || '').trim();
+    const body = {
+        name: val('wol-name'),
+        mac: val('wol-mac'),
+        host: val('wol-host'),
+        broadcast: val('wol-broadcast'),
+        port: parseInt(val('wol-port'), 10),
+    };
+    const summary = document.getElementById('wol-form-error');
+    summary.style.display = 'none';
+
+    const errors = [];
+    const check = (id, msg) => { wolSetFieldError(id, msg); if (msg) errors.push({ id, msg }); };
+    check('wol-name', body.name ? '' : 'Enter a name for the machine.');
+    check('wol-mac', wolMacValid(body.mac) ? '' : 'Enter a MAC address as six pairs of hex digits, e.g. 3c:7c:3f:12:ab:cd.');
+    check('wol-port', Number.isInteger(body.port) && body.port >= 1 && body.port <= 65535 ? '' : 'Enter a port from 1 to 65535.');
+    if (errors.length) {
+        // A hidden field inside a closed <details> cannot take focus.
+        if (errors.some(e => e.id === 'wol-port')) document.querySelector('#wol-dialog details').open = true;
+        summary.innerHTML = `<strong>Please fix ${errors.length === 1 ? 'this' : 'these'}:</strong><ul style="margin:6px 0 0; padding-left:18px;">${
+            errors.map(e => `<li><a href="#${e.id}" onclick="event.preventDefault(); document.getElementById('${e.id}').focus();" style="color:inherit;">${escapeHtml(e.msg)}</a></li>`).join('')}</ul>`;
+        summary.style.display = 'block';
+        summary.focus();
+        return;
+    }
+
+    const nodeId = editing ? editing.node.id : val('wol-node');
+    const url = editing
+        ? nodeApiUrl(nodeId, `/api/wol/targets/${encodeURIComponent(editing.target.id)}`)
+        : nodeApiUrl(nodeId, '/api/wol/targets');
+    const btn = document.getElementById('wol-save-btn');
+    btn.disabled = true;
+    try {
+        await wolFetchJson(url, {
+            method: editing ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        closeWolDialog();
+        showToast(editing ? `${body.name} saved` : `${body.name} added`, 'success');
+        loadWolPage();
+    } catch (e) {
+        // The server's message names the field (bad MAC, duplicate, bad
+        // broadcast…), so show it verbatim in the summary.
+        summary.textContent = (e && e.message) || String(e);
+        summary.style.display = 'block';
+        summary.focus();
+        btn.disabled = false;
+    }
+}
+
 function showClusterBackupsPage(clusterName) {
     closeSidebarMobile();
     clusterBackupsCurrentCluster = clusterName;
@@ -69343,6 +69738,7 @@ const DOCS_PAGE_MAP = {
     'cluster-backups': 'wolfstack-backups.php',
     wolffunctions: 'wolffunctions.php',
     'network-map': 'wolfstack-networking.php',
+    wol: 'wolfstack-networking.php#wake-on-lan',
     wolfrun: 'wolfrun.php',
     'wolfdisk-cluster': 'wolfdisk.php',
     statuspage: 'wolfstack-statuspage.php',
@@ -84405,6 +84801,7 @@ function fleetMenuGroups() {
                 { label: 'Shares', action: () => showSharesForCluster(fleetMenuDefaultCluster()) },
                 { label: 'Cluster Browser', action: go('cluster-browser') },
                 { label: 'Internet Exposure', action: go('exposure') },
+                { label: 'Wake-on-LAN', action: () => showWolPage(fleetMenuDefaultCluster()), badge: 'New' },
             ],
         },
         {

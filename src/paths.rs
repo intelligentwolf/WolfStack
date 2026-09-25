@@ -191,6 +191,10 @@ pub struct FileLocations {
     #[serde(default = "default_sql_audit_log")]
     pub sql_audit_log: String,
 
+    // ── Wake-on-LAN targets (per node, never replicated) ──
+    #[serde(default = "default_wol_targets_config")]
+    pub wol_targets_config: String,
+
     // ── Fleet Logs (loghub) ───────────────────────
     // Bulk log-segment store lives under the data dir, NOT /etc — it grows
     // and is not config. Config (enable/hub/retention) is a small JSON file.
@@ -370,6 +374,8 @@ fn default_ports_config() -> String { "/etc/wolfstack/ports.json".into() }
 
 fn default_sql_connections_config() -> String { "/etc/wolfstack/sql-connections.json".into() }
 fn default_sql_audit_log() -> String { "/var/log/wolfstack/sql-audit.log".into() }
+
+fn default_wol_targets_config() -> String { "/etc/wolfstack/wol-targets.json".into() }
 
 fn default_loghub_dir() -> String { "/var/lib/wolfstack/loghub".into() }
 fn default_loghub_config() -> String { "/etc/wolfstack/loghub.json".into() }
