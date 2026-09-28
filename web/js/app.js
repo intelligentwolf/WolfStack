@@ -37625,10 +37625,22 @@ function toggleStopForBackup(type, name, prefix, checked) {
     if (checked) map[key] = true; else delete map[key];
 }
 
+// Per-VM "keep running (live backup)" flags, split page/modal the same way.
+let _backupKeepMap = {};
+let _scheduleKeepMap = {};
+function keepMapFor(prefix) { return prefix === 'sched-' ? _scheduleKeepMap : _backupKeepMap; }
+function toggleKeepRunning(type, name, prefix, checked) {
+    const map = keepMapFor(prefix);
+    const key = `${type}:${name}`;
+    if (checked) map[key] = true; else delete map[key];
+}
+
 // Why a per-container tick is inert under "back up everything" — shown as the
 // tooltip on the greyed rows and kept in one place so the two spots agree.
 const STOP_FOR_BACKUP_COVERED_TIP =
     'Covered by "Stop each container for a cold backup" while "back up everything" is on.';
+const KEEP_RUNNING_COVERED_TIP =
+    'Covered by "Keep each VM running" while "back up everything" is on.';
 
 // Checkbox row for container targets (LXC + Docker): opt IN to stopping the
 // container for the backup. Default (unticked) backs it up live. For LXC on
@@ -37641,14 +37653,20 @@ const STOP_FOR_BACKUP_COVERED_TIP =
 // there has nothing to attach to and used to be discarded on save (JJ
 // 2026-08-19). The schedule-level "Stop each container" flag covers that case.
 function renderStopForBackupOption(t, prefix, disabled = false) {
-    // VMs have no hot path: every backend (Proxmox, libvirt, native QEMU)
-    // shuts a running VM down for the disk copy and starts it again after.
-    // Say so on the row, since there is no box to find (RutgerDiehard
-    // 2026-09-26 looked for one).
+    // VMs: opt IN to keeping a running VM up (RutgerDiehard 2026-09-26).
+    // Unticked is the fully consistent default every backend already had —
+    // shut down for the copy, started again after.
     if (t.type === 'vm') {
-        return `<div style="margin-top:3px; font-size:11px; color:var(--text-muted);${prefix ? ' padding-left:24px;' : ''}">
-            A running VM is shut down for its backup, then started again
-        </div>`;
+        const key = `${t.type}:${t.name}`;
+        const checked = keepMapFor(prefix)[key] ? 'checked' : '';
+        const tip = "Ticked: the VM keeps running and its disks are copied as of one instant — crash-consistent, like pulling the power at that moment, so the guest checks its disks on restore as it would after a power cut. Unticked (default): a running VM is shut down for the copy, then started again — fully consistent. A stopped VM is copied as it is either way.";
+        return `<div style="margin-top:3px;${prefix ? ' padding-left:24px;' : ''}">
+        <label data-keep-running-row data-keep-tip="${escapeHtml(tip)}" style="font-size:11px; color:var(--text-muted); display:inline-flex; align-items:center; gap:5px; cursor:pointer;${disabled ? ' opacity:0.5;' : ''}"
+               title="${escapeHtml(disabled ? KEEP_RUNNING_COVERED_TIP : tip)}">
+            <input type="checkbox" ${checked} ${disabled ? 'disabled' : ''} onchange="toggleKeepRunning('${escapeHtml(t.type)}','${escapeHtml(t.name)}','${prefix}', this.checked)">
+            Keep VM running (live backup)
+        </label>
+    </div>`;
     }
     if (t.type !== 'lxc' && t.type !== 'docker') return '';
     const key = `${t.type}:${t.name}`;
@@ -37925,6 +37943,7 @@ function getSelectedTargets() {
             const excl = _backupExcludeMap[key];
             if (Array.isArray(excl) && excl.length) t.exclude_mounts = excl;
             if (_backupStopMap[key]) t.stop_for_backup = true;
+            if (_backupKeepMap[key]) t.keep_running = true;
             targets.push(t);
         } catch (e) { }
     });
@@ -38003,6 +38022,7 @@ function getScheduleTargets() {
             const excl = _scheduleExcludeMap[key];
             if (Array.isArray(excl) && excl.length) t.exclude_mounts = excl;
             if (_scheduleStopMap[key]) t.stop_for_backup = true;
+            if (_scheduleKeepMap[key]) t.keep_running = true;
             out.push(t);
         } catch (e) { console.warn('getScheduleTargets: bad checkbox value', e); }
     });
@@ -38079,6 +38099,16 @@ function onScheduleBackupAllToggle(checked) {
 function setScheduleStopContainersMode(backupAll) {
     const row = document.getElementById('schedule-stop-containers-row');
     if (row) row.style.display = backupAll ? 'flex' : 'none';
+    const vmRow = document.getElementById('schedule-keep-vms-running-row');
+    if (vmRow) vmRow.style.display = backupAll ? 'flex' : 'none';
+    document.querySelectorAll('#schedule-target-list [data-keep-running-row]').forEach(label => {
+        const cb = label.querySelector('input[type=checkbox]');
+        if (cb) cb.disabled = !!backupAll;
+        label.style.opacity = backupAll ? '0.5' : '';
+        label.title = backupAll
+            ? KEEP_RUNNING_COVERED_TIP
+            : (label.getAttribute('data-keep-tip') || '');
+    });
     document.querySelectorAll('#schedule-target-list [data-stop-for-backup-row]').forEach(label => {
         const cb = label.querySelector('input[type=checkbox]');
         if (cb) cb.disabled = !!backupAll;
@@ -38707,6 +38737,8 @@ function editSchedule(id) {
     setScheduleDayFields(s.frequency, s.day_of_week, s.day_of_month);
     const stopAllEl = document.getElementById('schedule-stop-containers');
     if (stopAllEl) stopAllEl.checked = !!s.stop_containers;
+    const keepAllEl = document.getElementById('schedule-keep-vms-running');
+    if (keepAllEl) keepAllEl.checked = !!s.keep_vms_running;
     setScheduleStopContainersMode(!!s.backup_all);
 
     const schedTargets = Array.isArray(s.targets) ? s.targets : [];
@@ -38715,12 +38747,16 @@ function editSchedule(id) {
     // choices don't carry over).
     _scheduleExcludeMap = {};
     _scheduleStopMap = {};
+    _scheduleKeepMap = {};
     schedTargets.forEach(t => {
         if (t && Array.isArray(t.exclude_mounts) && t.exclude_mounts.length) {
             _scheduleExcludeMap[`${t.type}:${t.name}`] = t.exclude_mounts.slice();
         }
         if (t && t.stop_for_backup) {
             _scheduleStopMap[`${t.type}:${t.name}`] = true;
+        }
+        if (t && t.keep_running) {
+            _scheduleKeepMap[`${t.type}:${t.name}`] = true;
         }
     });
 
@@ -38978,6 +39014,8 @@ async function scheduleSystemFolder() {
     setScheduleDayFields((document.getElementById('schedule-frequency') || {}).value, null, null);
     const stopAllEl = document.getElementById('schedule-stop-containers');
     if (stopAllEl) stopAllEl.checked = false;
+    const keepAllEl = document.getElementById('schedule-keep-vms-running');
+    if (keepAllEl) keepAllEl.checked = false;
     setScheduleStopContainersMode(false);
     document.getElementById('create-schedule-modal').classList.add('active');
 }
@@ -39400,6 +39438,7 @@ async function showScheduleSelectedModal() {
     // so the page maps are untouched).
     _scheduleExcludeMap = Object.assign({}, _backupExcludeMap);
     _scheduleStopMap = Object.assign({}, _backupStopMap);
+    _scheduleKeepMap = Object.assign({}, _backupKeepMap);
     const targets = getSelectedTargets();
     if (targets.length === 0) {
         showToast('Please select at least one item to schedule', 'error');
@@ -39435,6 +39474,9 @@ async function showScheduleSelectedModal() {
     // rather than dropping it: if any selected container was marked for a cold
     // backup on the page, the schedule-level flag starts on.
     if (stopAllEl) stopAllEl.checked = allSelected && targets.some(t => t.stop_for_backup);
+    // Same carry-over for VMs marked "keep running" on the page.
+    const keepAllEl = document.getElementById('schedule-keep-vms-running');
+    if (keepAllEl) keepAllEl.checked = allSelected && targets.some(t => t.keep_running);
     setScheduleStopContainersMode(allSelected);
     document.getElementById('create-schedule-modal').classList.add('active');
 }
@@ -39534,6 +39576,9 @@ async function createSchedule() {
         // place that mode can express it, since it has no stored targets.
         stop_containers: backup_all
             && !!(document.getElementById('schedule-stop-containers') || {}).checked,
+        // Live VM backups for a "back up everything" schedule, for the same reason.
+        keep_vms_running: backup_all
+            && !!(document.getElementById('schedule-keep-vms-running') || {}).checked,
     };
     if (editing) body.id = editing.id; // update in place
 
@@ -42527,6 +42572,7 @@ async function pushClusterSchedule() {
     const scope = document.querySelector('input[name="cb-schedule-scope"]:checked')?.value || 'all';
     const days = getClusterScheduleDayFields();
     const stopContainers = !!(document.getElementById('cb-schedule-stop-containers') || {}).checked;
+    const keepVmsRunning = !!(document.getElementById('cb-schedule-keep-vms-running') || {}).checked;
 
     const selectedIds = [...document.querySelectorAll('.cb-sched-node-cb:checked')].map(cb => cb.value);
     if (selectedIds.length === 0) { showToast('No nodes selected', 'error'); return; }
@@ -42555,7 +42601,7 @@ async function pushClusterSchedule() {
     const summary = scope === 'all' ? 'backing up everything'
         : 'backing up selected targets';
     const dayLabel = formatScheduleRunDay({ frequency, day_of_week: days.day_of_week, day_of_month: days.day_of_month });
-    if (!await showConfirm(`Create schedule "${name}" (${frequency}${dayLabel ? ` on ${dayLabel}` : ''} at ${time} UTC${stopContainers ? ', containers stopped for a cold backup' : ''}) on ${nodes.length} node(s), ${summary}?\n\n${nodes.map(n => n.hostname).join(', ')}`)) return;
+    if (!await showConfirm(`Create schedule "${name}" (${frequency}${dayLabel ? ` on ${dayLabel}` : ''} at ${time} UTC${stopContainers ? ', containers stopped for a cold backup' : ''}${keepVmsRunning ? ', VMs kept running' : ''}) on ${nodes.length} node(s), ${summary}?\n\n${nodes.map(n => n.hostname).join(', ')}`)) return;
 
     await refreshBackupLocalDir();
     let storage;
@@ -42584,6 +42630,7 @@ async function pushClusterSchedule() {
             name, frequency, time, retention, storage,
             day_of_week: days.day_of_week, day_of_month: days.day_of_month,
             stop_containers: stopContainers,
+            keep_vms_running: keepVmsRunning,
         });
     }
 
@@ -42597,6 +42644,7 @@ async function pushClusterSchedule() {
                 backup_all: true, targets: [], storage, enabled: true,
                 day_of_week: days.day_of_week, day_of_month: days.day_of_month,
                 stop_containers: stopContainers,
+                keep_vms_running: keepVmsRunning,
                 scope: 'fleet',
                 target_nodes: nodes.map(n => n.id),
             }),
@@ -42627,7 +42675,7 @@ async function pushClusterSchedule() {
 // Per-node fallback for "select" scope, where each node gets a different
 // target list and so genuinely needs its own request.
 async function pushClusterSchedulePerNode(nodes, perNodeTargets, common) {
-    const { name, frequency, time, retention, storage, day_of_week, day_of_month, stop_containers } = common;
+    const { name, frequency, time, retention, storage, day_of_week, day_of_month, stop_containers, keep_vms_running } = common;
     let success = 0;
     const failures = [];
     const results = await Promise.allSettled(nodes.map(async (node) => {
@@ -42645,15 +42693,17 @@ async function pushClusterSchedulePerNode(nodes, perNodeTargets, common) {
         // the two modes carry it differently: a node whose whole target set was
         // selected runs in backup_all mode and takes the schedule-wide flag,
         // while a node with an explicit list carries the flag per container.
-        const coldTargets = stop_containers
-            ? targets.map(t => (t.type === 'docker' || t.type === 'lxc')
-                ? { ...t, stop_for_backup: true } : t)
-            : targets;
+        const coldTargets = targets.map(t => {
+            if (stop_containers && (t.type === 'docker' || t.type === 'lxc')) return { ...t, stop_for_backup: true };
+            if (keep_vms_running && t.type === 'vm') return { ...t, keep_running: true };
+            return t;
+        });
         const body = {
             name, frequency, time, retention, backup_all: backupAll,
             targets: coldTargets, storage, enabled: true,
             day_of_week, day_of_month,
             stop_containers: backupAll ? !!stop_containers : false,
+            keep_vms_running: backupAll ? !!keep_vms_running : false,
         };
         try {
             const res = await fetch(nodeApiUrl(node.id, '/api/backups/schedules'), {

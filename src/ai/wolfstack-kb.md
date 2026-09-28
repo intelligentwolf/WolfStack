@@ -173,6 +173,7 @@ Lambda-style functions instead of provisioning a container/VM. Definitions repli
 ## Backups
 - Scheduled backups with multiple destination types
 - Docker: commit + save + volume backup; LXC: full container backup; VM: disk image backup
+- VM backups: a running VM is shut down for the copy and started again (default, fully consistent). Per-VM "Keep VM running (live backup)" tick (schedule-wide "Keep each VM running" under Backup All) copies all disks at one instant while the VM runs — crash-consistent; QMP blockdev-backup (native), virsh backup-begin (libvirt), vzdump snapshot mode (Proxmox; skips backup=0 disks). Needs ~2× disk size free in backup staging. Native VM backups include extra disks, custom-storage OS disk, UEFI vars and TPM state (v25.34.0)
 - **Seven destination types**: Local, S3, Remote (another WolfStack node), WolfDisk, PBS (Proxmox Backup Server, including `pbs_file_level` pxar mode), NFS, SMB/CIFS
 - **PBS file-level (pxar)** applies to Docker, native LXC, system folders AND (v25.2.35) WolfStack config backups — PBS's own UI can then browse a snapshot and restore a single file. Config snapshots are per-node (`host/wolfstack-config-<hostname>`). VMs and Proxmox LXC can't (disk image / block rootfs) — the backup log states the fallback reason explicitly. WolfStack's own restore of a file-level config snapshot applies the usual same-/new-machine rules; per-FILE restore is done in the PBS UI
 - NFS/SMB backups mount the share idempotently under /mnt/wolfstack-backup/ and write through like Local

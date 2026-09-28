@@ -4732,6 +4732,12 @@
                             <input type="checkbox" id="cb-schedule-stop-containers">
                             Stop each container for a cold backup
                         </label>
+                        <!-- Live VM backups, schedule-wide for the same reason. -->
+                        <label style="display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; color:var(--text-secondary); cursor:pointer;"
+                               title="Ticked: each running VM keeps running and its disks are copied as of one instant — crash-consistent, like pulling the power at that moment. Unticked (default): a running VM is shut down for the copy, then started again — fully consistent.">
+                            <input type="checkbox" id="cb-schedule-keep-vms-running">
+                            Keep each VM running (live backup)
+                        </label>
                     </div>
                     <!-- Node selection for schedule -->
                     <div style="margin-bottom:16px;">
@@ -4902,6 +4908,15 @@
                                title="Ticked: every container is stopped while it is archived, then restarted — fully consistent (quiesced databases). Unticked (default): archived while running (crash-consistent). Proxmox LXC ignores this — vzdump snapshots there.">
                             <input type="checkbox" id="schedule-stop-containers">
                             Stop each container for a cold backup
+                        </label>
+                        <!-- The VM counterpart: per-VM "keep running" ticks have
+                             no stored target to ride on under "everything",
+                             so this one flag covers every VM. -->
+                        <label id="schedule-keep-vms-running-row"
+                               style="display:none; align-items:center; gap:8px; margin-top:6px; padding-left:22px; font-size:12px; color:var(--text-secondary); cursor:pointer;"
+                               title="Ticked: every running VM keeps running and its disks are copied as of one instant — crash-consistent, like pulling the power at that moment. Unticked (default): a running VM is shut down for the copy, then started again — fully consistent.">
+                            <input type="checkbox" id="schedule-keep-vms-running">
+                            Keep each VM running (live backup)
                         </label>
                     </div>
                     <p id="schedule-folder-summary" style="font-size:12px; color:var(--text-muted); display:none;"></p>
