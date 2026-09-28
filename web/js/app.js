@@ -37641,6 +37641,15 @@ const STOP_FOR_BACKUP_COVERED_TIP =
 // there has nothing to attach to and used to be discarded on save (JJ
 // 2026-08-19). The schedule-level "Stop each container" flag covers that case.
 function renderStopForBackupOption(t, prefix, disabled = false) {
+    // VMs have no hot path: every backend (Proxmox, libvirt, native QEMU)
+    // shuts a running VM down for the disk copy and starts it again after.
+    // Say so on the row, since there is no box to find (RutgerDiehard
+    // 2026-09-26 looked for one).
+    if (t.type === 'vm') {
+        return `<div style="margin-top:3px; font-size:11px; color:var(--text-muted);${prefix ? ' padding-left:24px;' : ''}">
+            A running VM is shut down for its backup, then started again
+        </div>`;
+    }
     if (t.type !== 'lxc' && t.type !== 'docker') return '';
     const key = `${t.type}:${t.name}`;
     const checked = stopMapFor(prefix)[key] ? 'checked' : '';

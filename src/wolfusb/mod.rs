@@ -1987,7 +1987,7 @@ fn passthrough_to_vm(vm_name: &str, busid: &str, dev_path: &str) -> Result<Strin
     // QMP isn't available (e.g. VMs spawned before v16.27 didn't have a
     // QMP socket).
     let running = Command::new("pgrep")
-        .args(["-af", &format!("qemu-system.*-name {}", vm_name)])
+        .args(["-af", &crate::vms::manager::qemu_process_pattern("qemu-system", vm_name)])
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
@@ -2032,7 +2032,7 @@ fn passthrough_to_vm(vm_name: &str, busid: &str, dev_path: &str) -> Result<Strin
         vm_name
     );
     let _ = Command::new("pkill")
-        .args(["-f", &format!("qemu-system.*-name {}", vm_name)])
+        .args(["-f", &crate::vms::manager::qemu_process_pattern("qemu-system", vm_name)])
         .status();
     Ok(format!(
         "USB device {} added to VM '{}' passthrough list; VM stopped for \
