@@ -3125,7 +3125,7 @@ fn backup_vm_libvirt(name: &str) -> Result<(PathBuf, u64), String> {
     // to actually power down before qemu-img convert touches the disk.
     let was_running = vm.running;
     if was_running {
-        stop_vm_and_wait_for_stop(&manager, name, 60)?;
+        stop_vm_and_wait_for_stop(&manager, name, 60, || manager.stop_vm(name, false))?;
     }
     let _restart_guard = VmRestartGuard { name: name.to_string(), should_restart: was_running };
 
@@ -3168,20 +3168,26 @@ impl Drop for VmRestartGuard {
 /// `running=false`, force-stop after `grace_secs` if needed.
 ///
 /// `max_wait_secs` budgets the graceful phase. After that we send
-/// the force signal (qm stop / virsh destroy) and wait another 5s.
+/// the force signal (qm stop / virsh destroy / pkill -9) and wait another 3s.
 /// Returns Err only if even the force-stop fails or the VM is not
 /// known. Returns Ok if VM is already stopped at entry.
+///
+/// `begin_graceful` starts the shutdown. Proxmox and libvirt pass
+/// `stop_vm(name, false)` (qm shutdown / virsh shutdown, both ACPI). Native
+/// QEMU passes its own: `stop_vm(name, false)` there is SIGTERM, which ends
+/// the QEMU process without the guest ever being told to shut down.
 fn stop_vm_and_wait_for_stop(
     manager: &crate::vms::manager::VmManager,
     name: &str,
     max_wait_secs: u64,
+    begin_graceful: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     // N2: no initial `list_vms()` check — callers gate on their own
     // `was_running` already. Saves a per-backup directory scan on
     // Proxmox + closes a TOCTOU window between callers and the helper.
     //
     // Initiate graceful shutdown.
-    manager.stop_vm(name, false)
+    begin_graceful()
         .map_err(|e| format!("graceful stop of '{}' failed to start: {}", name, e))?;
 
     // Poll until stopped or until deadline.
@@ -3247,7 +3253,7 @@ fn stop_vm_and_wait_for_stop(
 }
 
 /// Native WolfStack VM backup — the original path. KVM/QEMU process
-/// spawned by `wolfstack-vm-<name>`, config + disk in
+/// launched as `qemu-system-* -name <name>`, config + disk in
 /// `/var/lib/wolfstack/vms/`. Stop the VM, archive its files, restart
 /// via the RAII guard so it never stays stopped silently.
 fn backup_vm_native(name: &str) -> Result<(PathBuf, u64), String> {
@@ -3278,39 +3284,29 @@ fn backup_vm_native(name: &str) -> Result<(PathBuf, u64), String> {
         return Err(format!("VM config not found: {}", config_path));
     }
 
-    // Check if VM is running (check for QEMU process)
-    let was_running = is_vm_running(name);
+    // Stop the VM so tar reads a disk at rest. This used to look for a
+    // `wolfstack-vm-<name>` process and a `/var/run/wolfstack-vm-<name>.sock`
+    // monitor, neither of which native QEMU has: it runs as
+    // `qemu-system-* -name <name>` with its QMP monitor at
+    // `/run/wolfstack-qmp-<name>.sock` (VmManager::start_vm). So a running VM
+    // always read as stopped, was never shut down, and tar failed with
+    // "<name>.qcow2: file changed as we read it" (RutgerDiehard 2026-09-26).
+    // Now the same detection, stop and restart code the VM page uses decides.
+    let manager = crate::vms::manager::VmManager::new();
+    let was_running = manager.check_running(name);
     if was_running {
-
-        // Send ACPI shutdown
-        let _ = Command::new("sh")
-            .args(["-c", &format!(
-                "echo 'system_powerdown' | socat - UNIX-CONNECT:/var/run/wolfstack-vm-{}.sock 2>/dev/null || true", name
-            )])
-            .output();
-        // N1 fix: poll until stopped instead of a fixed 5s sleep that
-        // could be too short for a slow guest. Cap at 60s, then
-        // pkill -9 if the guest still hasn't powered down. Matches
-        // the budget the Proxmox/libvirt paths use via
-        // stop_vm_and_wait_for_stop.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut stopped_gracefully = false;
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if !is_vm_running(name) {
-                stopped_gracefully = true;
-                break;
+        stop_vm_and_wait_for_stop(&manager, name, 60, || {
+            // ACPI power button through QMP, so the guest shuts down
+            // cleanly. A VM started before QMP support has no monitor
+            // socket; SIGTERM still ends QEMU and flushes its disk writes.
+            match crate::vms::manager::qmp_command(name, "system_powerdown", None) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    warn!("backup {}: QMP system_powerdown failed ({}); stopping with SIGTERM", name, e);
+                    manager.stop_vm(name, false)
+                }
             }
-        }
-        if !stopped_gracefully {
-            tracing::warn!(target: "backup",
-                "VM '{}' did not gracefully ACPI-shutdown within 60s — forcing pkill \
-                 for backup consistency. Guest filesystem may need fsck on next boot.", name);
-            let _ = Command::new("pkill")
-                .args(["-f", &format!("wolfstack-vm-{}", name)])
-                .output();
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
+        })?;
     }
 
     // RAII guard: restart on EVERY exit path (success, tar-failure
@@ -3388,7 +3384,7 @@ fn backup_vm_proxmox(name: &str) -> Result<(PathBuf, u64), String> {
     // always restart afterwards.
     let was_running = vm.running;
     if was_running {
-        stop_vm_and_wait_for_stop(&manager, name, 60)?;
+        stop_vm_and_wait_for_stop(&manager, name, 60, || manager.stop_vm(name, false))?;
     }
     let _restart_guard = VmRestartGuard { name: name.to_string(), should_restart: was_running };
 
@@ -3399,16 +3395,6 @@ fn backup_vm_proxmox(name: &str) -> Result<(PathBuf, u64), String> {
     let archive = crate::vms::manager::export_proxmox_vm_with_staging(name, Some(&staging_str))?;
     let size = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
     Ok((archive, size))
-}
-
-/// Check if a VM is running
-fn is_vm_running(name: &str) -> bool {
-    Command::new("pgrep")
-        .args(["-f", &format!("wolfstack-vm-{}", name)])
-        .output()
-        .ok()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// Recursively copy a config directory into the backup bundle, skipping any

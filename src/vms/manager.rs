@@ -5049,7 +5049,7 @@ impl VmManager {
         let output = Command::new("pkill")
             .arg(signal)
             .arg("-f")
-            .arg(format!("qemu-system-x86_64.*-name {}", name))
+            .arg(qemu_process_pattern("qemu-system-x86_64", name))
             .output()
             .map_err(|e| e.to_string())?;
 
@@ -5140,6 +5140,26 @@ impl VmManager {
         qmp_command(name, command, None).map(|_| ())
     }
 
+}
+
+/// `pgrep`/`pkill -f` pattern matching the native QEMU process of exactly
+/// the VM `name`. Native VMs launch as `<qemu_bin> ... -name <name> -m ...`
+/// (see `start_vm`), so the name is followed by a space. Unanchored,
+/// `-name vm1` also matched `vm10`: a backup's force-stop of vm1 would have
+/// killed vm10 too. pgrep/pkill take a POSIX extended regex, so the name's
+/// ERE metacharacters are backslash-escaped (a legal VM name may contain
+/// `.`); `regex::escape` is not used because it also escapes `-`, and `\-`
+/// is undefined in ERE. `qemu_bin` is itself a regex fragment
+/// (`qemu-system` matches every arch).
+pub(crate) fn qemu_process_pattern(qemu_bin: &str, name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for c in name.chars() {
+        if ".[]()*+?{}|^$\\".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("{}.*-name {}( |$)", qemu_bin, escaped)
 }
 
 /// Send one QMP command, with optional arguments, and hand back its
@@ -5564,7 +5584,7 @@ impl VmManager {
         for qemu_bin in &["qemu-system-x86_64", "qemu-system-aarch64"] {
             let output = Command::new("pgrep")
                 .arg("-f")
-                .arg(format!("{}.*-name {}", qemu_bin, name))
+                .arg(qemu_process_pattern(qemu_bin, name))
                 .output();
             if let Ok(o) = output
                 && o.status.success() {
@@ -7777,7 +7797,7 @@ pub fn migrate_storage(
     // qemu would slip through.
     for qemu_bin in &["qemu-system-x86_64", "qemu-system-aarch64"] {
         if let Ok(o) = Command::new("pgrep")
-            .args(["-f", &format!("{}.*-name {}", qemu_bin, name)])
+            .args(["-f", &qemu_process_pattern(qemu_bin, name)])
             .output()
             && o.status.success() {
                 return Err(format!(
@@ -10393,6 +10413,18 @@ mod extra_qemu_args_tests {
         assert_eq!(&argv[n-2..], &["-audiodev".to_string(), "pa,id=snd0".to_string()]);
         // And the standard -name flag must precede them.
         assert!(argv.iter().any(|a| a == "-name"));
+    }
+
+    #[test]
+    fn qemu_process_pattern_matches_only_the_exact_vm_name() {
+        let re = regex::Regex::new(&qemu_process_pattern("qemu-system-x86_64", "vm1")).unwrap();
+        assert!(re.is_match("qemu-system-x86_64 -name vm1 -m 1024M"));
+        assert!(re.is_match("qemu-system-x86_64 -name vm1"));
+        assert!(!re.is_match("qemu-system-x86_64 -name vm10 -m 1024M"));
+        // A '.' in a name is literal, not a wildcard.
+        let dotted = regex::Regex::new(&qemu_process_pattern("qemu-system", "a.b")).unwrap();
+        assert!(dotted.is_match("qemu-system-aarch64 -name a.b -m 512M"));
+        assert!(!dotted.is_match("qemu-system-aarch64 -name axb -m 512M"));
     }
 }
 
