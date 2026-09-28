@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.34.0: back a VM up without shutting it down, and stop native VM backups leaving disks out** _(2026-09-28 — [`a2df0a52`](https://github.com/intelligentwolf/WolfStack/commit/a2df0a52bac5071d6211fb516f3b041a28214a75))_
 - **v25.33.2: shut native VMs down for their backup so the disk is not read while it changes** _(2026-09-28 — [`3f678a8b`](https://github.com/intelligentwolf/WolfStack/commit/3f678a8bd00222181d03a36087b9a85bc1791931))_
 - **v25.33.1: show a failed UPS battery on the UPS page, in Issues and in the Predictive Inbox** _(2026-09-25 — [`732e3547`](https://github.com/intelligentwolf/WolfStack/commit/732e3547df857020a10b7f592d964c46dadd1c5d))_
 - **v25.33.0: Wake-on-LAN — power on machines on your network from the dashboard** _(2026-09-25 — [`a2830e95`](https://github.com/intelligentwolf/WolfStack/commit/a2830e95b91e900405203ca113705098b1c52bd4))_
