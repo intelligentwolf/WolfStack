@@ -22530,6 +22530,10 @@ pub struct CreateScheduleRequest {
     /// for its archive). Absent → live backups, as before.
     #[serde(default)]
     pub stop_containers: bool,
+    /// `backup_all` schedules: back running VMs up live instead of shutting
+    /// them down. Absent → VMs are shut down for their backup, as before.
+    #[serde(default)]
+    pub keep_vms_running: bool,
 }
 
 #[derive(Deserialize)]
@@ -24321,6 +24325,7 @@ pub async fn backup_schedule_create(
         day_of_week: body.day_of_week,
         day_of_month: body.day_of_month,
         stop_containers: body.stop_containers,
+        keep_vms_running: body.keep_vms_running,
     };
     // Node scope: unchanged from before fleet scope existed.
     if body.scope == BackupScope::Node {

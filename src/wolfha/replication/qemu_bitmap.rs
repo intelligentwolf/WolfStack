@@ -589,6 +589,136 @@ pub fn take_full(
     Ok(())
 }
 
+/// Copy SEVERAL disks of a running VM, all as of one instant — the live
+/// ("keep running") VM backup.
+///
+/// Calling [`take_full`] once per disk would give each disk a different
+/// point in time, and a guest whose filesystem or database spans two disks
+/// could come back inconsistent. QMP `transaction` starts every
+/// `blockdev-backup` job atomically instead (qapi/transaction.json:
+/// `TransactionAction` includes `blockdev-backup` with `BlockdevBackup`
+/// data), so all copies share the same copy-before-write instant.
+///
+/// `disks` pairs each disk path QEMU has open with the qcow2 to write. The
+/// guest keeps running throughout. The result is crash-consistent, the
+/// same guarantee as a hot container backup.
+///
+/// The whole sequence (blockdev-add → transaction of two blockdev-backup
+/// sync=full jobs → query-block-jobs to `concluded` → job-dismiss →
+/// blockdev-del) was replayed against a live QEMU 11.1.1 on 2026-09-28, and
+/// both copies compared identical to their sources with `qemu-img compare`.
+///
+/// Blocking — run it off the async runtime. On any error every target
+/// file is removed and no node or job is left behind.
+// Source: qemu_bitmap.rs take_full() — same node/target/job plumbing,
+// started through `transaction` so the disks share one instant.
+pub fn take_full_consistent(
+    vm: &str,
+    disks: &[(String, String)],
+    timeout_secs: u64,
+) -> Result<(), String> {
+    if disks.is_empty() {
+        return Ok(());
+    }
+    // Resolve every node and create every target before touching QEMU, so a
+    // bad disk path fails without leaving half the set attached.
+    let mut plan: Vec<(String, String, String, String)> = Vec::new(); // (source node, target node, job id, out path)
+    let remove_outs = |plan: &[(String, String, String, String)]| {
+        for (_, _, _, out) in plan {
+            let _ = std::fs::remove_file(out);
+        }
+    };
+    for (disk, out) in disks {
+        let prepared = resolve_disk_node(vm, disk)
+            .and_then(|node| virtual_size(disk).map(|size| (node, size)))
+            .and_then(|(node, size)| create_delta_target(out, size).map(|_| node));
+        match prepared {
+            Ok(node) => {
+                // `wolfbak-t-` + 16 hex = 26 characters, under QEMU's
+                // 31-character node-name limit (see ephemeral_token).
+                let token = ephemeral_token();
+                plan.push((node, format!("wolfbak-t-{}", token), format!("wolfbak-j-{}", token), out.clone()));
+            }
+            Err(e) => {
+                remove_outs(&plan);
+                let _ = std::fs::remove_file(out);
+                return Err(e);
+            }
+        }
+    }
+
+    let detach_all = |attached: &[&(String, String, String, String)]| {
+        for (_, target, _, _) in attached {
+            let _ = qmp(vm, "blockdev-del", Some(serde_json::json!({ "node-name": target })));
+        }
+    };
+
+    let mut attached: Vec<&(String, String, String, String)> = Vec::new();
+    for entry in &plan {
+        let (_, target, _, out) = entry;
+        let add = qmp(
+            vm,
+            "blockdev-add",
+            Some(serde_json::json!({
+                "driver": "qcow2",
+                "node-name": target,
+                "file": { "driver": "file", "filename": out },
+            })),
+        );
+        if let Err(e) = add {
+            detach_all(&attached);
+            remove_outs(&plan);
+            return Err(format!("could not attach the backup target {}: {}", out, e));
+        }
+        attached.push(entry);
+    }
+
+    // Same arguments as take_full's blockdev-backup, one action per disk.
+    let actions: Vec<serde_json::Value> = plan
+        .iter()
+        .map(|(node, target, job, _)| {
+            serde_json::json!({
+                "type": "blockdev-backup",
+                "data": {
+                    "job-id": job,
+                    "device": node,
+                    "target": target,
+                    "sync": "full",
+                    // Park in `concluded` so the outcome can be read — see await_job.
+                    "auto-dismiss": false,
+                },
+            })
+        })
+        .collect();
+    if let Err(e) = qmp(vm, "transaction", Some(serde_json::json!({ "actions": actions }))) {
+        // A transaction is all-or-nothing: no job was started.
+        detach_all(&attached);
+        remove_outs(&plan);
+        return Err(format!("could not start the live backup: {}", e));
+    }
+
+    // Wait for each job. After the first failure, cancel the rest (await_job
+    // cancels only on its own timeout) and still wait, so each one reaches
+    // `concluded` and is dismissed before its node is removed.
+    let mut first_err: Option<String> = None;
+    for (_, _, job, _) in &plan {
+        if first_err.is_some() {
+            let _ = qmp(vm, "block-job-cancel", Some(serde_json::json!({ "device": job })));
+        }
+        if let Err(e) = await_job(vm, job, timeout_secs)
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+    }
+    detach_all(&attached);
+    if let Some(e) = first_err {
+        remove_outs(&plan);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Remove our persistent bitmap from a qcow2 that is NOT attached to a
 /// running QEMU. Used on a replica after installing a seed that was made
 /// by file copy (the copy carries the PRIMARY's bitmap inside it, which
@@ -675,6 +805,62 @@ pub fn apply_delta(delta_path: &str, target_disk: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end against a real QEMU: two disks copied by one QMP
+    /// `transaction` must come out byte-identical to their sources, with no
+    /// job or target node left behind. The QEMU hosts the disks only
+    /// (`-machine none`), the same harness the WolfHA QMP sequence was
+    /// verified with. Skipped where QEMU is not installed.
+    #[test]
+    fn take_full_consistent_copies_every_disk_exactly() {
+        use std::process::Command;
+        let have = |bin: &str| Command::new(bin).arg("--version").output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if !have("qemu-system-x86_64") || !have("qemu-img") || !have("qemu-io") {
+            eprintln!("skipped: QEMU tools not installed");
+            return;
+        }
+        // Short path: a UNIX socket path must stay under 108 bytes.
+        let dir = std::env::temp_dir().join(format!("wsbk-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().to_string();
+        let vm = "bktest";
+        let (a, b) = (format!("{}/a.qcow2", d), format!("{}/b.qcow2", d));
+        for (path, size, byte) in [(&a, "64M", "0xaa"), (&b, "32M", "0xbb")] {
+            assert!(Command::new("qemu-img").args(["create", "-q", "-f", "qcow2", path, size]).status().unwrap().success());
+            assert!(Command::new("qemu-io").args(["-f", "qcow2", "-c", &format!("write -P {} 0 1M", byte), path])
+                .output().unwrap().status.success());
+        }
+        let sock = format!("{}/wolfstack-qmp-{}.sock", d, vm);
+        let pid = format!("{}/qemu.pid", d);
+        let started = Command::new("qemu-system-x86_64")
+            .args(["-machine", "none", "-nodefaults", "-display", "none", "-name", vm])
+            .args(["-qmp", &format!("unix:{},server,nowait", sock)])
+            .args(["-drive", &format!("file={},format=qcow2,if=none,id=d0", a)])
+            .args(["-drive", &format!("file={},format=qcow2,if=none,id=d1", b)])
+            .args(["-daemonize", "-pidfile", &pid])
+            .status().unwrap();
+        assert!(started.success(), "harness QEMU did not start");
+        crate::vms::manager::TEST_QMP_DIR.with(|t| *t.borrow_mut() = Some(d.clone()));
+
+        let (ca, cb) = (format!("{}/ca.qcow2", d), format!("{}/cb.qcow2", d));
+        let result = take_full_consistent(vm, &[(a.clone(), ca.clone()), (b.clone(), cb.clone())], 60);
+        let leftover_jobs = qmp(vm, "query-block-jobs", None);
+        let _ = qmp(vm, "quit", None);
+        crate::vms::manager::TEST_QMP_DIR.with(|t| *t.borrow_mut() = None);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let same = |x: &str, y: &str| Command::new("qemu-img").args(["compare", "-q", x, y])
+            .status().map(|s| s.success()).unwrap_or(false);
+        let ok_a = same(&a, &ca);
+        let ok_b = same(&b, &cb);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        result.expect("live copy failed");
+        assert_eq!(leftover_jobs.unwrap(), serde_json::json!([]), "a backup job was left behind");
+        assert!(ok_a, "disk a copy differs from its source");
+        assert!(ok_b, "disk b copy differs from its source");
+    }
 
     /// Verified against a live QEMU: `query-block` reports the filename as
     /// QEMU was launched with, not the absolute path we hold. An exact

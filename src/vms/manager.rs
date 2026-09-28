@@ -1331,6 +1331,15 @@ impl VmManager {
         self.vm_efivars_path(config)
     }
 
+    /// The OS disk a native VM actually boots from: the custom-storage path
+    /// when that file exists, otherwise the default under the VM base
+    /// (the same fallback build_qemu_command and start_vm apply). Backups
+    /// read this so they archive the disk QEMU opens.
+    pub fn boot_disk_path_for(&self, config: &VmConfig) -> PathBuf {
+        let disk_path = self.vm_os_disk_path(config);
+        if disk_path.exists() { disk_path } else { self.vm_disk_path(&config.name) }
+    }
+
     /// Get the OS disk path, respecting custom storage_path if set
     fn vm_os_disk_path(&self, config: &VmConfig) -> PathBuf {
         if let Some(ref sp) = config.storage_path {
@@ -5162,6 +5171,24 @@ pub(crate) fn qemu_process_pattern(qemu_bin: &str, name: &str) -> String {
     format!("{}.*-name {}( |$)", qemu_bin, escaped)
 }
 
+/// The QMP monitor socket a native VM is started with (`-qmp
+/// unix:/run/wolfstack-qmp-<name>.sock,server,nowait`, see start_vm).
+fn qmp_socket_path(name: &str) -> String {
+    #[cfg(test)]
+    if let Some(dir) = TEST_QMP_DIR.with(|d| d.borrow().clone()) {
+        return format!("{}/wolfstack-qmp-{}.sock", dir, name);
+    }
+    format!("/run/wolfstack-qmp-{}.sock", name)
+}
+
+// Tests only: point QMP at a scratch QEMU's socket, because /run is
+// root-only. Per thread, so parallel tests cannot see each other's value.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_QMP_DIR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Send one QMP command, with optional arguments, and hand back its
 /// `return` value.
 ///
@@ -5191,7 +5218,7 @@ pub(crate) fn qmp_command(
         use std::io::{BufRead, BufReader, Write};
         use std::time::Duration;
 
-        let sock = format!("/run/wolfstack-qmp-{}.sock", name);
+        let sock = qmp_socket_path(name);
         let stream = UnixStream::connect(&sock).map_err(|e| {
             format!(
                 "QMP monitor {} not reachable — is the VM running? (VMs started by a \
@@ -6727,6 +6754,23 @@ pub fn migration_staging_root(explicit: Option<&str>) -> PathBuf {
 /// shared between backup (which has its own RAII restart guard) and
 /// migration (which has its own stop/start dance around export).
 pub fn export_proxmox_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
+    export_proxmox_vm_impl(name, staging_dir, None)
+}
+
+/// `export_proxmox_vm_with_staging`, optionally reading each disk from a
+/// point-in-time copy instead of its live volume.
+///
+/// `live_copies` maps a Proxmox disk slot (`scsi0`, `virtio1`, …) to the
+/// raw image `vma extract` produced for it (`export_proxmox_vm_live`).
+/// With it, a slot that has no copy is either one the operator excluded
+/// from Proxmox backups (`backup=0`, which vzdump skips, so it is skipped
+/// here too) or an error. Without it, every disk is read from its volume
+/// as before.
+fn export_proxmox_vm_impl(
+    name: &str,
+    staging_dir: Option<&str>,
+    live_copies: Option<&std::collections::HashMap<String, PathBuf>>,
+) -> Result<PathBuf, String> {
     // Look up the VM (qm_list_all → parse_pve_qemu_conf) to get name→vmid + bus + memory.
     let manager = VmManager::new();
     let vm = manager.list_vms().into_iter()
@@ -6797,17 +6841,38 @@ pub fn export_proxmox_vm_with_staging(name: &str, staging_dir: Option<&str>) -> 
             }
         };
 
-        let pvesm = Command::new("pvesm").args(["path", &volume_id]).output()
-            .map_err(|e| format!("pvesm path failed to start: {}", e))?;
-        if !pvesm.status.success() {
-            return Err(format!(
-                "pvesm could not resolve disk '{}' for VM '{}': {}",
-                volume_id, name, String::from_utf8_lossy(&pvesm.stderr).trim()));
-        }
-        let disk_source = String::from_utf8_lossy(&pvesm.stdout).trim().to_string();
-        if disk_source.is_empty() {
-            return Err(format!("pvesm returned empty path for disk '{}'", volume_id));
-        }
+        // Live backup: read the point-in-time copy vzdump made, not the
+        // volume the running guest is writing to.
+        let (disk_source, source_format): (String, Option<&str>) = if let Some(copies) = live_copies {
+            match copies.get(key) {
+                // `vma extract` writes raw images (tmp-disk-<dev>.raw, then
+                // renamed to disk-<dev>.raw).
+                Some(p) => (p.to_string_lossy().into_owned(), Some("raw")),
+                None if val.split(',').any(|o| o.trim() == "backup=0") => {
+                    // Excluded from Proxmox backups by the operator; vzdump
+                    // skipped it, and so does this backup.
+                    warn!("Proxmox VM '{}' disk {} has backup=0 — not in the live backup", name, key);
+                    continue;
+                }
+                None => {
+                    return Err(format!(
+                        "Proxmox VM '{}' disk {} ({}) is missing from the vzdump archive", name, key, volume_id));
+                }
+            }
+        } else {
+            let pvesm = Command::new("pvesm").args(["path", &volume_id]).output()
+                .map_err(|e| format!("pvesm path failed to start: {}", e))?;
+            if !pvesm.status.success() {
+                return Err(format!(
+                    "pvesm could not resolve disk '{}' for VM '{}': {}",
+                    volume_id, name, String::from_utf8_lossy(&pvesm.stderr).trim()));
+            }
+            let path = String::from_utf8_lossy(&pvesm.stdout).trim().to_string();
+            if path.is_empty() {
+                return Err(format!("pvesm returned empty path for disk '{}'", volume_id));
+            }
+            (path, None)
+        };
 
         // First non-CD disk becomes OS disk at <name>.qcow2; extras at <name>-<slot>.qcow2.
         let dest_name = if !os_disk_converted {
@@ -6818,14 +6883,24 @@ pub fn export_proxmox_vm_with_staging(name: &str, staging_dir: Option<&str>) -> 
         };
         let dest_path = staging.join(&dest_name);
 
-        let convert = Command::new("qemu-img")
-            .args(["convert", "-O", "qcow2", &disk_source, &dest_path.to_string_lossy()])
+        let mut convert_cmd = Command::new("qemu-img");
+        convert_cmd.arg("convert");
+        if let Some(f) = source_format {
+            convert_cmd.args(["-f", f]);
+        }
+        let convert = convert_cmd
+            .args(["-O", "qcow2", &disk_source, &dest_path.to_string_lossy()])
             .output()
             .map_err(|e| format!("qemu-img convert failed to start: {}", e))?;
         if !convert.status.success() {
             return Err(format!(
                 "qemu-img convert failed for disk '{}': {}",
                 volume_id, String::from_utf8_lossy(&convert.stderr).trim()));
+        }
+        // A live copy has served its purpose; free its space before the next
+        // disk is converted.
+        if source_format.is_some() {
+            let _ = fs::remove_file(&disk_source);
         }
 
         if dest_name != format!("{}.qcow2", name) {
@@ -6921,20 +6996,9 @@ fn qcow2_virtual_size_gb(path: &Path) -> Option<u32> {
     Some(((bytes + (1 << 30) - 1) >> 30) as u32)
 }
 
-/// libvirt-host implementation of `export_vm_with_staging`. Reads the
-/// libvirt domain XML via `virsh dumpxml`, enumerates disks via
-/// `virsh domblklist --details` (skipping CD-ROMs), converts each
-/// backing file to qcow2 via `qemu-img convert`, writes a portable
-/// JSON VmConfig (translated from dominfo), and tars into the same
-/// WolfStack-native archive format the Proxmox / native paths use.
-///
-/// Same caller contract as the Proxmox helper: caller stops/starts.
-pub fn export_libvirt_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
-    let manager = VmManager::new();
-    let vm = manager.list_vms().into_iter()
-        .find(|v| v.name == name)
-        .ok_or_else(|| format!("libvirt VM '{}' not found", name))?;
-
+/// A libvirt domain's backing disks as (target dev, source), CD-ROMs and
+/// empty drives left out, from `virsh domblklist --details`.
+fn libvirt_backing_disks(name: &str) -> Result<Vec<(String, String)>, String> {
     // Enumerate disks via virsh domblklist (Target/Source columns).
     // Skip cdrom devices — they reference an ISO, not a backing disk.
     let blklist = Command::new("virsh")
@@ -6964,6 +7028,35 @@ pub fn export_libvirt_vm_with_staging(name: &str, staging_dir: Option<&str>) -> 
     if disks.is_empty() {
         return Err(format!("libvirt VM '{}' has no non-CD backing disks — nothing to export", name));
     }
+    Ok(disks)
+}
+
+/// libvirt-host implementation of `export_vm_with_staging`. Reads the
+/// libvirt domain XML via `virsh dumpxml`, enumerates disks via
+/// `virsh domblklist --details` (skipping CD-ROMs), converts each
+/// backing file to qcow2 via `qemu-img convert`, writes a portable
+/// JSON VmConfig (translated from dominfo), and tars into the same
+/// WolfStack-native archive format the Proxmox / native paths use.
+///
+/// Same caller contract as the Proxmox helper: caller stops/starts.
+pub fn export_libvirt_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
+    export_libvirt_vm_impl(name, staging_dir, None)
+}
+
+/// `export_libvirt_vm_with_staging`, optionally reading each disk from a
+/// point-in-time copy instead of its live source. `live_copies` maps a
+/// libvirt target dev (`vda`, `sdb`, …) to the qcow2 `virsh backup-begin`
+/// wrote for it (`export_libvirt_vm_live`); every listed disk must have one.
+fn export_libvirt_vm_impl(
+    name: &str,
+    staging_dir: Option<&str>,
+    live_copies: Option<&std::collections::HashMap<String, PathBuf>>,
+) -> Result<PathBuf, String> {
+    let manager = VmManager::new();
+    let vm = manager.list_vms().into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| format!("libvirt VM '{}' not found", name))?;
+    let disks = libvirt_backing_disks(name)?;
 
     // Stage qcow2 conversions.
     let export_dir = migration_staging_root(staging_dir).join("wolfstack-vm-exports");
@@ -6986,14 +7079,36 @@ pub fn export_libvirt_vm_with_staging(name: &str, staging_dir: Option<&str>) -> 
             format!("{}-{}.qcow2", name, target)
         };
         let dest_path = staging.join(&dest_name);
-        let convert = Command::new("qemu-img")
-            .args(["convert", "-O", "qcow2", source, &dest_path.to_string_lossy()])
+        // Live backup: read the point-in-time copy libvirt wrote (always
+        // qcow2 — the backup XML asks for that), not the disk the running
+        // guest is writing to.
+        let live_copy = match live_copies {
+            Some(copies) => Some(copies.get(target).ok_or_else(|| format!(
+                "libvirt VM '{}' disk {} is missing from the live backup", name, target))?),
+            None => None,
+        };
+        let mut convert_cmd = Command::new("qemu-img");
+        convert_cmd.arg("convert");
+        let read_from = match live_copy {
+            Some(p) => {
+                convert_cmd.args(["-f", "qcow2"]);
+                p.to_string_lossy().into_owned()
+            }
+            None => source.clone(),
+        };
+        let convert = convert_cmd
+            .args(["-O", "qcow2", &read_from, &dest_path.to_string_lossy()])
             .output()
             .map_err(|e| format!("qemu-img convert failed to start: {}", e))?;
         if !convert.status.success() {
             return Err(format!(
                 "qemu-img convert failed for libvirt disk '{}' (target {}): {}",
-                source, target, String::from_utf8_lossy(&convert.stderr).trim()));
+                read_from, target, String::from_utf8_lossy(&convert.stderr).trim()));
+        }
+        // A live copy has served its purpose; free its space before the next
+        // disk is converted.
+        if let Some(p) = live_copy {
+            let _ = fs::remove_file(p);
         }
         if idx > 0 {
             let size_gb = qcow2_virtual_size_gb(&dest_path).unwrap_or(vm.disk_size_gb);
@@ -7060,6 +7175,265 @@ pub fn export_libvirt_vm_with_staging(name: &str, staging_dir: Option<&str>) -> 
         return Err(format!("tar failed: {}", String::from_utf8_lossy(&tar.stderr).trim()));
     }
     Ok(archive_path)
+}
+
+/// A per-export work directory under the export root, removed on drop.
+struct LiveWorkDir(PathBuf);
+impl Drop for LiveWorkDir {
+    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+}
+
+/// Live ("keep running") backup of a RUNNING libvirt VM: libvirt copies
+/// every backing disk as of one instant while the guest keeps running,
+/// then the copies go through the normal export into the same archive
+/// format as a cold backup.
+///
+/// Push-mode `virsh backup-begin` (libvirt formatbackup: `<domainbackup>`
+/// defaults to push; only the listed disks take part; `type='file'` with
+/// `<target file=…/>` and `<driver type='qcow2'/>`). The command returns
+/// at once and the job runs in the background, so it is polled with
+/// `virsh domjobinfo --rawstats`, whose first line is `Job type: <n>` as
+/// a number (tools/virsh-domain.c cmdDomjobinfo), not the translated word.
+/// Values from include/libvirt/libvirt-domain.h virDomainJobType:
+/// 0 none, 1 bounded, 2 unbounded, 3 completed, 4 failed, 5 cancelled.
+/// While the backup runs it is 1 or 2. Afterwards `--completed` reports the
+/// finished job: src/qemu/qemu_backup.c stores its status and `errmsg`,
+/// mapped to 3/4/5 by virDomainJobStatusToType (src/conf/virdomainjob.c).
+///
+/// Not run against a real libvirt host yet: every value above comes from
+/// the libvirt sources, but no dev host has libvirt.
+pub fn export_libvirt_vm_live(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
+    let disks = libvirt_backing_disks(name)?;
+
+    let export_dir = migration_staging_root(staging_dir).join("wolfstack-vm-exports");
+    fs::create_dir_all(&export_dir).map_err(|e| format!("create export dir: {}", e))?;
+    let work = export_dir.join(format!("live-{}-{}", name, uuid::Uuid::new_v4()));
+    fs::create_dir_all(&work).map_err(|e| format!("create live backup dir: {}", e))?;
+    let _work_guard = LiveWorkDir(work.clone());
+    // QEMU writes the copies itself, as the libvirt-qemu user on most
+    // distributions, so it must be able to reach this directory.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&work, fs::Permissions::from_mode(0o711));
+    }
+
+    let mut copies: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    let mut xml = String::from("<domainbackup mode='push'>\n  <disks>\n");
+    for (target, _) in &disks {
+        let out = work.join(format!("{}.qcow2", target));
+        xml.push_str(&format!(
+            "    <disk name='{}' backup='yes' type='file'>\n      <driver type='qcow2'/>\n      <target file='{}'/>\n    </disk>\n",
+            xml_escape_attr(target),
+            xml_escape_attr(&out.to_string_lossy()),
+        ));
+        copies.insert(target.clone(), out);
+    }
+    xml.push_str("  </disks>\n</domainbackup>\n");
+    let xml_path = work.join("backup.xml");
+    fs::write(&xml_path, &xml).map_err(|e| format!("write backup XML: {}", e))?;
+
+    let begin = Command::new("virsh")
+        .args(["backup-begin", name])
+        .arg(&xml_path)
+        .output()
+        .map_err(|e| format!("virsh backup-begin failed to start: {}", e))?;
+    if !begin.status.success() {
+        let err = String::from_utf8_lossy(&begin.stderr).trim().to_string();
+        let hint = if err.contains("Permission denied") {
+            " — QEMU could not write into the backup staging directory; every directory above it must be searchable by the QEMU user"
+        } else {
+            ""
+        };
+        return Err(format!("virsh backup-begin for '{}' failed: {}{}", name, err, hint));
+    }
+    // From here the job is running. Any early return must stop it before the
+    // work directory it writes into is removed (drop order: this guard is
+    // dropped before `_work_guard`, which was declared earlier).
+    struct AbortUnlessDone<'a> { name: &'a str, done: bool }
+    impl Drop for AbortUnlessDone<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                let _ = Command::new("virsh").args(["domjobabort", self.name]).output();
+            }
+        }
+    }
+    let mut abort_guard = AbortUnlessDone { name, done: false };
+
+    let job_type = |completed: bool| -> Result<(i32, String), String> {
+        let mut cmd = Command::new("virsh");
+        cmd.args(["domjobinfo", name]);
+        if completed {
+            cmd.arg("--completed");
+        }
+        let out = cmd.arg("--rawstats").output()
+            .map_err(|e| format!("virsh domjobinfo failed to start: {}", e))?;
+        if !out.status.success() {
+            return Err(format!("virsh domjobinfo for '{}' failed: {}",
+                name, String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let n = text.lines()
+            .find_map(|l| l.strip_prefix("Job type:"))
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .ok_or_else(|| format!("virsh domjobinfo gave no job type: {}", text.trim()))?;
+        Ok((n, text))
+    };
+
+    // Same six-hour ceiling as the native live copy.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6 * 60 * 60);
+    loop {
+        let (n, _) = job_type(false)?;
+        if n != 1 && n != 2 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // abort_guard aborts the job on this return.
+            return Err(format!("live backup of '{}' did not finish within 6 hours and was aborted", name));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    // The job has ended; nothing left to abort.
+    abort_guard.done = true;
+
+    let (n, text) = job_type(true)?;
+    match n {
+        3 => {}
+        4 | 5 => {
+            let errmsg = text.lines()
+                .find_map(|l| l.strip_prefix("errmsg:"))
+                .map(|m| m.trim().to_string())
+                .unwrap_or_else(|| if n == 5 { "the job was cancelled".to_string() } else { "no error message".to_string() });
+            return Err(format!("live backup of '{}' failed: {}", name, errmsg));
+        }
+        _ => {
+            return Err(format!(
+                "could not confirm the live backup of '{}' finished (libvirt reports job type {}) — not trusting the copies",
+                name, n));
+        }
+    }
+    for (target, path) in &copies {
+        if !path.exists() {
+            return Err(format!("libvirt reported the live backup of '{}' complete, but {} was not written ({})",
+                name, path.display(), target));
+        }
+    }
+
+    export_libvirt_vm_impl(name, staging_dir, Some(&copies))
+}
+
+/// Live ("keep running") backup of a RUNNING Proxmox VM through Proxmox's
+/// own live backup, converted into the same archive format as a cold
+/// backup.
+///
+/// `vzdump <vmid> --mode snapshot --stdout --dumpdir <dir>` streams a VMA
+/// archive while the guest runs (pve-manager PVE/VZDump.pm; snapshot is
+/// the QEMU-level live backup, and it freezes the guest filesystems when
+/// the QEMU guest agent is enabled). `--dumpdir` is passed with `--stdout`
+/// on purpose: with neither `dumpdir` nor `storage` set, a `storage:`
+/// default in /etc/vzdump.conf is applied, and `storage` together with
+/// `stdout` is refused ("cannot use options 'storage' and 'stdout' at the
+/// same time"). With `--stdout` the archive goes to stdout, not the dump
+/// directory, which only receives vzdump's log.
+///
+/// The stream is piped into `vma extract -v - <dir>` (pve-qemu vma.c: `-`
+/// reads stdin, as qemu-server's restore does), so no full-size .vma is
+/// ever written. For each disk vma prints `DEVINFO <dir>/tmp-disk-<dev>.raw
+/// <size>` and at the end renames it to `<dir>/disk-<dev>.raw`. `<dev>` is
+/// vzdump's `drive-<slot>` (PVE/VZDump/QemuServer.pm: `qmdevice =>
+/// "drive-$ds"`), and the slot is recovered by removing `drive-`, the way
+/// PVE's own code does.
+///
+/// Not run against a real Proxmox host yet: every value above comes from
+/// the Proxmox sources, but the only Proxmox hosts are production.
+pub fn export_proxmox_vm_live(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
+    use std::process::Stdio;
+    let manager = VmManager::new();
+    let vm = manager.list_vms().into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| format!("Proxmox VM '{}' not found", name))?;
+    let vmid = vm.vmid.ok_or_else(||
+        format!("Proxmox VM '{}' has no vmid — cannot locate Proxmox config", name))?;
+
+    let export_dir = migration_staging_root(staging_dir).join("wolfstack-vm-exports");
+    fs::create_dir_all(&export_dir).map_err(|e| format!("create export dir: {}", e))?;
+    let work = export_dir.join(format!("live-{}-{}", name, uuid::Uuid::new_v4()));
+    fs::create_dir_all(&work).map_err(|e| format!("create live backup dir: {}", e))?;
+    let _work_guard = LiveWorkDir(work.clone());
+    let dump_dir = work.join("dump");
+    fs::create_dir_all(&dump_dir).map_err(|e| format!("create vzdump dir: {}", e))?;
+    // vma creates this itself and refuses one that already exists.
+    let extract_dir = work.join("extract");
+    let vzdump_log = work.join("vzdump-stderr.log");
+    let log_file = fs::File::create(&vzdump_log)
+        .map_err(|e| format!("create vzdump log: {}", e))?;
+
+    let mut vzdump = Command::new("vzdump")
+        .arg(vmid.to_string())
+        .args(["--mode", "snapshot", "--stdout", "--dumpdir"])
+        .arg(&dump_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log_file))
+        .spawn()
+        .map_err(|e| format!("vzdump failed to start: {}", e))?;
+    let Some(stream) = vzdump.stdout.take() else {
+        let _ = vzdump.kill();
+        let _ = vzdump.wait();
+        return Err("vzdump started without an output stream".to_string());
+    };
+    let vma = Command::new("vma")
+        .args(["extract", "-v", "-"])
+        .arg(&extract_dir)
+        .stdin(Stdio::from(stream))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let vma = match vma {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = vzdump.kill();
+            let _ = vzdump.wait();
+            return Err(format!("vma failed to start: {}", e));
+        }
+    };
+    let vma_out = vma.wait_with_output().map_err(|e| format!("waiting for vma: {}", e));
+    let vzdump_status = vzdump.wait().map_err(|e| format!("waiting for vzdump: {}", e))?;
+    let vma_out = vma_out?;
+
+    let tail = |text: &str| -> String {
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        lines[lines.len().saturating_sub(15)..].join("\n")
+    };
+    if !vzdump_status.success() {
+        let log = fs::read_to_string(&vzdump_log).unwrap_or_default();
+        return Err(format!("vzdump live backup of VM {} failed:\n{}", vmid, tail(&log)));
+    }
+    if !vma_out.status.success() {
+        return Err(format!("vma extract failed:\n{}", tail(&String::from_utf8_lossy(&vma_out.stderr))));
+    }
+
+    let mut copies: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&vma_out.stdout).lines() {
+        let Some(rest) = line.strip_prefix("DEVINFO ") else { continue };
+        // "<path> <size>" — the path may itself contain spaces.
+        let Some((path, _size)) = rest.rsplit_once(' ') else { continue };
+        let Some(dev) = Path::new(path).file_name()
+            .and_then(|f| f.to_str())
+            .and_then(|f| f.strip_prefix("tmp-disk-"))
+            .and_then(|f| f.strip_suffix(".raw"))
+        else { continue };
+        let slot = dev.strip_prefix("drive-").unwrap_or(dev).to_string();
+        copies.insert(slot, extract_dir.join(format!("disk-{}.raw", dev)));
+    }
+    if copies.is_empty() {
+        return Err(format!("vma extract of VM {} reported no disks", vmid));
+    }
+    for (slot, path) in &copies {
+        if !path.exists() {
+            return Err(format!("vma extract reported disk {} but {} is missing", slot, path.display()));
+        }
+    }
+
+    export_proxmox_vm_impl(name, staging_dir, Some(&copies))
 }
 
 pub fn export_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {

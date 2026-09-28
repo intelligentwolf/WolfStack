@@ -93,6 +93,14 @@ pub struct BackupTarget {
     /// non-disruptive behaviour. Proxmox LXC ignores this (vzdump snapshots).
     #[serde(default)]
     pub stop_for_backup: bool,
+    /// VM targets only: back a RUNNING VM up without shutting it down, from
+    /// a point-in-time copy of its disks (crash-consistent, like a power
+    /// cut at that instant). OFF by default: a running VM is shut down for
+    /// the copy and started again, the fully consistent behaviour every
+    /// existing config already has. See `backup_vm`. RutgerDiehard
+    /// 2026-09-26 asked for the VM to stay up.
+    #[serde(default)]
+    pub keep_running: bool,
 }
 
 impl Default for BackupTarget {
@@ -107,6 +115,7 @@ impl Default for BackupTarget {
             system_path: String::new(),
             compose_project: None,
             stop_for_backup: false,
+            keep_running: false,
         }
     }
 }
@@ -1185,6 +1194,13 @@ pub struct BackupSchedule {
     /// Ignored when `backup_all` is false; the per-target flag governs then.
     #[serde(default)]
     pub stop_containers: bool,
+    /// `backup_all` schedules: back each running VM up live, without
+    /// shutting it down (`BackupTarget::keep_running`, which a run-time
+    /// target list has nowhere to carry — the same reason `stop_containers`
+    /// exists). Absent → VMs are shut down for their backup, as before.
+    /// Ignored when `backup_all` is false; the per-target flag governs then.
+    #[serde(default)]
+    pub keep_vms_running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2119,35 +2135,6 @@ fn docker_content_bytes(name: &str, exclude_mounts: &[String]) -> Option<u64> {
         .map(|m| quick_dir_size_bytes(&m.data_path))
         .sum();
     Some(root_fs.saturating_add(mount_bytes))
-}
-
-/// Uncompressed bytes a native VM's archive will hold.
-///
-/// Two on-disk layouts exist and both are backed up: a per-VM subdirectory
-/// (`vms/<name>/`, used when a VM has extra volumes) and the common flat layout
-/// (`vms/<name>.json` + `vms/<name>.qcow2` beside each other). `None` when
-/// neither can be measured.
-fn vm_content_bytes(name: &str) -> Option<u64> {
-    const VM_BASE: &str = "/var/lib/wolfstack/vms";
-    let dir = format!("{}/{}", VM_BASE, name);
-    if Path::new(&dir).is_dir() {
-        return match quick_dir_size_bytes(&dir) { 0 => None, n => Some(n) };
-    }
-    // Flat layout: every entry whose name is `<name>` or starts with `<name>.`
-    // belongs to this VM (`.json` config, `.qcow2` disks, extra volumes).
-    let prefix = format!("{}.", name);
-    let total: u64 = fs::read_dir(VM_BASE)
-        .ok()?
-        .flatten()
-        .filter(|e| {
-            e.file_name().to_str()
-                .map(|f| f == name || f.starts_with(&prefix))
-                .unwrap_or(false)
-        })
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum();
-    (total > 0).then_some(total)
 }
 
 /// Create staging directory
@@ -3098,27 +3085,46 @@ fn docker_is_running(name: &str) -> bool {
 ///     `virsh domblklist --details`, convert each to qcow2 via
 ///     `qemu-img convert`, write portable JSON config, tar everything).
 ///     Same archive format as the Proxmox + native paths.
-///   • **native** → existing in-place tar.gz with the RAII restart
-///     guard from A.1.
-pub fn backup_vm(name: &str) -> Result<(PathBuf, u64), String> {
+///   • **native** → `backup_vm_native` (every disk, UEFI vars, TPM
+///     state and log, with the config rewritten to where restore puts
+///     them).
+///
+/// `keep_running` (the target's "Keep VM running" option) backs up a
+/// RUNNING VM without shutting it down, from a point-in-time copy of its
+/// disks: QMP `blockdev-backup` on native QEMU, `virsh backup-begin` on
+/// libvirt, `vzdump --mode snapshot` on Proxmox. The copy is
+/// crash-consistent, like pulling the power at that instant. Off (the
+/// default), a running VM is shut down for the copy and started again. A
+/// stopped VM is copied as it is either way.
+pub fn backup_vm(name: &str, keep_running: bool) -> Result<(PathBuf, u64), String> {
     if crate::containers::is_proxmox() {
-        return backup_vm_proxmox(name);
+        return backup_vm_proxmox(name, keep_running);
     }
     if crate::containers::is_libvirt() {
-        return backup_vm_libvirt(name);
+        return backup_vm_libvirt(name, keep_running);
     }
-    backup_vm_native(name)
+    backup_vm_native(name, keep_running)
 }
 
 /// Backup a libvirt-managed VM. Same pattern as Proxmox: stop with
 /// RAII restart guard, delegate the export to the shared helper in
 /// vms::manager. Output matches the native WolfStack format so
 /// `restore_vm_local` works on any host.
-fn backup_vm_libvirt(name: &str) -> Result<(PathBuf, u64), String> {
+fn backup_vm_libvirt(name: &str, keep_running: bool) -> Result<(PathBuf, u64), String> {
     let manager = crate::vms::manager::VmManager::new();
     let vm = manager.list_vms().into_iter()
         .find(|v| v.name == name)
         .ok_or_else(|| format!("libvirt VM '{}' not found", name))?;
+
+    // Keep running: libvirt copies the disks while the guest runs; no stop,
+    // no restart.
+    if keep_running && vm.running {
+        let staging = ensure_staging_dir()?;
+        let staging_str = staging.to_string_lossy().to_string();
+        let archive = crate::vms::manager::export_libvirt_vm_live(name, Some(&staging_str))?;
+        let size = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+        return Ok((archive, size));
+    }
 
     // Same C1 fix as Proxmox: graceful stop + poll + force fallback.
     // virsh shutdown is fire-and-forget too — must wait for the VM
@@ -3252,49 +3258,177 @@ fn stop_vm_and_wait_for_stop(
          — refusing to back up a live disk", name))
 }
 
-/// Native WolfStack VM backup — the original path. KVM/QEMU process
-/// launched as `qemu-system-* -name <name>`, config + disk in
-/// `/var/lib/wolfstack/vms/`. Stop the VM, archive its files, restart
-/// via the RAII guard so it never stays stopped silently.
-fn backup_vm_native(name: &str) -> Result<(PathBuf, u64), String> {
-    // The VM name flows into a shell string (the socat socket path) and
-    // into tar/JSON filenames. Refuse anything that isn't filename-safe so
-    // a crafted name can't inject shell here. Real VM names are already
-    // filename-safe (used as vm-<name>.tar.gz / <name>.json), so this
-    // never rejects a legitimate VM.
+/// Where native VMs live, and where `restore_vm_to_native` extracts to.
+const NATIVE_VM_BASE: &str = "/var/lib/wolfstack/vms";
+
+/// One file or directory a native VM backup captures.
+struct NativeVmItem {
+    /// Where it is on this host.
+    source: PathBuf,
+    /// Its path inside the archive, which is also where restore puts it
+    /// under `NATIVE_VM_BASE`.
+    archive_name: String,
+    /// `Some(format)` for a disk QEMU holds open while the VM runs. A live
+    /// backup copies these through QMP rather than reading the file.
+    disk_format: Option<String>,
+}
+
+/// Everything that belongs to a native VM, and the config as the archive
+/// must carry it.
+///
+/// Source: vms/manager.rs build_qemu_command() — the OS disk
+/// (`boot_disk_path_for`), every extra disk at `StorageVolume::file_path()`,
+/// and the OVMF vars file (`efivars_path_for`); start_swtpm() — TPM state
+/// in `<VM base>/<name>-tpm`.
+///
+/// `restore_vm_to_native` extracts the archive into the VM base as-is, so
+/// each item is archived under the name it needs THERE, and the archived
+/// config is rewritten to match: `storage_path` cleared (the OS disk and
+/// OVMF vars then resolve under the VM base) and each extra disk's
+/// `storage_path` set to the VM base. The old backup archived only
+/// `<name>.qcow2` from the VM base and a legacy `<name>/` folder, so extra
+/// disks (`<name>-<vol>.qcow2` by default), an OS disk on custom storage,
+/// the UEFI vars and the TPM state were missing from every native VM
+/// backup.
+fn native_vm_backup_items(
+    manager: &crate::vms::manager::VmManager,
+    config: &crate::vms::manager::VmConfig,
+) -> (Vec<NativeVmItem>, crate::vms::manager::VmConfig) {
+    let name = config.name.as_str();
+    let base = Path::new(NATIVE_VM_BASE);
+    let mut items: Vec<NativeVmItem> = Vec::new();
+
+    let os_disk = manager.boot_disk_path_for(config);
+    if os_disk.exists() {
+        items.push(NativeVmItem {
+            source: os_disk,
+            archive_name: format!("{}.qcow2", name),
+            disk_format: Some("qcow2".to_string()),
+        });
+    } else {
+        warn!("backup {}: no OS disk at {} — archiving the VM without one", name, os_disk.display());
+    }
+
+    let mut archived = config.clone();
+    archived.storage_path = None;
+    for (vol, archived_vol) in config.extra_disks.iter().zip(archived.extra_disks.iter_mut()) {
+        archived_vol.storage_path = NATIVE_VM_BASE.to_string();
+        let src = vol.file_path();
+        if !src.exists() {
+            // build_qemu_command skips a missing volume too; the VM runs
+            // without it, so the backup does as well.
+            warn!("backup {}: extra disk '{}' not found at {} — not archived", name, vol.name, src.display());
+            continue;
+        }
+        items.push(NativeVmItem {
+            source: src,
+            archive_name: format!("{}.{}", vol.name, vol.format),
+            disk_format: Some(vol.format.clone()),
+        });
+    }
+
+    let efivars = manager.efivars_path_for(config);
+    if efivars.exists() {
+        items.push(NativeVmItem {
+            source: efivars,
+            archive_name: format!("{}_VARS.fd", name),
+            disk_format: None,
+        });
+    }
+    for extra in [format!("{}-tpm", name), format!("{}.log", name), format!("{}.runtime.json", name)] {
+        let src = base.join(&extra);
+        if src.exists() {
+            items.push(NativeVmItem { source: src, archive_name: extra, disk_format: None });
+        }
+    }
+
+    // Legacy layout: a `<name>/` folder. Its entries are archived one by one
+    // so a disk already listed above (an extra disk stored in there) is not
+    // archived twice.
+    let legacy = base.join(name);
+    if legacy.is_dir()
+        && let Ok(entries) = fs::read_dir(&legacy)
+    {
+        let disks: Vec<PathBuf> = items.iter()
+            .filter(|i| i.disk_format.is_some())
+            .map(|i| i.source.clone())
+            .collect();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if disks.contains(&path) { continue; }
+            items.push(NativeVmItem {
+                source: path,
+                archive_name: format!("{}/{}", name, entry.file_name().to_string_lossy()),
+                disk_format: None,
+            });
+        }
+    }
+
+    (items, archived)
+}
+
+/// Native WolfStack VM backup. KVM/QEMU process launched as
+/// `qemu-system-* -name <name>`, config + disks under
+/// `/var/lib/wolfstack/vms/` (or custom storage). Every item from
+/// `native_vm_backup_items` is gathered into a work directory and tarred
+/// from there.
+///
+/// Cold (the default): a running VM is shut down, its files are read at
+/// rest, and the RAII guard starts it again on every exit path. Live
+/// (`keep_running`): the VM keeps running and its disks are copied through
+/// QMP as of one instant; the smaller files are copied as they are.
+fn backup_vm_native(name: &str, keep_running: bool) -> Result<(PathBuf, u64), String> {
+    // The VM name flows into filenames and QMP socket paths. Refuse anything
+    // that isn't filename-safe. Real VM names already are (used as
+    // vm-<name>.tar.gz / <name>.json), so this never rejects a legitimate VM.
     if !crate::auth::is_safe_name(name) {
         return Err(format!("refusing to back up VM with unsafe name: {:?}", name));
     }
 
+    let config_path = Path::new(NATIVE_VM_BASE).join(format!("{}.json", name));
+    let config_text = fs::read_to_string(&config_path)
+        .map_err(|e| format!("VM config not found: {} ({})", config_path.display(), e))?;
+    let config: crate::vms::manager::VmConfig = serde_json::from_str(&config_text)
+        .map_err(|e| format!("VM config {} is not valid: {}", config_path.display(), e))?;
+    let manager = crate::vms::manager::VmManager::new();
+    let (items, archived_config) = native_vm_backup_items(&manager, &config);
+
+    let was_running = manager.check_running(name);
+    let live = keep_running && was_running;
+
     let staging = ensure_staging_dir()?;
-    // A VM's qcow2 images are the largest thing WolfStack ever stages, so the
-    // space check matters most here.
-    ensure_staging_space(&format!("VM '{}'", name), vm_content_bytes(name), &staging)?;
+    // A VM's disk images are the largest thing WolfStack ever stages, so the
+    // space check matters most here. A live backup first writes a full copy
+    // of every disk into staging, then the archive, so it needs about twice
+    // the room of a cold one (which archives straight from the originals).
+    let content: u64 = items.iter()
+        .map(|i| if i.source.is_dir() {
+            quick_dir_size_bytes(&i.source.to_string_lossy())
+        } else {
+            fs::metadata(&i.source).map(|m| m.len()).unwrap_or(0)
+        })
+        .sum();
+    let needed = if live { content.saturating_mul(2) } else { content };
+    ensure_staging_space(&format!("VM '{}'", name), (needed > 0).then_some(needed), &staging)?;
+
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
     let filename = format!("vm-{}-{}.tar.gz", name, timestamp);
-    // Guarded: any error below deletes the half-written archive instead of
-    // leaving it in staging forever.
+    // Guarded: any error below deletes the half-written archive and the work
+    // directory instead of leaving them in staging.
     let staged = StagedPath::new(staging.join(&filename));
     let tar_path = staged.path().to_path_buf();
+    let staged_work = StagedPath::new(staging.join(format!("vm-work-{}", Uuid::new_v4())));
+    let work = staged_work.path().to_path_buf();
+    fs::create_dir_all(&work).map_err(|e| format!("Failed to create VM work dir: {}", e))?;
 
-    let vm_base = "/var/lib/wolfstack/vms";
-    let config_file = format!("{}.json", name);
-    let config_path = format!("{}/{}", vm_base, config_file);
-    if !Path::new(&config_path).exists() {
-        return Err(format!("VM config not found: {}", config_path));
-    }
-
-    // Stop the VM so tar reads a disk at rest. This used to look for a
-    // `wolfstack-vm-<name>` process and a `/var/run/wolfstack-vm-<name>.sock`
+    // Cold: stop the VM so every file is read at rest. Stopping used to look
+    // for a `wolfstack-vm-<name>` process and a `/var/run/wolfstack-vm-<name>.sock`
     // monitor, neither of which native QEMU has: it runs as
     // `qemu-system-* -name <name>` with its QMP monitor at
     // `/run/wolfstack-qmp-<name>.sock` (VmManager::start_vm). So a running VM
     // always read as stopped, was never shut down, and tar failed with
     // "<name>.qcow2: file changed as we read it" (RutgerDiehard 2026-09-26).
-    // Now the same detection, stop and restart code the VM page uses decides.
-    let manager = crate::vms::manager::VmManager::new();
-    let was_running = manager.check_running(name);
-    if was_running {
+    let _restart_guard = if was_running && !live {
         stop_vm_and_wait_for_stop(&manager, name, 60, || {
             // ACPI power button through QMP, so the guest shuts down
             // cleanly. A VM started before QMP support has no monitor
@@ -3307,61 +3441,104 @@ fn backup_vm_native(name: &str) -> Result<(PathBuf, u64), String> {
                 }
             }
         })?;
-    }
-
-    // RAII guard: restart on EVERY exit path (success, tar-failure
-    // early return, panic). Shared `VmRestartGuard` is defined
-    // module-level so all three backup_vm_* paths use the same logic.
-    let _restart_guard = VmRestartGuard {
-        name: name.to_string(),
-        should_restart: was_running,
+        // Restarts the VM on EVERY exit path from here (success, error,
+        // panic). Don't add a manual restart below; it would double-start.
+        Some(VmRestartGuard { name: name.to_string(), should_restart: true })
+    } else {
+        None
     };
 
-    // Collect all files belonging to this VM:
-    // - {name}.json (config - required)
-    // - {name}.qcow2 (OS disk)
-    // - {name}.log, {name}.runtime.json (optional)
-    // - {name}/ subdirectory (extra volumes, if exists)
-    let mut tar_items: Vec<String> = vec![config_file];
-    
-    // Add OS disk image
-    let disk_file = format!("{}.qcow2", name);
-    if Path::new(&format!("{}/{}", vm_base, disk_file)).exists() {
-        tar_items.push(disk_file);
-    }
-    
-    // Add optional files (log, runtime)
-    for ext in &["log", "runtime.json"] {
-        let f = format!("{}.{}", name, ext);
-        if Path::new(&format!("{}/{}", vm_base, f)).exists() {
-            tar_items.push(f);
+    for item in &items {
+        if let Some(parent) = Path::new(&item.archive_name).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(work.join(parent))
+                .map_err(|e| format!("Failed to create {} in the VM work dir: {}", parent.display(), e))?;
         }
     }
-    
-    // Add VM subdirectory if it exists (extra volumes stored here)
-    if Path::new(&format!("{}/{}", vm_base, name)).is_dir() {
-        tar_items.push(name.to_string());
+
+    if live {
+        // Disks: one point-in-time copy of all of them through QMP. The
+        // copy is always qcow2; a disk in another format is converted back
+        // to it so the restored VM opens it with the format its config says.
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut converts: Vec<(PathBuf, PathBuf, String)> = Vec::new(); // (qcow2 copy, final path, format)
+        for item in items.iter().filter(|i| i.disk_format.is_some()) {
+            let format = item.disk_format.clone().unwrap_or_default();
+            let dest = work.join(&item.archive_name);
+            let copy = if format == "qcow2" {
+                dest.clone()
+            } else {
+                let tmp = work.join(format!("{}.live.qcow2", item.archive_name));
+                converts.push((tmp.clone(), dest.clone(), format));
+                tmp
+            };
+            pairs.push((item.source.to_string_lossy().into_owned(), copy.to_string_lossy().into_owned()));
+        }
+        // Same six-hour ceiling WolfHA uses for a full copy of a large disk.
+        crate::wolfha::replication::qemu_bitmap::take_full_consistent(name, &pairs, 6 * 60 * 60)
+            .map_err(|e| format!("live copy of VM '{}' failed: {}", name, e))?;
+        for (copy, dest, format) in &converts {
+            let out = Command::new("qemu-img")
+                .args(["convert", "-f", "qcow2", "-O", format])
+                .arg(copy)
+                .arg(dest)
+                .output()
+                .map_err(|e| format!("qemu-img convert failed to start: {}", e))?;
+            if !out.status.success() {
+                return Err(format!("converting the live copy of {} to {} failed: {}",
+                    dest.display(), format, String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            let _ = fs::remove_file(copy);
+        }
+        // Everything else is small and rarely written: copy it as it is.
+        for item in items.iter().filter(|i| i.disk_format.is_none()) {
+            let out = Command::new("cp")
+                .arg("-a")
+                .arg(&item.source)
+                .arg(work.join(&item.archive_name))
+                .output()
+                .map_err(|e| format!("cp failed to start: {}", e))?;
+            if !out.status.success() {
+                return Err(format!("copying {} failed: {}",
+                    item.source.display(), String::from_utf8_lossy(&out.stderr).trim()));
+            }
+        }
+    } else {
+        // Cold: link the originals in and let tar read them (`-h` follows
+        // the links), so nothing is copied twice.
+        for item in &items {
+            std::os::unix::fs::symlink(&item.source, work.join(&item.archive_name))
+                .map_err(|e| format!("Failed to stage {}: {}", item.source.display(), e))?;
+        }
     }
 
+    // The config, rewritten to where restore puts every file.
+    let config_json = serde_json::to_string_pretty(&archived_config)
+        .map_err(|e| format!("serialize VM config: {}", e))?;
+    fs::write(work.join(format!("{}.json", name)), config_json)
+        .map_err(|e| format!("write VM config: {}", e))?;
+
+    let mut top_level: Vec<String> = vec![format!("{}.json", name)];
+    for item in &items {
+        let first = item.archive_name.split('/').next().unwrap_or(&item.archive_name).to_string();
+        if !top_level.contains(&first) {
+            top_level.push(first);
+        }
+    }
     let output = Command::new("tar")
-        .arg("czf")
-        .arg(tar_path.to_string_lossy().to_string())
+        .arg("-czhf")
+        .arg(&tar_path)
         .arg("-C")
-        .arg(vm_base)
-        .args(&tar_items)
+        .arg(&work)
+        .args(&top_level)
         .output()
         .map_err(|e| format!("Failed to tar VM: {}", e))?;
-
     if !output.status.success() {
         return Err(format!("VM tar failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    // Restart handled by RestartGuard's Drop above — fires on success
-    // here OR on any earlier `?`/`return`. Don't add a manual restart
-    // call below; we'd double-start.
-
     let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
-
     Ok((staged.keep(), size))
 }
 
@@ -3371,11 +3548,21 @@ fn backup_vm_native(name: &str) -> Result<(PathBuf, u64), String> {
 /// (also called by the migration path — single source of truth for
 /// the per-platform export format). Output is a WolfStack-format
 /// tar.gz that restores cleanly on any host.
-fn backup_vm_proxmox(name: &str) -> Result<(PathBuf, u64), String> {
+fn backup_vm_proxmox(name: &str, keep_running: bool) -> Result<(PathBuf, u64), String> {
     let manager = crate::vms::manager::VmManager::new();
     let vm = manager.list_vms().into_iter()
         .find(|v| v.name == name)
         .ok_or_else(|| format!("Proxmox VM '{}' not found", name))?;
+
+    // Keep running: Proxmox's own live backup (vzdump snapshot mode) copies
+    // the disks while the guest runs; no stop, no restart.
+    if keep_running && vm.running {
+        let staging = ensure_staging_dir()?;
+        let staging_str = staging.to_string_lossy().to_string();
+        let archive = crate::vms::manager::export_proxmox_vm_live(name, Some(&staging_str))?;
+        let size = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+        return Ok((archive, size));
+    }
 
     // Stop VM for consistent export. C1 fix: graceful stop + poll-
     // until-stopped + force fallback (pre-fix was stop_vm(false) which
@@ -3901,6 +4088,7 @@ fn mount_overrides_for(overrides: &[BackupTarget], kind: &BackupTargetType, name
 pub fn backup_all(
     storage: &BackupStorage,
     stop_containers: bool,
+    keep_vms_running: bool,
     overrides: &[BackupTarget],
 ) -> Vec<BackupEntry> {
     let mut entries = Vec::new();
@@ -3991,6 +4179,7 @@ pub fn backup_all(
                 BackupTarget {
                     target_type: BackupTargetType::Vm,
                     name: vm.name.clone(),
+                    keep_running: keep_vms_running,
                     ..Default::default()
                 },
                 storage,
@@ -4013,7 +4202,9 @@ pub fn backup_all(
                     entries.push(create_backup_entry(
                         BackupTarget {
                             target_type: BackupTargetType::Vm,
-                            name, ..Default::default()
+                            name,
+                            keep_running: keep_vms_running,
+                            ..Default::default()
                         },
                         storage,
                     ));
@@ -4167,7 +4358,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
             }
         }
         BackupTargetType::Lxc => (backup_lxc(&target.name, &target.exclude_mounts, target.stop_for_backup), String::new(), Vec::new()),
-        BackupTargetType::Vm => (backup_vm(&target.name), String::new(), Vec::new()),
+        BackupTargetType::Vm => (backup_vm(&target.name, target.keep_running), String::new(), Vec::new()),
         BackupTargetType::Config => (backup_config(), String::new(), Vec::new()),
         BackupTargetType::SystemPath => (
             backup_system_path(&target.name, &target.system_path, &target.exclude_mounts),
@@ -7380,7 +7571,7 @@ pub fn create_backup(target: Option<BackupTarget>, storage: BackupStorage) -> Ve
         // On-demand "everything" from the UI: live (crash-consistent) container
         // archives, as it always has been — cold backups are a scheduling
         // decision, made per schedule.
-        None => backup_all(&storage, false, &[]),
+        None => backup_all(&storage, false, false, &[]),
     };
 
     config.entries.extend(new_entries.clone());
@@ -7511,8 +7702,13 @@ pub fn create_backup_with_log(
                 (r, String::new(), Vec::new())
             }
             BackupTargetType::Vm => {
-                let _ = log.send(format!("  Backing up VM '{}'...", t.name));
-                (backup_vm(&t.name), String::new(), Vec::new())
+                let _ = log.send(format!("  Backing up VM '{}'{}...", t.name,
+                    if t.keep_running {
+                        " while it keeps running (a running VM is copied live, not shut down)"
+                    } else {
+                        " (a running VM is shut down for the copy, then started again)"
+                    }));
+                (backup_vm(&t.name, t.keep_running), String::new(), Vec::new())
             }
             BackupTargetType::Config => {
                 let _ = log.send("  Archiving WolfStack config files...".to_string());
@@ -8650,7 +8846,7 @@ fn execute_schedule_run(schedule: &BackupSchedule) -> (Vec<BackupEntry>, Schedul
         let mut storage = schedule.storage.clone();
         merge_pbs_secrets(&mut storage);
         let backups: Vec<BackupEntry> = if schedule.backup_all {
-            backup_all(&storage, schedule.stop_containers, &schedule.targets)
+            backup_all(&storage, schedule.stop_containers, schedule.keep_vms_running, &schedule.targets)
         } else {
             schedule.targets.iter()
                 .map(|t| create_backup_entry(t.clone(), &storage))
@@ -10839,6 +11035,7 @@ mod schedule_hook_tests {
             day_of_week: None,
             day_of_month: None,
             stop_containers: false,
+            keep_vms_running: false,
         }
     }
 
@@ -11147,6 +11344,7 @@ mod schedule_day_tests {
             day_of_week: None,
             day_of_month: None,
             stop_containers: false,
+            keep_vms_running: false,
         }
     }
 
@@ -11276,10 +11474,12 @@ mod schedule_day_tests {
         s.day_of_week = Some(3);
         s.backup_all = true;
         s.stop_containers = true;
+        s.keep_vms_running = true;
         let json = serde_json::to_string(&s).unwrap();
         let back: BackupSchedule = serde_json::from_str(&json).unwrap();
         assert_eq!(back.day_of_week, Some(3));
         assert!(back.stop_containers);
+        assert!(back.keep_vms_running);
 
         // And a schedule written before these fields existed still loads, with
         // the pre-existing behaviour (no pinned day, live container backups).
@@ -11289,6 +11489,8 @@ mod schedule_day_tests {
         assert_eq!(old.day_of_week, None);
         assert_eq!(old.day_of_month, None);
         assert!(!old.stop_containers);
+        // VMs keep being shut down for their backup unless asked otherwise.
+        assert!(!old.keep_vms_running);
     }
 
     /// Per-target cold-backup flags survive the same round trip — this is the
@@ -11305,6 +11507,24 @@ mod schedule_day_tests {
         let back: BackupTarget = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert!(back.stop_for_backup);
         assert_eq!(back.target_type, BackupTargetType::Docker);
+    }
+
+    /// A VM target's "keep running" choice survives the round trip, and a
+    /// target saved before the option existed loads with it OFF — a VM
+    /// backed up by an old schedule is still shut down for the copy.
+    #[test]
+    fn a_vm_target_round_trips_keep_running_and_defaults_it_off() {
+        let t = BackupTarget {
+            target_type: BackupTargetType::Vm,
+            name: "win11".to_string(),
+            keep_running: true,
+            ..Default::default()
+        };
+        let back: BackupTarget = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert!(back.keep_running);
+
+        let legacy: BackupTarget = serde_json::from_str(r#"{"type":"vm","name":"win11"}"#).unwrap();
+        assert!(!legacy.keep_running);
     }
 }
 
