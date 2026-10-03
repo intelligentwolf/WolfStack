@@ -38434,7 +38434,13 @@ function renderBackupHistory(backups) {
         const date = b.created_at ? new Date(b.created_at).toLocaleString() : '—';
         const errText = (b.error || '').trim();
         const errTitle = errText ? ` title="${escapeHtml(errText)}"` : '';
-        const statusBadge = b.status === 'completed'
+        // A completed entry only carries error text when tar warned that files
+        // changed while it read them — the archive is usable, just not an
+        // exact point-in-time copy.
+        const hasWarning = b.status === 'completed' && !!errText;
+        const statusBadge = hasWarning
+            ? `<span class="badge" style="background:#b45309; color:#fff; cursor:help;"${errTitle}>Completed with warnings</span>`
+            : b.status === 'completed'
             ? '<span class="badge" style="background:#22c55e; color:#fff;">Completed</span>'
             : b.status === 'failed'
                 ? `<span class="badge" style="background:#ef4444; color:#fff; cursor:help;"${errTitle}>Failed</span>`
@@ -38452,7 +38458,7 @@ function renderBackupHistory(backups) {
             if (vols)  parts.push(`${vols} volume${vols === 1 ? '' : 's'}`);
             if (binds) parts.push(`${binds} bind${binds === 1 ? '' : 's'}`);
             if (parts.length) {
-                const tip = archived.map(m => `${m.mount_type}: ${m.source} → ${m.destination}`).join('\n');
+                const tip = archived.map(m => `${m.mount_type}: ${m.source} → ${m.destination}${m.warning ? ' (files changed while archived)' : ''}`).join('\n');
                 mountsBadge += `<span class="badge" title="${escapeHtml(tip)}" style="background:rgba(59,130,246,0.15); color:#60a5fa; font-size:10px; margin-left:6px;">${parts.join(' + ')}</span>`;
             }
             if (skipped.length) {
@@ -38470,6 +38476,13 @@ function renderBackupHistory(backups) {
                     <details>
                         <summary style="cursor:pointer; list-style:none;">${escapeHtml(errText.length > 140 ? errText.slice(0, 140) + '…' : errText)}</summary>
                         <pre style="margin:4px 0 0; padding:6px 8px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.25); border-radius:4px; color:#fecaca; font-size:11px; white-space:pre-wrap; word-break:break-word; max-height:180px; overflow:auto;">${escapeHtml(errText)}</pre>
+                    </details>
+               </div>`
+            : hasWarning
+            ? `<div style="margin-top:4px; font-size:11px; color:var(--text-primary); max-width:520px;">
+                    <details>
+                        <summary style="cursor:pointer; list-style:none;">⚠ ${escapeHtml(errText.length > 140 ? errText.slice(0, 140) + '…' : errText)}</summary>
+                        <pre style="margin:4px 0 0; padding:6px 8px; background:var(--warning-bg); border:1px solid var(--warning); border-radius:4px; color:var(--text-primary); font-size:11px; white-space:pre-wrap; word-break:break-word; max-height:180px; overflow:auto;">${escapeHtml(errText)}</pre>
                     </details>
                </div>`
             : '';
@@ -42121,7 +42134,10 @@ function renderClusterBackupHistory(backups) {
         const storageLabel = formatStorageLabel(b.storage);
         const size = formatBytes(b.size_bytes || 0);
         const date = b.created_at ? new Date(b.created_at).toLocaleString() : '—';
-        const statusBadge = b.status === 'completed'
+        const warnText = b.status === 'completed' ? (b.error || '').trim() : '';
+        const statusBadge = warnText
+            ? `<span class="badge" style="background:#b45309; color:#fff; cursor:help;" title="${escapeHtml(warnText)}">Completed with warnings</span>`
+            : b.status === 'completed'
             ? '<span class="badge" style="background:#22c55e; color:#fff;">Completed</span>'
             : b.status === 'failed'
                 ? '<span class="badge" style="background:#ef4444; color:#fff;">Failed</span>'
