@@ -428,6 +428,57 @@ mod tests {
         assert!(d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
+    /// A finished tar with the given exit code and stderr.
+    fn tar_output(code: i32, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            // Wait status layout: the exit code sits in bits 8..16.
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// 2026-10 report: /root backup failed on "tar: root: file changed as we
+    /// read it" (exit 1) and threw a good archive away. tar(1): 1 = files
+    /// changed during --create, archive still written; 2 = fatal.
+    #[test]
+    fn tar_exit_1_is_a_warning_not_a_failure() {
+        assert_eq!(tar_create_outcome("t", &tar_output(0, "")), Ok(None));
+        let w = tar_create_outcome("t", &tar_output(1, "tar: root: file changed as we read it"))
+            .expect("exit 1 must not fail the backup");
+        assert_eq!(w.as_deref(), Some("tar: root: file changed as we read it"));
+        // Exit 1 with nothing on stderr still reports a warning.
+        assert!(matches!(tar_create_outcome("t", &tar_output(1, "")), Ok(Some(ref t)) if !t.is_empty()));
+        assert_eq!(tar_create_outcome("t", &tar_output(2, "tar: fatal")), Err("tar: fatal".to_string()));
+    }
+
+    #[test]
+    fn tar_killed_by_signal_is_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(9), // SIGKILL, no exit code
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(tar_create_outcome("t", &out).is_err());
+    }
+
+    #[test]
+    fn long_tar_warning_is_capped() {
+        let long = "x".repeat(TAR_WARNING_MAX_CHARS + 500);
+        let w = tar_create_outcome("t", &tar_output(1, &long)).unwrap().unwrap();
+        assert!(w.chars().count() < TAR_WARNING_MAX_CHARS + 100, "len {}", w.len());
+        assert!(w.contains("truncated"));
+    }
+
+    #[test]
+    fn completed_with_warnings_note_is_empty_for_a_clean_run() {
+        assert_eq!(completed_with_warnings_note(""), "");
+        assert!(completed_with_warnings_note("tar: a: file changed as we read it")
+            .contains("file changed as we read it"));
+    }
+
     /// wabil 2026-07-06 EXACT repro: back up /mnt/docker, exclude
     /// /mnt/docker/plex. End-to-end through the REAL backup_system_path
     /// (pattern generation + tar), not a hand-built tar command. Proves
@@ -451,7 +502,7 @@ mod tests {
 
         let folder = docker.to_string_lossy().to_string();
         let exclude = docker.join("plex").to_string_lossy().to_string();
-        let (tar_path, _size) = backup_system_path("docker", &folder, &[exclude])
+        let (tar_path, _size, _warning) = backup_system_path("docker", &folder, &[exclude])
             .expect("backup_system_path failed");
 
         let listing = std::process::Command::new("tar")
@@ -1236,6 +1287,11 @@ pub struct MountInfo {
     /// tmpfs, etc.). Empty when the mount was successfully archived.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub skipped_reason: String,
+    /// tar's stderr when this mount WAS archived but files changed while it
+    /// was being read (tar exit 1 — see `tar_create_outcome`). The archive
+    /// is usable, just not a point-in-time copy. Empty on a clean archive.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub warning: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1247,6 +1303,9 @@ pub struct BackupEntry {
     pub size_bytes: u64,
     pub created_at: String,
     pub status: BackupStatus,
+    /// Why a Failed entry failed. On a Completed entry, a non-empty value is
+    /// a warning: the archive was written but files changed while tar read
+    /// them (tar exit 1), and the UI shows "Completed with warnings".
     #[serde(default)]
     pub error: String,
     /// Schedule ID that created this, if any
@@ -2272,6 +2331,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                         archive_path: String::new(),
                         size_bytes: 0,
                         skipped_reason: "excluded by operator".into(),
+                        warning: String::new(),
                     });
                     continue;
                 }
@@ -2296,11 +2356,12 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                         archive_path: String::new(),
                         size_bytes: 0,
                         skipped_reason: format!("volume data directory not found ({})", data_dir),
+                        warning: String::new(),
                     });
                     continue;
                 }
                 match tar_dir_to_gz(&data_dir, &archive_abs) {
-                    Ok(size) => {
+                    Ok((size, warning)) => {
                         mounts.push(MountInfo {
                             mount_type: "volume".into(),
                             source: vol_name,
@@ -2308,6 +2369,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                             archive_path: archive_rel,
                             size_bytes: size,
                             skipped_reason: String::new(),
+                            warning: warning.unwrap_or_default(),
                         });
                     }
                     Err(e) => {
@@ -2318,6 +2380,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                             archive_path: String::new(),
                             size_bytes: 0,
                             skipped_reason: format!("tar failed: {}", e),
+                            warning: String::new(),
                         });
                     }
                 }
@@ -2334,6 +2397,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                         archive_path: String::new(),
                         size_bytes: 0,
                         skipped_reason: "excluded by operator".into(),
+                        warning: String::new(),
                     });
                     continue;
                 }
@@ -2346,6 +2410,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                         archive_path: String::new(),
                         size_bytes: 0,
                         skipped_reason: reason,
+                        warning: String::new(),
                     });
                     continue;
                 }
@@ -2357,13 +2422,14 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                         archive_path: String::new(),
                         size_bytes: 0,
                         skipped_reason: "host source path does not exist".into(),
+                        warning: String::new(),
                     });
                     continue;
                 }
                 let archive_rel = format!("binds/bind-{}.tar.gz", idx);
                 let archive_abs = work_dir.join(&archive_rel);
                 match tar_path_to_gz(&source, &archive_abs) {
-                    Ok(size) => {
+                    Ok((size, warning)) => {
                         mounts.push(MountInfo {
                             mount_type: "bind".into(),
                             source,
@@ -2371,6 +2437,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                             archive_path: archive_rel,
                             size_bytes: size,
                             skipped_reason: String::new(),
+                            warning: warning.unwrap_or_default(),
                         });
                     }
                     Err(e) => {
@@ -2381,6 +2448,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                             archive_path: String::new(),
                             size_bytes: 0,
                             skipped_reason: format!("tar failed: {}", e),
+                            warning: String::new(),
                         });
                     }
                 }
@@ -2394,6 +2462,7 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
                     archive_path: String::new(),
                     size_bytes: 0,
                     skipped_reason: "tmpfs/unsupported mount type — not archived".into(),
+                    warning: String::new(),
                 });
             }
         }
@@ -2472,29 +2541,94 @@ fn short_path_discriminator(path: &str) -> String {
     out
 }
 
+/// Longest tar warning text kept on a backup entry. tar prints one line per
+/// changed file, so a busy volume could otherwise put thousands of lines into
+/// backups.json on every run.
+const TAR_WARNING_MAX_CHARS: usize = 2000;
+
+/// Judge a finished `tar --create` by GNU tar's exit status. Source: tar(1)
+/// RETURN VALUE — 0 is success; 1 is "some files differ", which under
+/// --create means "some files were changed while being archived and so the
+/// resulting archive does not contain the exact copy of the file set": the
+/// archive IS written and usable; 2 is a fatal error.
+///
+/// Ok(None) on 0, Ok(Some(tar's stderr, capped)) on 1, Err(stderr) on
+/// anything else — including death by signal, which has no exit code. Exit 1
+/// is always written to the journal in full, labelled with `what`. Before
+/// this, live folders and hot Docker volumes failed at random whenever a file
+/// changed mid-read, throwing away a good archive.
+fn tar_create_outcome(what: &str, output: &std::process::Output) -> Result<Option<String>, String> {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => Ok(None),
+        Some(1) => {
+            warn!("tar for {} completed with warnings (files changed while being archived): {}", what, stderr);
+            Ok(Some(if stderr.is_empty() {
+                "files changed while tar was reading them".to_string()
+            } else if stderr.chars().count() > TAR_WARNING_MAX_CHARS {
+                let kept: String = stderr.chars().take(TAR_WARNING_MAX_CHARS).collect();
+                format!("{}… (truncated; full text in the WolfStack journal)", kept)
+            } else {
+                stderr
+            }))
+        }
+        _ => Err(stderr),
+    }
+}
+
+/// One line per archived Docker mount whose tar reported files changing
+/// mid-read, for the backup entry. Empty when every mount archived cleanly.
+fn docker_mount_warnings(mounts: &[MountInfo]) -> String {
+    mounts.iter()
+        .filter(|m| !m.warning.is_empty())
+        .map(|m| format!("{} {}: {}", m.mount_type, m.destination, m.warning))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text stored in a Completed entry's `error` field when tar warned —
+/// the UI keys "Completed with warnings" off it. Empty in, empty out.
+fn completed_with_warnings_note(tar_warning: &str) -> String {
+    if tar_warning.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Completed with warnings: files changed while being archived, so this backup is \
+         usable but not an exact point-in-time copy.\n{}",
+        tar_warning
+    )
+}
+
 /// tar.gz a directory's contents (NOT the directory itself) into the
-/// given archive path. Returns the resulting archive size in bytes.
-fn tar_dir_to_gz(src_dir: &str, archive: &Path) -> Result<u64, String> {
+/// given archive path. Returns the archive size in bytes and, when files
+/// changed while being read, tar's warning (see `tar_create_outcome`).
+fn tar_dir_to_gz(src_dir: &str, archive: &Path) -> Result<(u64, Option<String>), String> {
     let out = Command::new("tar")
-        .arg("czf")
+        // Sockets and doors can never be archived; tar's "socket ignored"
+        // line is noise, not something the operator can act on.
+        .arg("--warning=no-file-ignored")
+        .arg("-czf")
         .arg(archive)
         .arg("-C")
         .arg(src_dir)
         .arg(".")
         .output()
         .map_err(|e| format!("tar spawn failed: {}", e))?;
-    if !out.status.success() {
-        // tar leaves whatever it had written when it failed — drop it here so
-        // a failing target can't accumulate a partial archive per run.
-        let _ = fs::remove_file(archive);
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    match tar_create_outcome(&format!("'{}'", src_dir), &out) {
+        Ok(warning) => Ok((fs::metadata(archive).map(|m| m.len()).unwrap_or(0), warning)),
+        Err(e) => {
+            // tar leaves whatever it had written when it failed — drop it here so
+            // a failing target can't accumulate a partial archive per run.
+            let _ = fs::remove_file(archive);
+            Err(e)
+        }
     }
-    Ok(fs::metadata(archive).map(|m| m.len()).unwrap_or(0))
 }
 
 /// tar.gz an arbitrary path (file or dir). Used for bind mounts where
-/// `Source` may be a file (e.g. a single config) or a directory.
-fn tar_path_to_gz(src: &str, archive: &Path) -> Result<u64, String> {
+/// `Source` may be a file (e.g. a single config) or a directory. Returns
+/// the same `(size, warning)` pair as `tar_dir_to_gz`.
+fn tar_path_to_gz(src: &str, archive: &Path) -> Result<(u64, Option<String>), String> {
     let p = Path::new(src);
     let (parent, name) = if p.is_dir() {
         // tar -C parent name → archive contains a "name" entry at the root.
@@ -2507,18 +2641,21 @@ fn tar_path_to_gz(src: &str, archive: &Path) -> Result<u64, String> {
         (parent, name)
     };
     let out = Command::new("tar")
-        .arg("czf")
+        .arg("--warning=no-file-ignored")
+        .arg("-czf")
         .arg(archive)
         .arg("-C")
         .arg(&parent)
         .arg(&name)
         .output()
         .map_err(|e| format!("tar spawn failed: {}", e))?;
-    if !out.status.success() {
-        let _ = fs::remove_file(archive);
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    match tar_create_outcome(&format!("'{}'", src), &out) {
+        Ok(warning) => Ok((fs::metadata(archive).map(|m| m.len()).unwrap_or(0), warning)),
+        Err(e) => {
+            let _ = fs::remove_file(archive);
+            Err(e)
+        }
     }
-    Ok(fs::metadata(archive).map(|m| m.len()).unwrap_or(0))
 }
 
 /// Backup an LXC container — tar rootfs + config
@@ -3876,7 +4013,9 @@ fn folder_exclude_pattern(raw: &str, src: &str, leaf: &str, contents_only: bool)
     Some(if contents_only { rel_to_src } else { format!("{}/{}", leaf, rel_to_src) })
 }
 
-pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) -> Result<(PathBuf, u64), String> {
+/// Returns `(archive, size, warning)`; `warning` is empty unless files
+/// changed while tar read them (see `tar_create_outcome`).
+pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) -> Result<(PathBuf, u64, String), String> {
     validate_system_path(path)?;
     let staging = ensure_staging_dir()?;
     let folder_bytes = match quick_dir_size_bytes(path) {
@@ -3939,6 +4078,8 @@ pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) ->
     // `-czf` (dashed) — old-style `czf` must be the FIRST argument, but the
     // `--exclude` flags above precede it, so the bare form made tar abort the
     // moment any exclusion was present (the root of wabil's "exclude ignored").
+    // Sockets can never be archived; tar's "socket ignored" line is noise.
+    tar_cmd.arg("--warning=no-file-ignored");
     if contents_only {
         tar_cmd.args(["-czf", &tar_path.to_string_lossy(), "-C", src, "."]);
     } else {
@@ -3947,11 +4088,14 @@ pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) ->
     let output = tar_cmd
         .output()
         .map_err(|e| format!("Failed to tar system folder: {}", e))?;
-    if !output.status.success() {
-        return Err(format!("System folder tar failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
-    }
+    // A live folder changes under tar all the time — a process rewriting a
+    // file in it bumps the folder's own mtime, which no exclude can prevent
+    // (/root with a write-temp-then-rename config, 2026-10). That is tar exit
+    // 1 with a complete archive, so keep it and carry the warning.
+    let warning = tar_create_outcome(&format!("system folder '{}'", path), &output)
+        .map_err(|e| format!("System folder tar failed: {}", e))?;
     let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
-    Ok((staged.keep(), size))
+    Ok((staged.keep(), size, warning.unwrap_or_default()))
 }
 
 /// True when every top-level member of the archive is the folder's leaf name —
@@ -4350,20 +4494,27 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
         }
         // else: fall through to the tarball path (VM/Proxmox-LXC).
 
-    let (result, docker_config, mounts) = match target.target_type {
+    // `tar_warning`: tar's text when the archive completed but files changed
+    // while it was read (see `tar_create_outcome`); empty otherwise.
+    let (result, docker_config, mounts, tar_warning) = match target.target_type {
         BackupTargetType::Docker => {
             match backup_docker(&target.name, &target.exclude_mounts, target.stop_for_backup) {
-                Ok((path, size, config, m)) => (Ok((path, size)), config, m),
-                Err(e) => (Err(e), String::new(), Vec::new()),
+                Ok((path, size, config, m)) => {
+                    let w = docker_mount_warnings(&m);
+                    (Ok((path, size)), config, m, w)
+                }
+                Err(e) => (Err(e), String::new(), Vec::new(), String::new()),
             }
         }
-        BackupTargetType::Lxc => (backup_lxc(&target.name, &target.exclude_mounts, target.stop_for_backup), String::new(), Vec::new()),
-        BackupTargetType::Vm => (backup_vm(&target.name, target.keep_running), String::new(), Vec::new()),
-        BackupTargetType::Config => (backup_config(), String::new(), Vec::new()),
-        BackupTargetType::SystemPath => (
-            backup_system_path(&target.name, &target.system_path, &target.exclude_mounts),
-            String::new(), Vec::new(),
-        ),
+        BackupTargetType::Lxc => (backup_lxc(&target.name, &target.exclude_mounts, target.stop_for_backup), String::new(), Vec::new(), String::new()),
+        BackupTargetType::Vm => (backup_vm(&target.name, target.keep_running), String::new(), Vec::new(), String::new()),
+        BackupTargetType::Config => (backup_config(), String::new(), Vec::new(), String::new()),
+        BackupTargetType::SystemPath => {
+            match backup_system_path(&target.name, &target.system_path, &target.exclude_mounts) {
+                Ok((path, size, w)) => (Ok((path, size)), String::new(), Vec::new(), w),
+                Err(e) => (Err(e), String::new(), Vec::new(), String::new()),
+            }
+        }
     };
 
     match result {
@@ -4387,7 +4538,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                         size_bytes: size,
                         created_at: now,
                         status: BackupStatus::Completed,
-                        error: String::new(),
+                        error: completed_with_warnings_note(&tar_warning),
                         schedule_id: String::new(),
                         comments,
                         node_hostname: hostname,
@@ -7661,7 +7812,8 @@ pub fn create_backup_with_log(
         }
 
         // Run the backup with line-by-line output for vzdump
-        let (result, docker_config, mounts) = match t.target_type {
+        // `tar_warning`: see the same binding in `create_backup_entry`.
+        let (result, docker_config, mounts, tar_warning) = match t.target_type {
             BackupTargetType::Docker => {
                 let _ = log.send(format!("  Exporting Docker container '{}'{}...",
                     t.name,
@@ -7680,9 +7832,10 @@ pub fn create_backup_with_log(
                                 let _ = log.send(format!("    skipped {} {}: {}", x.mount_type, x.destination, x.skipped_reason));
                             }
                         }
-                        (Ok((path, size)), config, m)
+                        let w = docker_mount_warnings(&m);
+                        (Ok((path, size)), config, m, w)
                     },
-                    Err(e) => (Err(e), String::new(), Vec::new()),
+                    Err(e) => (Err(e), String::new(), Vec::new(), String::new()),
                 }
             }
             BackupTargetType::Lxc => {
@@ -7699,7 +7852,7 @@ pub fn create_backup_with_log(
                         if t.stop_for_backup { " — stopping for a cold backup" } else { " while it runs" }));
                     backup_lxc(&t.name, &t.exclude_mounts, t.stop_for_backup)
                 };
-                (r, String::new(), Vec::new())
+                (r, String::new(), Vec::new(), String::new())
             }
             BackupTargetType::Vm => {
                 let _ = log.send(format!("  Backing up VM '{}'{}...", t.name,
@@ -7708,11 +7861,11 @@ pub fn create_backup_with_log(
                     } else {
                         " (a running VM is shut down for the copy, then started again)"
                     }));
-                (backup_vm(&t.name, t.keep_running), String::new(), Vec::new())
+                (backup_vm(&t.name, t.keep_running), String::new(), Vec::new(), String::new())
             }
             BackupTargetType::Config => {
                 let _ = log.send("  Archiving WolfStack config files...".to_string());
-                (backup_config(), String::new(), Vec::new())
+                (backup_config(), String::new(), Vec::new(), String::new())
             }
             BackupTargetType::SystemPath => {
                 let _ = log.send(format!("  Archiving system folder '{}'...", t.system_path));
@@ -7733,7 +7886,10 @@ pub fn create_backup_with_log(
                             dropped.len(), t.system_path, dropped.join(", ")));
                     }
                 }
-                (backup_system_path(&t.name, &t.system_path, &t.exclude_mounts), String::new(), Vec::new())
+                match backup_system_path(&t.name, &t.system_path, &t.exclude_mounts) {
+                    Ok((path, size, w)) => (Ok((path, size)), String::new(), Vec::new(), w),
+                    Err(e) => (Err(e), String::new(), Vec::new(), String::new()),
+                }
             }
         };
 
@@ -7762,10 +7918,14 @@ pub fn create_backup_with_log(
                     Ok(_) => {
                         let _ = fs::remove_file(&local_path);
                         let _ = log.send(format!("  ✓ {} backup complete ({})", type_name, format_size_human(size)));
+                        let warning = completed_with_warnings_note(&tar_warning);
+                        if !warning.is_empty() {
+                            let _ = log.send(format!("  ⚠ {}", warning));
+                        }
                         BackupEntry {
                             id, target: t.clone(), storage: storage.clone(), filename,
                             size_bytes: size, created_at: now, status: BackupStatus::Completed,
-                            error: String::new(), schedule_id: String::new(),
+                            error: warning, schedule_id: String::new(),
                             comments, node_hostname: hostname, docker_config,
                             mounts: mounts.clone(),
                         }
