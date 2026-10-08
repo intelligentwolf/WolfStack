@@ -86023,8 +86023,8 @@ function wolfHaOpenSettings(nodeId, container, current) {
     document.getElementById('wolfha-settings-modal')?.remove();
     const modal = document.createElement('div');
     modal.id = 'wolfha-settings-modal';
-    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
-    modal.innerHTML = `<div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:24px 30px;min-width:380px;max-width:460px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);padding:16px;box-sizing:border-box;';
+    modal.innerHTML = `<div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:24px 30px;width:100%;max-width:460px;max-height:100%;overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
         <h3 style="margin:0 0 12px;">HA settings — '${vlanEsc(container)}'</h3>
         <div style="display:flex;flex-direction:column;gap:10px;font-size:13px;">
             <div><label style="color:var(--text-muted);">Sync interval (minutes)</label>
@@ -86069,8 +86069,8 @@ function wolfHaOpenProtectModal() {
     const nodes = getClusterNodes(wolfHaCurrentCluster).filter(n => n.online);
     const modal = document.createElement('div');
     modal.id = 'wolfha-protect-modal';
-    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
-    modal.innerHTML = `<div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:24px 30px;min-width:420px;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);padding:16px;box-sizing:border-box;';
+    modal.innerHTML = `<div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:24px 30px;width:100%;max-width:520px;max-height:100%;overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
         <h3 style="margin:0 0 12px;">Protect a container or VM</h3>
         <div style="display:flex;flex-direction:column;gap:10px;">
             <div><label style="font-size:13px;color:var(--text-muted);">What to protect</label>
