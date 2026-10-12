@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.34.3: SSL sites made in WolfStack no longer put HTTPS on port 80 over IPv6** _(2026-10-12 — [`fe535165`](https://github.com/intelligentwolf/WolfStack/commit/fe535165e2aca2d36df9abce1b3d1c89880c95e3))_
 - **v25.34.2: fit the WolfHA protect and settings dialogs on screen, scrolling when they are taller** _(2026-10-08 — [`7dbb378c`](https://github.com/intelligentwolf/WolfStack/commit/7dbb378c41fa16a1484a33b9989030d7f71d5020))_
 - **v25.34.1: keep a backup when tar says files changed while it read them, instead of failing it** _(2026-10-03 — [`228fe8b5`](https://github.com/intelligentwolf/WolfStack/commit/228fe8b5c97c6f5792a287fc52dc72353d950c94))_
 - **v25.34.0: back a VM up without shutting it down, and stop native VM backups leaving disks out** _(2026-09-28 — [`a2df0a52`](https://github.com/intelligentwolf/WolfStack/commit/a2df0a52bac5071d6211fb516f3b041a28214a75))_
