@@ -376,18 +376,15 @@ pub fn generate_site_config(params: &NginxSiteParams) -> String {
 
     config.push_str("server {\n");
 
-    if params.ssl && params.listen_port == 80 {
-        config.push_str("    listen 443 ssl;\n");
-        config.push_str("    listen [::]:443 ssl;\n");
-    } else if params.ssl {
-        config.push_str(&format!("    listen {} ssl;\n", params.listen_port));
-        config.push_str(&format!("    listen [::]{} ssl;\n",
-            if params.listen_port == 443 { String::new() } else { format!(":{}", params.listen_port) }));
-    } else {
-        config.push_str(&format!("    listen {};\n", params.listen_port));
-        config.push_str(&format!("    listen [::]{};\n",
-            if params.listen_port == 80 { String::new() } else { format!(":{}", params.listen_port) }));
-    }
+    // Always write the IPv6 port explicitly. nginx reads an address with no
+    // port as port 80, so the old `listen [::] ssl;` (written whenever SSL
+    // was ticked with port 443) put TLS on [::]:80. WolfProxy follows the
+    // same rule, saw port 80 claimed as HTTPS, and then collided with its
+    // own plain-HTTP listener on :80 (klas, 2026-10-12).
+    let port = if params.ssl && params.listen_port == 80 { 443 } else { params.listen_port };
+    let ssl = if params.ssl { " ssl" } else { "" };
+    config.push_str(&format!("    listen {}{};\n", port, ssl));
+    config.push_str(&format!("    listen [::]:{}{};\n", port, ssl));
 
     config.push_str(&format!("    server_name {};\n", params.server_name));
     config.push('\n');
@@ -438,4 +435,67 @@ pub fn generate_site_config(params: &NginxSiteParams) -> String {
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(listen_port: u16, ssl: bool) -> NginxSiteParams {
+        NginxSiteParams {
+            server_name: "example.com".to_string(),
+            listen_port,
+            ssl,
+            ssl_cert: Some("/etc/ssl/a.pem".to_string()),
+            ssl_key: Some("/etc/ssl/a.key".to_string()),
+            proxy_pass: Some("http://127.0.0.1:8080".to_string()),
+            root: None,
+        }
+    }
+
+    /// Every listen line must carry an explicit port: a bare `[::]` means
+    /// port 80 to nginx and WolfProxy, whatever the site intended.
+    fn assert_no_bare_ipv6_listen(cfg: &str) {
+        for line in cfg.lines().map(str::trim).filter(|l| l.starts_with("listen [::]")) {
+            assert!(line.starts_with("listen [::]:"), "IPv6 listen without a port: {line}");
+        }
+    }
+
+    #[test]
+    fn ssl_on_443_listens_on_443_for_both_families() {
+        let cfg = generate_site_config(&params(443, true));
+        assert!(cfg.contains("    listen 443 ssl;\n"));
+        assert!(cfg.contains("    listen [::]:443 ssl;\n"));
+        assert!(!cfg.contains("listen 80 ssl") && !cfg.contains("[::]:80 ssl"));
+        assert_no_bare_ipv6_listen(&cfg);
+    }
+
+    #[test]
+    fn ssl_with_port_80_moves_tls_to_443_and_redirects_80() {
+        let cfg = generate_site_config(&params(80, true));
+        assert!(cfg.contains("    listen 443 ssl;\n"));
+        assert!(cfg.contains("    listen [::]:443 ssl;\n"));
+        assert!(cfg.contains("    listen 80;\n"));
+        assert!(cfg.contains("    listen [::]:80;\n"));
+        assert_no_bare_ipv6_listen(&cfg);
+    }
+
+    #[test]
+    fn plain_http_ports_are_explicit() {
+        let cfg = generate_site_config(&params(80, false));
+        assert!(cfg.contains("    listen 80;\n"));
+        assert!(cfg.contains("    listen [::]:80;\n"));
+        assert_no_bare_ipv6_listen(&cfg);
+
+        let cfg = generate_site_config(&params(8080, false));
+        assert!(cfg.contains("    listen 8080;\n"));
+        assert!(cfg.contains("    listen [::]:8080;\n"));
+    }
+
+    #[test]
+    fn ssl_on_a_custom_port_keeps_that_port() {
+        let cfg = generate_site_config(&params(8443, true));
+        assert!(cfg.contains("    listen 8443 ssl;\n"));
+        assert!(cfg.contains("    listen [::]:8443 ssl;\n"));
+    }
 }
