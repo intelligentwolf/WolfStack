@@ -82759,7 +82759,11 @@ async function arraySelfTestRun(device, kind) {
         if (!ok) return;
     }
     try {
-        const r = await fetch('/api/array/smart-tests/run', {
+        // apiUrl(): the card lists the SELECTED node's drives, so the test must
+        // go to that node too. A bare path ran it on the node serving the UI —
+        // "unknown device" for a drive only the remote host has, and silently
+        // the wrong disk when both hosts have one of the same name (/dev/sda).
+        const r = await fetch(apiUrl('/api/array/smart-tests/run'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ device: device, kind: kind }),
