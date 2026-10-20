@@ -50821,6 +50821,7 @@ function switchSettingsTab(tabName) {
         // the operator never opens.
         if (typeof switchAlertsSub === 'function') switchAlertsSub('overview');
     } else if (tabName === 'security') {
+        loadTamperProtection();
         loadClusterSecretStatus();
         loadReclusterOverrideStatus();
         loadLeaveClusterContext();
@@ -50851,6 +50852,8 @@ function switchSettingsTab(tabName) {
         loadPlugins();
     } else if (tabName === 'apikeys') {
         loadApiKeysTab();
+    } else if (tabName === 'mcp') {
+        loadMcpTab();
     } else if (tabName === 'profile') {
         loadUserProfile();
     } else if (tabName === 'systemcheck') {
@@ -52171,6 +52174,301 @@ async function dangerRollback(id) {
     }
 }
 window.dangerRollback = dangerRollback;
+
+// ─── Tamper protection maintenance switch ───
+//
+// Pause before adding a user / editing sudoers or sshd_config / changing
+// root's SSH keys, resume afterwards — resuming accepts the files as they
+// are. Without it the first such change is reverted as a suspected
+// backdoor (klas, 2026-10-20).
+
+let _tamperPaused = null;
+
+async function loadTamperProtection() {
+    const status = document.getElementById('tamper-protection-status');
+    const btn = document.getElementById('tamper-protection-btn');
+    const detail = document.getElementById('tamper-protection-detail');
+    if (!status || !btn) return;
+    try {
+        const r = await fetch(apiUrl('/api/security/tamper-protection'));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        _tamperPaused = !!d.paused;
+        if (_tamperPaused) {
+            const since = d.paused_at ? new Date(d.paused_at * 1000).toLocaleString() : '';
+            status.textContent = 'Paused';
+            status.style.color = '#f59e0b';
+            btn.textContent = 'Resume and accept changes';
+            btn.className = 'btn btn-primary';
+            detail.textContent = `Paused by ${d.paused_by || 'unknown'}${since ? ' at ' + since : ''}. Changes are not being checked or reverted.`;
+        } else {
+            status.textContent = 'On';
+            status.style.color = 'var(--success, #10b981)';
+            btn.textContent = 'Pause for maintenance';
+            btn.className = 'btn';
+            detail.textContent = '';
+        }
+        btn.style.display = '';
+    } catch (e) {
+        status.textContent = 'Unknown';
+        status.style.color = '';
+        btn.style.display = 'none';
+        detail.textContent = 'Could not load tamper protection status: ' + (e.message || e);
+    }
+}
+
+async function toggleTamperProtection() {
+    const btn = document.getElementById('tamper-protection-btn');
+    const detail = document.getElementById('tamper-protection-detail');
+    const resuming = _tamperPaused === true;
+    const ok = await wolfConfirm(resuming
+        ? 'Resume tamper protection? The protected files are accepted exactly as they are now, so only do this once you have finished your changes and checked them.'
+        : 'Pause tamper protection on this node? Changes to /etc/passwd, sudoers, sshd_config, root\'s SSH keys and fail2ban will not be checked or reverted until you resume. An Inbox card reminds you while it is paused.',
+        resuming ? 'Resume tamper protection' : 'Pause tamper protection',
+        { okText: resuming ? 'Resume and accept' : 'Pause', danger: !resuming });
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+        const r = await fetch(apiUrl('/api/security/tamper-protection'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paused: !resuming }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        showToast(resuming
+            ? `Tamper protection is on — ${(d.accepted || []).length} file(s) accepted as they are now`
+            : 'Tamper protection paused — remember to resume when you are done', resuming ? 'success' : 'warning');
+    } catch (e) {
+        detail.textContent = '';
+        showToast((resuming ? 'Could not resume: ' : 'Could not pause: ') + (e.message || e), 'error', 0);
+    } finally {
+        btn.disabled = false;
+        loadTamperProtection();
+    }
+}
+
+window.toggleTamperProtection = toggleTamperProtection;
+
+// ─── AI Agents (MCP) ───
+//
+// Settings → AI Agents (MCP): enable the node's MCP endpoint, set the public
+// URL its OAuth tokens are bound to, and review / revoke what agents were
+// granted. Talks to the node serving the UI (settings are per node).
+
+function mcpFormatTime(unixSecs) {
+    if (!unixSecs) return '—';
+    try { return new Date(unixSecs * 1000).toLocaleString(); } catch (e) { return '—'; }
+}
+
+function setMcpUrlError(msg) {
+    const input = document.getElementById('mcp-public-url');
+    const err = document.getElementById('mcp-public-url-error');
+    if (!input || !err) return;
+    if (msg) {
+        input.setAttribute('aria-invalid', 'true');
+        err.textContent = msg;
+        err.style.display = 'block';
+    } else {
+        input.removeAttribute('aria-invalid');
+        err.textContent = '';
+        err.style.display = 'none';
+    }
+}
+
+function renderMcpConnect(mcpUrl) {
+    const box = document.getElementById('mcp-connect');
+    if (!box) return;
+    if (!mcpUrl) { box.style.display = 'none'; return; }
+    document.getElementById('mcp-url-text').textContent = mcpUrl;
+    document.getElementById('mcp-claude-cmd').textContent = `claude mcp add --transport http wolfstack ${mcpUrl}`;
+    box.style.display = 'block';
+}
+
+async function copyMcpText(elementId) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    try {
+        await navigator.clipboard.writeText(el.textContent);
+        showToast('Copied to clipboard', 'success', 1500);
+    } catch (e) {
+        // Clipboard needs a secure context; say so instead of failing silently.
+        showToast('Could not copy automatically — select the text and copy it by hand.', 'error', 0);
+    }
+}
+
+async function loadMcpTab() {
+    const loadErr = document.getElementById('mcp-load-error');
+    if (!loadErr) return;
+    loadErr.style.display = 'none';
+    try {
+        const r = await fetch(apiUrl('/api/mcp/settings'));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        const cfg = d.config || {};
+        document.getElementById('mcp-public-url').value = cfg.public_url || '';
+        document.getElementById('mcp-enabled').checked = !!cfg.enabled;
+        document.getElementById('mcp-allow-api-keys').checked = !!cfg.allow_api_keys;
+        document.getElementById('mcp-tls-warning').style.display = d.tls_listener ? 'none' : 'block';
+        setMcpUrlError('');
+        renderMcpConnect(d.mcp_url);
+    } catch (e) {
+        loadErr.textContent = 'Could not load MCP settings: ' + (e.message || e);
+        loadErr.style.display = 'block';
+        return;
+    }
+    loadMcpGrants();
+    loadMcpClients();
+}
+
+async function saveMcpSettings(ev) {
+    if (ev) ev.preventDefault();
+    const btn = document.getElementById('mcp-save-btn');
+    const status = document.getElementById('mcp-save-status');
+    const url = document.getElementById('mcp-public-url').value.trim();
+    const enabled = document.getElementById('mcp-enabled').checked;
+    const allowKeys = document.getElementById('mcp-allow-api-keys').checked;
+    setMcpUrlError('');
+    status.textContent = '';
+    if (enabled && !url) {
+        setMcpUrlError('Enter the public HTTPS URL before enabling MCP.');
+        document.getElementById('mcp-public-url').focus();
+        return;
+    }
+    if (url && !/^https:\/\//i.test(url)) {
+        setMcpUrlError('The URL must start with https://');
+        document.getElementById('mcp-public-url').focus();
+        return;
+    }
+    btn.disabled = true;
+    status.textContent = 'Saving…';
+    try {
+        const r = await fetch(apiUrl('/api/mcp/settings'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled, public_url: url, allow_api_keys: allowKeys }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            status.textContent = '';
+            setMcpUrlError(d.error || `Save failed (HTTP ${r.status})`);
+            document.getElementById('mcp-public-url').focus();
+            return;
+        }
+        document.getElementById('mcp-public-url').value = (d.config && d.config.public_url) || '';
+        status.textContent = d.config && d.config.enabled ? 'Saved — MCP is on for this node.' : 'Saved — MCP is off for this node.';
+        renderMcpConnect(d.mcp_url);
+        loadMcpGrants();
+    } catch (e) {
+        status.textContent = '';
+        showToast('Could not save MCP settings: ' + (e.message || e), 'error', 0);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function loadMcpGrants() {
+    const tbody = document.getElementById('mcp-grants-body');
+    if (!tbody) return;
+    try {
+        const r = await fetch(apiUrl('/api/mcp/grants'));
+        const grants = await r.json().catch(() => null);
+        if (!r.ok || !Array.isArray(grants)) throw new Error((grants && grants.error) || `HTTP ${r.status}`);
+        if (grants.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px;">No agent has been approved on this node.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = grants.map(g => `<tr>
+            <td style="font-weight:600;">${escapeHtml(g.username)}</td>
+            <td>${escapeHtml(g.client_name)}</td>
+            <td style="font-size:11px;">${(g.scopes || []).map(s => `<span style="background:var(--bg-tertiary);padding:1px 6px;border-radius:4px;margin-right:3px;">${escapeHtml(s)}</span>`).join('')}</td>
+            <td style="font-size:12px;color:var(--text-muted);">${escapeHtml(mcpFormatTime(g.last_used_at))}</td>
+            <td style="font-size:12px;color:var(--text-muted);">${escapeHtml(mcpFormatTime(g.expires_at))}</td>
+            <td><button type="button" class="btn btn-sm" style="font-size:11px;color:var(--danger);border-color:var(--danger);"
+                data-mcp-action="revoke-grant" data-id="${escapeAttr(g.id)}" data-user="${escapeAttr(g.username)}"
+                aria-label="Revoke ${escapeAttr(g.client_name)} access for ${escapeAttr(g.username)}"
+                data-client="${escapeAttr(g.client_name)}">Revoke</button></td>
+        </tr>`).join('');
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="6" role="alert" style="text-align:center;color:var(--danger,#ef4444);padding:20px;">Could not load approvals: ${escapeHtml(e.message || String(e))}</td></tr>`;
+    }
+}
+
+async function loadMcpClients() {
+    const tbody = document.getElementById('mcp-clients-body');
+    if (!tbody) return;
+    try {
+        const r = await fetch(apiUrl('/api/mcp/clients'));
+        const clients = await r.json().catch(() => null);
+        if (!r.ok || !Array.isArray(clients)) throw new Error((clients && clients.error) || `HTTP ${r.status}`);
+        if (clients.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:20px;">No apps registered.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = clients.map(c => {
+            const hosts = (c.redirect_uris || []).map(u => { try { return new URL(u).host; } catch (e) { return u; } });
+            return `<tr>
+                <td>${escapeHtml(c.client_name)}</td>
+                <td style="font-size:12px;"><code>${escapeHtml(hosts.join(', '))}</code></td>
+                <td style="font-size:12px;color:var(--text-muted);">${escapeHtml(mcpFormatTime(c.created_at))}</td>
+                <td style="font-size:12px;color:var(--text-muted);">${c.approved_at ? escapeHtml(mcpFormatTime(c.approved_at)) : '<em>Never</em>'}</td>
+                <td><button type="button" class="btn btn-sm" style="font-size:11px;color:var(--danger);border-color:var(--danger);"
+                    data-mcp-action="remove-client" data-id="${escapeAttr(c.client_id)}"
+                    aria-label="Remove app ${escapeAttr(c.client_name)}"
+                    data-client="${escapeAttr(c.client_name)}">Remove</button></td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" role="alert" style="text-align:center;color:var(--danger,#ef4444);padding:20px;">Could not load apps: ${escapeHtml(e.message || String(e))}</td></tr>`;
+    }
+}
+
+async function revokeMcpGrant(id, username, clientName) {
+    if (!(await wolfConfirm(`Revoke ${clientName}'s access as ${username}? The agent stops working immediately and must be approved again.`,
+        'Revoke agent access', { okText: 'Revoke', danger: true }))) return;
+    try {
+        const r = await fetch(apiUrl(`/api/mcp/grants/${encodeURIComponent(id)}`), { method: 'DELETE' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        showToast(`Access revoked for ${clientName}`, 'success');
+    } catch (e) {
+        showToast('Could not revoke: ' + (e.message || e), 'error', 0);
+    }
+    loadMcpGrants();
+}
+
+async function removeMcpClient(id, clientName) {
+    if (!(await wolfConfirm(`Remove the app "${clientName}"? Every approval it holds ends now; it would have to register and be approved again.`,
+        'Remove app', { okText: 'Remove', danger: true }))) return;
+    try {
+        const r = await fetch(apiUrl(`/api/mcp/clients/${encodeURIComponent(id)}`), { method: 'DELETE' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        showToast(`Removed ${clientName}`, 'success');
+    } catch (e) {
+        showToast('Could not remove: ' + (e.message || e), 'error', 0);
+    }
+    loadMcpClients();
+    loadMcpGrants();
+}
+
+// App names are chosen by whoever registers the app, so they must never be
+// interpolated into an inline onclick: the browser decodes &#39; back to '
+// before the handler's JS is parsed, which would let a crafted name run
+// script in an admin's session. The rows carry values in data-* attributes
+// (plain HTML-attribute context, where escapeAttr IS correct) and one
+// delegated listener reads them back as data.
+document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest && ev.target.closest('[data-mcp-action]');
+    if (!btn) return;
+    const { mcpAction, id, user, client } = btn.dataset;
+    if (mcpAction === 'revoke-grant') revokeMcpGrant(id, user, client);
+    else if (mcpAction === 'remove-client') removeMcpClient(id, client);
+});
+
+window.loadMcpTab = loadMcpTab;
+window.saveMcpSettings = saveMcpSettings;
+window.copyMcpText = copyMcpText;
 
 // ─── Enterprise API Keys ───
 
@@ -78101,11 +78399,12 @@ function predictiveExpandedBody(p) {
         <div role="group" aria-label="Actions for this finding" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
             <button class="btn btn-sm btn-primary" onclick="predictiveApprove('${escapeAttr(p.id)}')">Mark applied</button>
             <button class="btn btn-sm" onclick="predictiveOpenTerm('${escapeAttr(p.id)}')" title="Open an interactive shell on this proposal's target — host, container, or VM">Open terminal</button>
-            ${isSnoozed
+            ${p.finding_type === 'tamper:paused' ? '' : `${isSnoozed
                 ? `<button class="btn btn-sm" onclick="predictiveRestore('${escapeAttr(p.id)}', 'unsnooze')" title="End the snooze now">Unsnooze</button>`
                 : `<button class="btn btn-sm" onclick="predictiveSnoozeMenu('${escapeAttr(p.id)}', this)" title="Hide for a while — it comes back when the snooze ends">Snooze ▾</button>`}
             <button class="btn btn-sm" onclick="predictiveDismiss('${escapeAttr(p.id)}')" title="Hide this finding until you restore it from Suppressed">Dismiss</button>
-            <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')" title="${escapeAttr(ackTitle)}">Ack as intentional</button>
+            <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')" title="${escapeAttr(ackTitle)}">Ack as intentional</button>`}
+            ${tamperCardButtons(p)}
         </div>`;
 
     return `
@@ -79293,6 +79592,58 @@ async function predictiveSuppressedAct(btn, kind, id) {
     await predictiveSuppressedLoad();
     document.getElementById('pred-supp-title')?.focus();
 }
+
+// ─── Tamper cards: Accept / Revert ───
+//
+// A change to /etc/passwd, sudoers, sshd_config, root's SSH keys or the
+// fail2ban jails raises a tamper card. Some are reverted automatically
+// (rewrites, removals), some only pointed out (new accounts, new SSH keys);
+// either way the admin decides here: Accept makes the current files the new
+// baseline, Revert puts them back. Shown only for findings on THIS node —
+// the endpoints refuse proxied (cluster-secret) callers on purpose.
+const TAMPER_FILE_FINDINGS = ['tamper:sshd_config', 'tamper:authorized_keys', 'tamper:sudoers', 'tamper:passwd', 'tamper:fail2ban'];
+
+function findingIsOnThisNode(nodeId) {
+    const list = Array.isArray(allNodes) ? allNodes : [];
+    return list.some(n => n.is_self && (n.id === nodeId || n.self_id === nodeId));
+}
+
+function tamperCardButtons(p) {
+    if (!TAMPER_FILE_FINDINGS.includes(p.finding_type) || !findingIsOnThisNode(p.scope.node_id)) return '';
+    return `<button type="button" class="btn btn-sm btn-primary" data-tamper-action="accept" data-finding="${escapeAttr(p.finding_type)}"
+                title="I made this change — accept these files as they are now">Accept change</button>
+            <button type="button" class="btn btn-sm" style="color:var(--danger);border-color:var(--danger);" data-tamper-action="revert"
+                data-finding="${escapeAttr(p.finding_type)}" title="I did not make this change — put the files back">Revert change</button>`;
+}
+
+async function tamperCardAction(action, findingType) {
+    const accepting = action === 'accept';
+    const ok = await wolfConfirm(accepting
+        ? 'Accept this change? The protected files are taken as they are now, and only later changes will be flagged. Only do this if you (or someone you trust) made it.'
+        : 'Revert this change? The files are put back to their last accepted version; the changed copy is kept under /var/lib/wolfstack/forensics/tamper/. If you did not make this change, treat the server as compromised.',
+        accepting ? 'Accept change' : 'Revert change',
+        { okText: accepting ? 'Accept' : 'Revert', danger: !accepting });
+    if (!ok) return;
+    try {
+        const r = await fetch(apiUrl(`/api/security/tamper/${accepting ? 'accept' : 'revert'}`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ finding_type: findingType }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        const files = (accepting ? d.accepted : d.reverted) || [];
+        showToast(`${accepting ? 'Accepted' : 'Reverted'} ${files.length} file(s). The card clears on the next check (within 5 minutes).`, 'success');
+    } catch (e) {
+        showToast(`Could not ${accepting ? 'accept' : 'revert'}: ${e.message || e}`, 'error', 0);
+    }
+}
+
+document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest && ev.target.closest('[data-tamper-action]');
+    if (!btn) return;
+    tamperCardAction(btn.dataset.tamperAction, btn.dataset.finding);
+});
 
 /// Mark applied — instant action with a 6 s Undo window. The
 /// previous flow showed a confirm modal first, which (with the

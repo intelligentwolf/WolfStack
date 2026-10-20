@@ -422,6 +422,8 @@ pub const SCOPES: &[(&str, &str)] = &[
     ("statuspage", "Manage status pages"),
     ("cluster", "Cluster management"),
     ("wolfrun", "WolfRun orchestration"),
+    ("mcp", "Use the MCP endpoint (AI agents) — also needs MCP API keys enabled on the node, plus read/logs/containers/vms/backup for what the agent may do"),
+    ("logs", "MCP only: let an AI agent read container logs (they can contain secrets)"),
 ];
 
 fn dt() -> bool { true }
@@ -525,6 +527,8 @@ pub fn scope_allows(key: &ApiKey, method: &str, path: &str) -> bool {
             "statuspage" => path.starts_with("/api/statuspage"),
             "cluster" => path.starts_with("/api/cluster") || path.starts_with("/api/nodes"),
             "wolfrun" => path.starts_with("/api/wolfrun"),
+            // "mcp" and "logs" land here on purpose: they grant no REST
+            // access, they only matter at /mcp (see mcp::http::authenticate).
             _ => false,
         };
         if ok { return true; }

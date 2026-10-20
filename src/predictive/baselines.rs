@@ -285,6 +285,22 @@ pub fn clear_autofix(path: &str) {
     }
 }
 
+/// Drop the baseline, content snapshot and auto-restore marker for
+/// `path` — accepting that an operator deliberately deleted the file.
+/// The next scan re-seeds it if the file ever comes back.
+pub fn forget(path: &str) -> Result<(), String> {
+    let slug = slug_for(path);
+    let dir = baselines_dir();
+    for f in [format!("{}.json", slug), format!("{}.content", slug), format!("{}.autofixed", slug)] {
+        match std::fs::remove_file(dir.join(&f)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove baseline {}: {}", f, e)),
+        }
+    }
+    Ok(())
+}
+
 /// Re-seed an existing baseline because the operator made an
 /// intentional change. Captures the new content snapshot so future
 /// restores use the corrected version. Records who and why for the

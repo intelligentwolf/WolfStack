@@ -5783,7 +5783,7 @@ dependencies = [
 
 [[package]]
 name = "wolfstack"
-version = "25.35.0"
+version = "25.36.0"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -5837,6 +5837,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
  "webauthn-rs",

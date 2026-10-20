@@ -200,7 +200,7 @@ pub fn session_user_is_admin(username: &str) -> bool {
 /// group — the conventional "can administer this host" set across Debian
 /// (`sudo`) and RHEL/Arch (`wheel`). Reads /etc/group + /etc/passwd; if
 /// they can't be read we fail closed (return false) rather than granting.
-fn linux_user_is_privileged(username: &str) -> bool {
+pub(crate) fn linux_user_is_privileged(username: &str) -> bool {
     if username == "root" {
         return true;
     }

@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "25.35.0"
+version = "25.36.0"
 edition = "2024"
 authors = ["IntelligentWolf Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -71,6 +71,9 @@ hex = "0.4"
 base64 = "0.22"
 regex = "1"
 urlencoding = "2"
+# Already in the tree via reqwest (Cargo.lock 2.5.8). MCP OAuth parses
+# redirect URIs and the public URL with it rather than by hand.
+url = "2.5"
 rand = "0.8"
 subtle = "2"
 sha-crypt = "0.5"
