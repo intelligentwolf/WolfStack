@@ -6072,6 +6072,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('sql')"><span class="ws-icon-clean-wrap" data-icon="database"></span> SQL Connections</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('plugins')"><span class="ws-icon-clean-wrap" data-icon="plug"></span> Plugins</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('apikeys')"><span class="ws-icon-clean-wrap" data-icon="key"></span> API Keys / Enterprise</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('mcp')"><span class="ws-icon-clean-wrap" data-icon="plug"></span> AI Agents (MCP)</button>
                     </div>
                 </div>
                 <div class="card-body" style="padding:24px;">
@@ -7430,6 +7431,20 @@
                     </div>
 
                     <div id="settings-tab-security" class="settings-tab-panel">
+                        <div style="background:var(--bg-input);border-radius:12px;padding:20px;border:1px solid var(--border);max-width:600px;margin-bottom:20px;">
+                            <h4 style="margin:0 0 8px 0;font-size:15px;">Tamper protection</h4>
+                            <p style="font-size:13px;color:var(--text-muted);margin:0 0 12px 0;">
+                                WolfStack watches <code>/etc/passwd</code>, sudoers, <code>sshd_config</code>, root's SSH keys and fail2ban on
+                                this node, and puts back changes it didn't expect — a new login account looks exactly like an attacker's backdoor.
+                                Adding a user or editing these yourself? Pause it first, make your changes, then resume: resuming accepts the files as they are.
+                            </p>
+                            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                                <span style="font-size:13px;font-weight:600;">Status:</span>
+                                <span id="tamper-protection-status" style="font-size:13px;padding:4px 10px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);">Checking…</span>
+                                <button type="button" class="btn" id="tamper-protection-btn" onclick="toggleTamperProtection()" style="display:none;"></button>
+                            </div>
+                            <p id="tamper-protection-detail" role="status" aria-live="polite" style="margin:8px 0 0;font-size:12px;color:var(--text-secondary);"></p>
+                        </div>
                         <div style="background:var(--bg-input);border-radius:12px;padding:20px;border:1px solid var(--border);max-width:600px;">
                             <h4 style="margin:0 0 8px 0;font-size:15px;">Cluster Secret</h4>
                             <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
@@ -8181,6 +8196,88 @@ dns_cloudflare_api_token = your_token_here"
                                 <div id="apikeys-audit-log" style="max-height:300px;overflow-y:auto;font-size:12px;background:var(--bg-tertiary);border-radius:8px;padding:12px;">
                                     <div style="color:var(--text-muted);text-align:center;">No audit entries</div>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ─── AI Agents (MCP) Tab ─── -->
+                    <div id="settings-tab-mcp" class="settings-tab-panel">
+                        <h4 style="margin:0 0 4px 0;font-size:16px;font-weight:600;">AI Agents (MCP)</h4>
+                        <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;max-width:720px;">
+                            Let Claude and other AI agents read <strong>this node</strong> and start, stop or restart its containers and VMs
+                            through the Model Context Protocol. Agents sign in with a WolfStack account and you approve each one;
+                            they can never run commands, open shells, read files or delete anything. Each node is enabled separately.
+                        </p>
+                        <div id="mcp-load-error" role="alert" aria-live="assertive" style="display:none;margin-bottom:16px;padding:12px 14px;border-radius:6px;border:1px solid var(--danger,#ef4444);background:rgba(239,68,68,0.12);color:var(--text);font-size:13px;"></div>
+                        <div id="mcp-tls-warning" role="note" style="display:none;margin-bottom:16px;padding:12px 14px;border-radius:6px;border:1px solid #f59e0b;background:rgba(245,158,11,0.12);color:var(--text);font-size:13px;">
+                            This node's web server is not using HTTPS. MCP only answers over HTTPS, so agents can only reach it through a
+                            TLS reverse proxy running on this same machine. Enable TLS on this node, or set the public URL to that proxy.
+                        </div>
+
+                        <form id="mcp-settings-form" onsubmit="saveMcpSettings(event)" novalidate style="max-width:720px;">
+                            <div style="margin-bottom:16px;">
+                                <label for="mcp-public-url" style="display:block;font-size:13px;font-weight:600;margin-bottom:4px;">Public HTTPS URL of this node</label>
+                                <input type="url" id="mcp-public-url" class="form-control" placeholder="https://ws1.example.com:8553" autocomplete="off" spellcheck="false"
+                                       aria-describedby="mcp-public-url-help mcp-public-url-error" style="max-width:480px;">
+                                <div id="mcp-public-url-help" style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                                    The address agents use to reach this node — scheme, host and port only. Agents' sign-in tokens are tied to it,
+                                    so changing it later ends every existing approval.
+                                </div>
+                                <div id="mcp-public-url-error" style="display:none;font-size:12px;color:var(--danger,#ef4444);margin-top:4px;"></div>
+                            </div>
+                            <label style="display:flex;gap:10px;align-items:flex-start;margin-bottom:12px;font-size:14px;cursor:pointer;">
+                                <input type="checkbox" id="mcp-enabled" style="margin-top:3px;">
+                                <span><strong>Enable MCP on this node</strong><br>
+                                <span style="font-size:12px;color:var(--text-muted);">Off: every MCP and sign-in address on this node answers "not found".</span></span>
+                            </label>
+                            <label style="display:flex;gap:10px;align-items:flex-start;margin-bottom:16px;font-size:14px;cursor:pointer;">
+                                <input type="checkbox" id="mcp-allow-api-keys" style="margin-top:3px;">
+                                <span><strong>Also accept API keys</strong> <span style="font-size:12px;color:var(--text-muted);">(for unattended agents)</span><br>
+                                <span style="font-size:12px;color:var(--text-muted);">Only keys created with the <code>mcp</code> scope, plus the read / logs / containers / vms / backup scopes for what the agent may do (a full-access <code>*</code> key gives an agent nothing).
+                                An API key is a shared secret, not a person — prefer signing in. Needs a licence.</span></span>
+                            </label>
+                            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                                <button type="submit" class="btn btn-primary" id="mcp-save-btn">Save</button>
+                                <span id="mcp-save-status" role="status" aria-live="polite" style="font-size:13px;color:var(--text-muted);"></span>
+                            </div>
+                        </form>
+
+                        <div id="mcp-connect" style="display:none;margin-top:24px;max-width:720px;">
+                            <h4 style="margin:0 0 8px 0;font-size:15px;font-weight:600;">Connect an agent</h4>
+                            <div style="font-size:13px;margin-bottom:6px;">MCP server URL</div>
+                            <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+                                <code id="mcp-url-text" style="padding:6px 10px;background:var(--bg-tertiary);border-radius:6px;word-break:break-all;"></code>
+                                <button type="button" class="btn btn-sm" onclick="copyMcpText('mcp-url-text')">Copy</button>
+                            </div>
+                            <div style="font-size:13px;margin-bottom:6px;">Claude Code</div>
+                            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
+                                <code id="mcp-claude-cmd" style="padding:6px 10px;background:var(--bg-tertiary);border-radius:6px;word-break:break-all;"></code>
+                                <button type="button" class="btn btn-sm" onclick="copyMcpText('mcp-claude-cmd')">Copy</button>
+                            </div>
+                            <p style="font-size:12px;color:var(--text-muted);margin:0;">Run <code>/mcp</code> in Claude Code to sign in. A WolfStack page opens: tick the permissions to give (only read is ticked to start with), sign in with your password and 2FA code, and approve.</p>
+                        </div>
+
+                        <div style="margin-top:28px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
+                                <h4 style="margin:0;font-size:15px;font-weight:600;">Approved agents</h4>
+                                <button type="button" class="btn btn-sm" onclick="loadMcpTab()">Refresh</button>
+                            </div>
+                            <div style="overflow-x:auto;">
+                                <table class="table" style="width:100%;font-size:13px;">
+                                    <thead><tr><th>User</th><th>App</th><th>Permissions</th><th>Last used</th><th>Expires</th><th style="width:90px;"><span class="sr-only">Actions</span></th></tr></thead>
+                                    <tbody id="mcp-grants-body"><tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px;">Loading…</td></tr></tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div style="margin-top:24px;">
+                            <h4 style="margin:0 0 4px 0;font-size:15px;font-weight:600;">Registered apps</h4>
+                            <p style="font-size:12px;color:var(--text-muted);margin:0 0 8px 0;">Apps register themselves automatically and can do nothing until a user approves them. Unapproved ones are removed after a day.</p>
+                            <div style="overflow-x:auto;">
+                                <table class="table" style="width:100%;font-size:13px;">
+                                    <thead><tr><th>App (name not verified)</th><th>Returns to</th><th>Registered</th><th>Approved</th><th style="width:90px;"><span class="sr-only">Actions</span></th></tr></thead>
+                                    <tbody id="mcp-clients-body"><tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:20px;">Loading…</td></tr></tbody>
+                                </table>
                             </div>
                         </div>
                     </div>

@@ -537,7 +537,7 @@ pub fn load_join_token() -> String {
 // ─── Auth helpers ───
 
 /// Extract session token from cookie
-fn get_session_token(req: &HttpRequest) -> Option<String> {
+pub(crate) fn get_session_token(req: &HttpRequest) -> Option<String> {
     req.cookie("wolfstack_session")
         .map(|c| c.value().to_string())
 }
@@ -3387,6 +3387,14 @@ pub async fn delete_user(req: HttpRequest, state: web::Data<AppState>, path: web
     let mut store = crate::auth::users::UserStore::load();
     match store.remove(&username) {
         Ok(()) => {
+            // End the user's MCP grants on this node now (other nodes refuse
+            // them on the next request: the account no longer resolves).
+            let u = username.clone();
+            match web::block(move || crate::mcp::OAUTH.revoke_user(&u)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("mcp: could not revoke grants of deleted user '{}': {}", username, e),
+                Err(e) => tracing::warn!("mcp: revoke task for deleted user '{}' failed: {}", username, e),
+            }
             // Propagate the deletion (newer version) so it isn't undone by a
             // peer's stale copy on the next sweep.
             trigger_control_plane_push(&state);
@@ -3446,6 +3454,14 @@ pub async fn change_user_password(req: HttpRequest, state: web::Data<AppState>, 
                 Ok(()) => {
                     // Outstanding reset codes die with the old password.
                     state.password_reset_tokens.invalidate_user(&username);
+                    // So do MCP grants (cluster-wide via the credential
+                    // fingerprint; here immediately).
+                    let u = username.clone();
+                    match web::block(move || crate::mcp::OAUTH.revoke_user(&u)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!("mcp: could not revoke grants of '{}' after password change: {}", username, e),
+                        Err(e) => tracing::warn!("mcp: revoke task for '{}' failed: {}", username, e),
+                    }
                     trigger_control_plane_push(&state);
                     HttpResponse::Ok().json(serde_json::json!({"success": true}))
                 }
@@ -3869,7 +3885,7 @@ pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResp
 /// auth) and any user not found in the store pass everything through
 /// — this is the safe default for service-to-service and for cases
 /// where a session exists without a matching user record.
-fn filter_nodes_for_caller(caller: &str, nodes: Vec<crate::agent::Node>) -> Vec<crate::agent::Node> {
+pub(crate) fn filter_nodes_for_caller(caller: &str, nodes: Vec<crate::agent::Node>) -> Vec<crate::agent::Node> {
     if caller == "cluster-node" { return nodes; }
     let store = crate::auth::users::UserStore::load();
     let Some(user) = store.find(caller) else { return nodes; };
@@ -12576,6 +12592,46 @@ pub(crate) async fn wolfnet_ip_active_elsewhere(state: &web::Data<AppState>, ip:
     None
 }
 
+/// Refusals every path that changes a container's run state must apply —
+/// the REST action handlers and the MCP tools both call this, so a new
+/// surface can never start a container the UI would refuse to. `Err` is the
+/// operator-facing reason (the REST handlers answer it as 409).
+///
+/// * start (Docker + LXC): never bring up a second copy of a WolfNet IP that
+///   is already live elsewhere in the cluster.
+/// * start / restart (LXC): a WolfHA standby carries its primary's MAC and
+///   IP — hand-starting it while the primary runs puts two identical
+///   containers on one L2. Promotion (the WolfHA page) removes the marker
+///   before starting.
+pub(crate) async fn container_lifecycle_guard(
+    state: &web::Data<AppState>, runtime: &str, name: &str, action: &str,
+) -> Result<(), String> {
+    if action == "start" {
+        let (rt, n) = (runtime.to_string(), name.to_string());
+        // docker_effective_wolfnet_ip can run `docker inspect` (10s cap).
+        let ip = web::block(move || match rt.as_str() {
+            "docker" => containers::docker_effective_wolfnet_ip(&n),
+            "lxc" => containers::lxc_get_wolfnet_ip(&n),
+            _ => None,
+        }).await.unwrap_or(None);
+        if let Some(ip) = ip
+            && let Some(holder) = wolfnet_ip_active_elsewhere(state, &ip).await
+        {
+            return Err(format!("WolfNet IP already in use: {} (active on {})", ip.trim(), holder));
+        }
+    }
+    if runtime == "lxc"
+        && matches!(action, "start" | "restart")
+        && crate::wolfha::is_replica(name)
+    {
+        return Err(format!(
+            "'{}' is a WolfHA standby — starting it here would collide with the active copy. Use Promote on the WolfHA page instead.",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub async fn docker_action(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -12584,15 +12640,8 @@ pub async fn docker_action(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
-    // A start must not bring up a second copy of a WolfNet IP already live
-    // elsewhere in the cluster.
-    if body.action == "start"
-        && let Some(ip) = containers::docker_effective_wolfnet_ip(&id)
-        && let Some(holder) = wolfnet_ip_active_elsewhere(&state, &ip).await
-    {
-        return HttpResponse::Conflict().json(serde_json::json!({
-            "error": format!("WolfNet IP already in use: {} (active on {})", ip.trim(), holder)
-        }));
+    if let Err(e) = container_lifecycle_guard(&state, "docker", &id, &body.action).await {
+        return HttpResponse::Conflict().json(serde_json::json!({ "error": e }));
     }
     // Removing a WolfRun-managed container is futile — the reconciler
     // recreates it within seconds — and users read the reappearance as
@@ -12854,26 +12903,8 @@ pub async fn lxc_action(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    // A start must not bring up a second copy of a WolfNet IP already live
-    // elsewhere in the cluster.
-    if body.action == "start"
-        && let Some(ip) = containers::lxc_get_wolfnet_ip(&name)
-        && let Some(holder) = wolfnet_ip_active_elsewhere(&state, &ip).await
-    {
-        return HttpResponse::Conflict().json(serde_json::json!({
-            "error": format!("WolfNet IP already in use: {} (active on {})", ip.trim(), holder)
-        }));
-    }
-    // A WolfHA standby carries its primary's MAC and IP — hand-starting
-    // it while the primary runs puts two identical containers on one L2.
-    // Promotion (the WolfHA page) removes the marker before starting.
-    if matches!(body.action.as_str(), "start" | "restart") && crate::wolfha::is_replica(&name) {
-        return HttpResponse::Conflict().json(serde_json::json!({
-            "error": format!(
-                "'{}' is a WolfHA standby — starting it here would collide with the active copy. Use Promote on the WolfHA page instead.",
-                name
-            )
-        }));
+    if let Err(e) = container_lifecycle_guard(&state, "lxc", &name, &body.action).await {
+        return HttpResponse::Conflict().json(serde_json::json!({ "error": e }));
     }
     // Destroying a WolfRun-managed container is futile — the reconciler
     // recreates it within seconds (klas, 2026-08-12). Refuse unless
@@ -12892,15 +12923,20 @@ pub async fn lxc_action(
             }));
         }
     }
-    let result = match body.action.as_str() {
+    // lxc-start / pct start poll until RUNNING and lxc_restart is stop +
+    // start — blocking work that pinned an actix worker for its duration.
+    let action = body.action.clone();
+    let result = web::block(move || match action.as_str() {
         "start" => containers::lxc_start(&name),
         "stop" => containers::lxc_stop(&name),
         "restart" => containers::lxc_restart(&name),
         "freeze" => containers::lxc_freeze(&name),
         "unfreeze" => containers::lxc_unfreeze(&name),
         "destroy" => containers::lxc_destroy(&name),
-        _ => Err(format!("Unknown action: {}", body.action)),
-    };
+        _ => Err(format!("Unknown action: {}", action)),
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("container action task failed: {}", e)));
 
     match result {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
@@ -37403,6 +37439,99 @@ pub struct ReseedBaselineBody {
     pub reason: String,
 }
 
+/// Admin gate for the tamper-protection controls: these accept changes to
+/// /etc/passwd, sudoers and root's SSH keys, so only a signed-in admin —
+/// never an API key or a peer's cluster secret.
+fn tamper_admin(req: &HttpRequest, state: &web::Data<AppState>) -> Result<String, HttpResponse> {
+    let caller = require_auth(req, state)?;
+    if caller.starts_with("apikey:") || caller == "cluster-node" {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Only a signed-in administrator can change tamper protection."
+        })));
+    }
+    require_admin(&caller)?;
+    Ok(caller)
+}
+
+/// GET /api/security/tamper-protection — is tamper protection paused?
+pub async fn tamper_protection_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(r) = require_auth(&req, &state) { return r; }
+    match web::block(crate::predictive::tamper_detection::pause_state).await {
+        Ok(s) => HttpResponse::Ok().json(s),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct TamperProtectionBody {
+    pub paused: bool,
+}
+
+/// POST /api/security/tamper-protection {paused} — pause for maintenance,
+/// or resume (which accepts every protected file as it is now).
+pub async fn tamper_protection_set(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<TamperProtectionBody>,
+) -> HttpResponse {
+    let caller = match tamper_admin(&req, &state) { Ok(c) => c, Err(r) => return r };
+    let pause = body.paused;
+    let by = caller.clone();
+    let result = web::block(move || {
+        use crate::predictive::tamper_detection as td;
+        if pause {
+            td::pause(&by).map(|s| serde_json::json!({ "paused": true, "state": s }))
+        } else {
+            td::resume(&by).map(|accepted| serde_json::json!({ "paused": false, "accepted": accepted }))
+        }
+    }).await;
+    match result {
+        Ok(Ok(v)) => {
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(v)
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct TamperFindingBody {
+    pub finding_type: String,
+}
+
+/// POST /api/security/tamper/accept {finding_type} — the operator made the
+/// change on an Inbox tamper card: its changed files become the baseline.
+pub async fn tamper_finding_accept(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<TamperFindingBody>,
+) -> HttpResponse {
+    let caller = match tamper_admin(&req, &state) { Ok(c) => c, Err(r) => return r };
+    let ft = body.finding_type.clone();
+    match web::block(move || crate::predictive::tamper_detection::accept_finding(&ft, &caller)).await {
+        Ok(Ok(paths)) => {
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "accepted": paths }))
+        }
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/security/tamper/revert {finding_type} — put an Inbox tamper
+/// card's changed files back to their baseline.
+pub async fn tamper_finding_revert(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<TamperFindingBody>,
+) -> HttpResponse {
+    let caller = match tamper_admin(&req, &state) { Ok(c) => c, Err(r) => return r };
+    let ft = body.finding_type.clone();
+    match web::block(move || crate::predictive::tamper_detection::revert_finding(&ft, &caller)).await {
+        Ok(Ok(paths)) => {
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "reverted": paths }))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 pub async fn predictive_baselines_reseed(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -38020,35 +38149,6 @@ pub async fn whatsapp_webhook(
     HttpResponse::Ok()
         .content_type("application/xml")
         .body(twiml)
-}
-
-// ─── MCP-shaped tool surface ───
-
-/// POST /api/mcp/tools/list — MCP-compatible tool catalogue.
-/// Returns `{ "tools": [...] }` with each entry carrying name,
-/// description, and a JSON Schema for its arguments.
-pub async fn mcp_tools_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
-    HttpResponse::Ok().json(serde_json::json!({
-        "tools": crate::mcp::catalogue(),
-    }))
-}
-
-/// POST /api/mcp/tools/call — invoke a tool by name.
-/// Body: `{ "name": "...", "arguments": {...} }`
-/// Returns MCP-shaped `{ "content": [{ "type": "text", "text": ... }] }`.
-pub async fn mcp_tools_call(
-    req: HttpRequest, state: web::Data<AppState>,
-    body: web::Json<crate::mcp::ToolCall>,
-) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
-    match crate::mcp::dispatch(body.into_inner(), state.get_ref()).await {
-        Ok(result) => HttpResponse::Ok().json(result),
-        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
-            "isError": true,
-            "content": [{ "type": "text", "text": e }],
-        })),
-    }
 }
 
 // ─── WolfAgents API ───
@@ -48549,6 +48649,10 @@ pub async fn diagnostics_collect(req: HttpRequest, state: web::Data<AppState>) -
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
+        // MCP server + its OAuth authorization server (/mcp, /oauth/*,
+        // /.well-known/*, /api/mcp/*). Every path is 404 until an admin
+        // enables MCP on this node.
+        .configure(crate::mcp::http::configure)
         .configure(crate::vms::api::config)
         .configure(crate::tui::configure)
         .configure(crate::networking::router::api::configure)
@@ -49572,6 +49676,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/predictive/osv-config", web::get().to(predictive_osv_config_get))
         .route("/api/predictive/osv-config", web::put().to(predictive_osv_config_put))
         .route("/api/predictive/baselines/reseed/{slug}", web::post().to(predictive_baselines_reseed))
+        .route("/api/security/tamper-protection", web::get().to(tamper_protection_status))
+        .route("/api/security/tamper-protection", web::post().to(tamper_protection_set))
+        .route("/api/security/tamper/accept", web::post().to(tamper_finding_accept))
+        .route("/api/security/tamper/revert", web::post().to(tamper_finding_revert))
         .route("/api/predictive/threat-intel/status", web::get().to(predictive_threat_intel_status))
         .route("/api/predictive/threat-intel/enable", web::post().to(predictive_threat_intel_enable))
         .route("/api/predictive/threat-intel/disable", web::post().to(predictive_threat_intel_disable))
@@ -49595,10 +49703,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/agents/{id}/pending", web::get().to(agents_pending_list))
         .route("/api/agents/{id}/pending/{seq}/approve", web::post().to(agents_pending_approve))
         .route("/api/agents/{id}/pending/{seq}/deny", web::post().to(agents_pending_deny))
-        // MCP-shaped tool surface so external agent harnesses can call
-        // WolfStack's read-only capabilities without reinventing each one.
-        .route("/api/mcp/tools/list", web::post().to(mcp_tools_list))
-        .route("/api/mcp/tools/call", web::post().to(mcp_tools_call))
         // WhatsApp inbound via Twilio — unauth, signature-validated.
         .route("/api/whatsapp/webhook", web::post().to(whatsapp_webhook))
         // Integrations (auth required)

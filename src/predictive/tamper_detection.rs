@@ -120,8 +120,12 @@ pub struct TamperFacts {
     /// proposal's evidence so the inbox card shows the action.
     pub remediations: Vec<RemediationOutcome>,
     /// Set false on hosts where /etc/ doesn't look like a Linux box
-    /// (no /etc/passwd at all — shouldn't happen but be defensive).
+    /// (no /etc/passwd at all — shouldn't happen but be defensive), and
+    /// while protection is paused.
     pub scanned: bool,
+    /// Some while an operator has paused protection for maintenance.
+    #[serde(default)]
+    pub paused: Option<PauseState>,
 }
 
 /// One baselined path's current state plus its verdict.
@@ -144,18 +148,167 @@ pub async fn sample_now_async(_timeout: Duration) -> TamperFacts {
     tokio::task::spawn_blocking(sample_blocking).await.unwrap_or_default()
 }
 
-fn sample_blocking() -> TamperFacts {
-    if std::fs::metadata(PASSWD).is_err() {
-        return TamperFacts::default();
-    }
+// ─── Maintenance switch ───
+//
+// An operator adding a user for an app, editing sudoers or rotating SSH
+// keys looks exactly like an attacker to the scan, and the first such
+// change is reverted (klas, 2026-10-20: "the /etc/passwd change keeps
+// reverting"). Pausing stops the scan entirely — no checks, no reverts,
+// no baselines seeded mid-change — and resuming accepts the files as they
+// now are by reseeding every tracked baseline. While paused, an Inbox
+// card says so, so the protection can't be left off and forgotten.
 
-    let mut paths: Vec<TamperedPath> = Vec::new();
+pub const FT_TAMPER_PAUSED: &str = "tamper:paused";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PauseState {
+    pub paused: bool,
+    /// Unix seconds.
+    #[serde(default)]
+    pub paused_at: u64,
+    #[serde(default)]
+    pub paused_by: String,
+}
+
+// `.state`, not `.json`: the scan treats every *.json in the baselines
+// directory as a Baseline.
+fn pause_file() -> std::path::PathBuf {
+    baselines::baselines_dir().join("tamper-protection.state")
+}
+
+/// Serialises everything that changes protected files or their baselines:
+/// the scan's auto-remediation, pause, resume, Accept and Revert. Without
+/// it an Accept could land between a scan's verdict and its revert. A std
+/// mutex taken only on the blocking pool.
+static TAMPER_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn tamper_op_lock() -> std::sync::MutexGuard<'static, ()> {
+    TAMPER_OP_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn pause_state() -> PauseState {
+    std::fs::read_to_string(pause_file())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Pause tamper protection on this node (blocking file I/O).
+pub fn pause(by: &str) -> Result<PauseState, String> {
+    let _op = tamper_op_lock();
+    let state = PauseState {
+        paused: true,
+        paused_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0),
+        paused_by: by.to_string(),
+    };
+    let dir = baselines::baselines_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {:?}: {}", dir, e))?;
+    let json = serde_json::to_string(&state).map_err(|e| e.to_string())?;
+    let path = pause_file();
+    crate::paths::write_secure(&path.to_string_lossy(), json)
+        .map_err(|e| format!("write {:?}: {}", path, e))?;
+    tracing::warn!("tamper_detection: protection PAUSED by '{}'", by);
+    Ok(state)
+}
+
+/// Accept every tracked file as it is now (reseed; drop the baseline of a
+/// tracked file that was deliberately deleted), then resume. Resumes only
+/// if every file was accepted — a half-accepted state would revert the
+/// rest of the operator's changes. Returns the paths accepted.
+pub fn resume(by: &str) -> Result<Vec<String>, String> {
+    let _op = tamper_op_lock();
+    let mut accepted = Vec::new();
+    let mut failures = Vec::new();
+    for path in tracked_paths(is_unit_known("fail2ban.service")) {
+        let result = if std::fs::metadata(&path).is_ok() {
+            baselines::reseed(&path, by, "accepted when tamper protection was resumed").map(|_| ())
+        } else {
+            baselines::forget(&path)
+        };
+        match result {
+            Ok(()) => accepted.push(path),
+            Err(e) => failures.push(format!("{}: {}", path, e)),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("protection is still paused — could not accept: {}", failures.join("; ")));
+    }
+    match std::fs::remove_file(pause_file()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("accepted the files but could not clear the pause: {}", e)),
+    }
+    tracing::warn!("tamper_detection: protection RESUMED by '{}'; accepted {} file(s)", by, accepted.len());
+    Ok(accepted)
+}
+
+/// The tracked files of one Inbox card (`finding_type`) that currently
+/// differ from their baseline.
+fn drifted_paths_of(finding_type: &str) -> Vec<String> {
+    tracked_paths(is_unit_known("fail2ban.service"))
+        .into_iter()
+        .filter(|p| finding_type_for_path(p) == finding_type)
+        .filter(|p| matches!(baselines::check(p), Verdict::Drift { .. } | Verdict::FileMissing { .. }))
+        .collect()
+}
+
+fn is_file_finding(finding_type: &str) -> bool {
+    matches!(finding_type,
+        FT_SSHD_CONFIG_TAMPER | FT_AUTHORIZED_KEYS_TAMPER | FT_SUDOERS_TAMPER | FT_PASSWD_TAMPER | FT_FAIL2BAN_TAMPER)
+}
+
+/// Inbox "Accept": the operator made this change — the drifted files of
+/// this card become the new baseline (a deleted one is forgotten).
+pub fn accept_finding(finding_type: &str, by: &str) -> Result<Vec<String>, String> {
+    if !is_file_finding(finding_type) {
+        return Err(format!("'{}' is not a tamper-file finding", finding_type));
+    }
+    let _op = tamper_op_lock();
+    let paths = drifted_paths_of(finding_type);
+    for p in &paths {
+        if std::fs::metadata(p).is_ok() {
+            baselines::reseed(p, by, "accepted from the Inbox")?;
+        } else {
+            baselines::forget(p)?;
+        }
+    }
+    tracing::warn!("tamper_detection: '{}' accepted {} as the new baseline: {:?}", by, finding_type, paths);
+    Ok(paths)
+}
+
+/// Inbox "Revert": put each drifted file of this card back to its
+/// baseline (the changed version is kept for forensics first).
+pub fn revert_finding(finding_type: &str, by: &str) -> Result<Vec<String>, String> {
+    if !is_file_finding(finding_type) {
+        return Err(format!("'{}' is not a tamper-file finding", finding_type));
+    }
+    let _op = tamper_op_lock();
+    let paths = drifted_paths_of(finding_type);
+    let mut failed = Vec::new();
+    for p in &paths {
+        let outcome = restore_from_baseline(p, true);
+        if !outcome.ok {
+            failed.push(format!("{}: {}", p, outcome.detail));
+        }
+    }
+    tracing::warn!("tamper_detection: '{}' reverted {}: {:?} (failures: {:?})", by, finding_type, paths, failed);
+    if failed.is_empty() { Ok(paths) } else { Err(failed.join("; ")) }
+}
+
+/// Every file the scan watches: the fixed set (present, or baselined and
+/// since deleted), each file in sudoers.d, any baselined sudoers.d file
+/// that has been deleted, and — when fail2ban is installed — jail.local
+/// and jail.d/*. The scan and `resume` share this list so they can
+/// never disagree about what is protected.
+fn tracked_paths(fail2ban_installed: bool) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
 
     for p in [SSHD_CONFIG, ROOT_AUTHORIZED_KEYS, SUDOERS, PASSWD] {
         if std::fs::metadata(p).is_err() && baselines::load(p).is_none() {
             continue; // file not present and no baseline — skip
         }
-        paths.push(verdict_to_path(p));
+        paths.push(p.to_string());
     }
 
     // sudoers.d/* — every file there gets baselined.
@@ -163,8 +316,7 @@ fn sample_blocking() -> TamperFacts {
         for e in entries.flatten() {
             let p = e.path();
             if !p.is_file() { continue; }
-            let s = p.to_string_lossy().into_owned();
-            paths.push(verdict_to_path(&s));
+            paths.push(p.to_string_lossy().into_owned());
         }
     }
 
@@ -181,12 +333,38 @@ fn sample_blocking() -> TamperFacts {
             if let Ok(body) = std::fs::read_to_string(&p)
                 && let Ok(b) = serde_json::from_str::<baselines::Baseline>(&body)
                     && b.path.starts_with(SUDOERS_D_DIR)
-                        && !paths.iter().any(|tp| tp.path == b.path)
+                        && !paths.contains(&b.path)
                         && std::fs::metadata(&b.path).is_err()
                     {
-                        paths.push(verdict_to_path(&b.path));
+                        paths.push(b.path);
                     }
         }
+    }
+
+    if fail2ban_installed {
+        if std::fs::metadata(FAIL2BAN_JAIL_LOCAL).is_ok() || baselines::load(FAIL2BAN_JAIL_LOCAL).is_some() {
+            paths.push(FAIL2BAN_JAIL_LOCAL.to_string());
+        }
+        if let Ok(entries) = std::fs::read_dir(FAIL2BAN_JAIL_D_DIR) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_file() { continue; }
+                paths.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    paths
+}
+
+fn sample_blocking() -> TamperFacts {
+    if std::fs::metadata(PASSWD).is_err() {
+        return TamperFacts::default();
+    }
+    // Paused for maintenance: touch nothing — not even auto-seeding a
+    // baseline, which would anchor a half-finished change.
+    let pause = pause_state();
+    if pause.paused {
+        return TamperFacts { paused: Some(pause), ..TamperFacts::default() };
     }
 
     // fail2ban state.
@@ -199,19 +377,10 @@ fn sample_blocking() -> TamperFacts {
         true // not installed → don't flag; the operator's choice
     };
 
-    if fail2ban_installed {
-        if std::fs::metadata(FAIL2BAN_JAIL_LOCAL).is_ok() || baselines::load(FAIL2BAN_JAIL_LOCAL).is_some() {
-            paths.push(verdict_to_path(FAIL2BAN_JAIL_LOCAL));
-        }
-        if let Ok(entries) = std::fs::read_dir(FAIL2BAN_JAIL_D_DIR) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if !p.is_file() { continue; }
-                let s = p.to_string_lossy().into_owned();
-                paths.push(verdict_to_path(&s));
-            }
-        }
-    }
+    let paths: Vec<TamperedPath> = tracked_paths(fail2ban_installed)
+        .iter()
+        .map(|p| verdict_to_path(p))
+        .collect();
 
     TamperFacts {
         paths,
@@ -221,6 +390,7 @@ fn sample_blocking() -> TamperFacts {
         fail2ban_sshd_jail_enabled,
         remediations: Vec::new(),
         scanned: true,
+        paused: None,
     }
 }
 
@@ -332,6 +502,13 @@ fn remediate_blocking(
     proposals: &crate::predictive::proposal::ProposalStore,
     scope: &ProposalScope,
 ) -> TamperFacts {
+    // Serialised with pause / resume / accept / revert, and re-checked
+    // under that lock: a pause pressed while this tick was sampling must
+    // still stop the revert.
+    let _op = tamper_op_lock();
+    if pause_state().paused {
+        return TamperFacts { paused: Some(pause_state()), ..TamperFacts::default() };
+    }
     let suppressed = |ft: &str| -> bool {
         acks.suppresses(ft, scope) || proposals.is_suppressed(ft, scope)
     };
@@ -368,6 +545,40 @@ fn remediate_blocking(
                 detail: format!(
                     "only known-safe service accounts were added to {}; baseline reseeded to accept them",
                     tp.path
+                ),
+            });
+            continue;
+        }
+
+        // /etc/passwd: an operator adding an account (klas, 2026-10-20:
+        // "the /etc/passwd change keeps reverting") looks exactly like a
+        // backdoor account, and deleting it — leaving its /etc/shadow
+        // entry and home directory behind — is the worst response to a
+        // legitimate change. Pure additions are pointed out (Critical
+        // card with Accept / Revert) and NOT reverted. Any rewritten or
+        // removed line, or a new UID-0 account (a second root), falls
+        // through to the restore path below.
+        let passwd_additions = if tp.path == PASSWD && tp.verdict_label == "drift" {
+            passwd_added_accounts_only(&tp.path)
+        } else {
+            None
+        };
+        if let Some(added) = passwd_additions {
+            tracing::warn!(
+                "tamper_detection: {} gained {} new account(s) and lost none — \
+                 alerting WITHOUT reverting; accept or revert from the Inbox",
+                tp.path, added.len(),
+            );
+            facts.remediations.push(RemediationOutcome {
+                action: format!("alert-only (no revert): {}", tp.path),
+                ok: true,
+                detail: format!(
+                    "{} new account(s) were ADDED and no existing account was changed or \
+                     removed, so WolfStack did NOT modify the file. Added: {}. If you added \
+                     them, press Accept. If you did NOT, press Revert and treat the server as \
+                     compromised — this is how attackers create backdoor logins.",
+                    added.len(),
+                    added.join("; "),
                 ),
             });
             continue;
@@ -429,7 +640,7 @@ fn remediate_blocking(
             continue;
         }
 
-        let outcome = restore_from_baseline(&tp.path);
+        let outcome = restore_from_baseline(&tp.path, false);
         if outcome.ok {
             facts.paths[i].restored = true;
             baselines::record_autofix(&tp.path);
@@ -466,11 +677,18 @@ fn finding_type_for_path(path: &str) -> String {
 /// baseline was seeded before content-snapshotting was a thing),
 /// we capture-only and leave the operator to restore from their
 /// own backup — the proposal text says so explicitly.
-fn restore_from_baseline(path: &str) -> RemediationOutcome {
+///
+/// `recreate_missing`: a DELETED file is only put back when an operator
+/// explicitly pressed Revert. The automatic pass leaves it deleted and
+/// reports it — the deletion may well have been the operator's.
+fn restore_from_baseline(path: &str, recreate_missing: bool) -> RemediationOutcome {
     let action = format!("restore {} from baseline", path);
     // Capture current state first.
     let cur_capture = match baselines::capture_current(path, "tamper") {
         Ok(p) => p,
+        Err(e) if e.starts_with("read ") && recreate_missing && std::fs::metadata(path).is_err() => {
+            "(file was deleted — nothing to capture)".to_string()
+        }
         Err(e) if e.starts_with("read ") => {
             // File was deleted entirely — that IS the tamper. Nothing
             // to capture; just record the verdict in the outcome.
@@ -605,8 +823,14 @@ pub fn analyze(
     proposals: &crate::predictive::proposal::ProposalStore,
 ) -> Vec<Proposal> {
     let mut out = Vec::new();
-    if !facts.scanned { return out; }
     let scope = ProposalScope { node_id: ctx.node_id.clone(), resource_id: None };
+    if let Some(p) = &facts.paused {
+        // Deliberately not suppressible (no ack / dismiss check): this card
+        // is what stops protection being left off and forgotten.
+        out.push(build_paused_proposal(p, &scope));
+        return out;
+    }
+    if !facts.scanned { return out; }
 
     // Group drift findings by indicator class. Each (finding_type)
     // gets one card listing every file in that class that's drifted.
@@ -649,14 +873,42 @@ pub fn covered_scopes(
 ) -> Vec<(String, ProposalScope)> {
     if !facts.scanned { return Vec::new(); }
     let scope = ProposalScope { node_id: ctx.node_id.clone(), resource_id: None };
-    let types: [&str; 5] = [
+    // A real scan ran, so protection is on: the "paused" card resolves.
+    let types: [&str; 6] = [
         FT_SSHD_CONFIG_TAMPER,
         FT_AUTHORIZED_KEYS_TAMPER,
         FT_SUDOERS_TAMPER,
         FT_PASSWD_TAMPER,
         FT_FAIL2BAN_TAMPER,
+        FT_TAMPER_PAUSED,
     ];
     types.iter().map(|t| ((*t).to_string(), scope.clone())).collect()
+}
+
+fn build_paused_proposal(p: &PauseState, scope: &ProposalScope) -> Proposal {
+    let since = chrono::DateTime::from_timestamp(p.paused_at as i64, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    Proposal::new_rule(
+        FT_TAMPER_PAUSED,
+        Severity::Warn,
+        "Tamper protection is paused on this node".to_string(),
+        "Changes to /etc/passwd, sudoers, sshd_config, root's SSH keys and fail2ban are not being \
+         checked or reverted while it is paused. Turn it back on when you have finished — that \
+         accepts the files as they are now."
+            .to_string(),
+        vec![Evidence {
+            label: "Paused".into(),
+            value: format!("by {} at {}", p.paused_by, since),
+            detail: None,
+            links: Vec::new(),
+        }],
+        RemediationPlan::Manual {
+            instructions: "Settings → Security → Tamper protection → Resume and accept changes.".into(),
+            commands: Vec::new(),
+        },
+        scope.clone(),
+    )
 }
 
 fn build_tamper_proposal(
@@ -676,10 +928,13 @@ fn build_tamper_proposal(
     };
     let why = format!(
         "WolfStack baselined this file's contents when it was first observed and the current contents \
-         no longer match. This is either an intentional operator change (in which case reseed the \
-         baseline via `/api/predictive/baselines/reseed/<slug>` so it stops alerting) OR an attacker \
+         no longer match. This is either an intentional operator change OR an attacker \
          establishing persistence — adding their SSH key to authorized_keys, re-enabling password \
-         login in sshd_config, or granting NOPASSWD sudo to a backdoor account.\n\nFiles flagged: {}",
+         login in sshd_config, or granting NOPASSWD sudo to a backdoor account.\n\nIf it was you: \
+         next time, pause it first in Settings → Security → Tamper protection, make the change, \
+         then resume — resuming accepts the files as they are. To accept this change now, pause \
+         and resume straight away (or reseed via `/api/predictive/baselines/reseed/<slug>`).\
+         \n\nFiles flagged: {}",
         path_list.iter().map(|s| format!("`{}`", s)).collect::<Vec<_>>().join(", "),
     );
     let mut evidence: Vec<Evidence> = paths.iter().map(|tp| Evidence {
@@ -999,9 +1254,78 @@ fn authorized_keys_added_only(path: &str) -> Option<Vec<String>> {
     authorized_keys_added_only_in(&baseline_text, &current_text)
 }
 
+/// `Some(accounts)` when `current` is `baseline` plus new account lines
+/// only — every baseline line still present unchanged, every new line a
+/// well-formed passwd entry (7 fields, numeric UID) with UID != 0. The
+/// summaries name each account, its UID and shell for the Inbox card.
+/// `None` for anything else: a removed or rewritten line, a malformed
+/// line, a second UID-0 account, or no additions at all.
+fn passwd_added_accounts_only_in(baseline: &str, current: &str) -> Option<Vec<String>> {
+    let base: HashSet<&str> = baseline.lines().filter(|l| !l.trim().is_empty()).collect();
+    let cur: HashSet<&str> = current.lines().filter(|l| !l.trim().is_empty()).collect();
+    if base.iter().any(|l| !cur.contains(l)) {
+        return None;
+    }
+    let mut added: Vec<&str> = cur.difference(&base).copied().collect();
+    if added.is_empty() {
+        return None;
+    }
+    added.sort_unstable();
+    let mut out = Vec::new();
+    for line in added {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() != 7 || f[0].is_empty() {
+            return None;
+        }
+        let uid: u32 = f[2].parse().ok()?;
+        if uid == 0 {
+            return None;
+        }
+        out.push(format!("{} (uid {}, shell {})", f[0], uid, f[6]));
+    }
+    Some(out)
+}
+
+/// File-reading wrapper around `passwd_added_accounts_only_in`. No
+/// baseline content snapshot → None: an unknown change is "tampering".
+fn passwd_added_accounts_only(path: &str) -> Option<Vec<String>> {
+    let content_path = baselines::baselines_dir()
+        .join(format!("{}.content", baselines::slug_for(path)));
+    let baseline_bytes = std::fs::read(&content_path).ok()?;
+    let baseline_text = String::from_utf8_lossy(&baseline_bytes);
+    let current_text = std::fs::read_to_string(path).ok()?;
+    passwd_added_accounts_only_in(&baseline_text, &current_text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PW_BASE: &str = "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n";
+
+    #[test]
+    fn passwd_pure_addition_is_pointed_out_not_reverted() {
+        let cur = format!("{}appuser:x:1001:1001::/home/appuser:/bin/bash\n", PW_BASE);
+        assert_eq!(passwd_added_accounts_only_in(PW_BASE, &cur),
+            Some(vec!["appuser (uid 1001, shell /bin/bash)".to_string()]));
+    }
+
+    #[test]
+    fn passwd_rewrites_removals_and_second_roots_still_revert() {
+        // root's shell rewritten
+        let cur = "root:x:0:0:root:/root:/bin/evil\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n";
+        assert!(passwd_added_accounts_only_in(PW_BASE, cur).is_none());
+        // an existing account removed
+        assert!(passwd_added_accounts_only_in(PW_BASE, "root:x:0:0:root:/root:/bin/bash\n").is_none());
+        // a new UID-0 account is a second root
+        let cur = format!("{}toor:x:0:0::/root:/bin/bash\n", PW_BASE);
+        assert!(passwd_added_accounts_only_in(PW_BASE, &cur).is_none());
+        // malformed addition
+        let cur = format!("{}garbage-line\n", PW_BASE);
+        assert!(passwd_added_accounts_only_in(PW_BASE, &cur).is_none());
+        // no addition at all
+        assert!(passwd_added_accounts_only_in(PW_BASE, PW_BASE).is_none());
+    }
 
     #[test]
     fn finding_type_mapping() {

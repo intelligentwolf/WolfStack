@@ -618,10 +618,12 @@ Sell N VMs → auto-deploy as a federated tenant cluster.
 - Discord: bot token, replies in-thread. Telegram: bot token, /start, 4096-char chunking. WhatsApp: Baileys gateway (Node.js subprocess), one-time phone pairing
 - Named WolfAgents can also bind their own Discord/Telegram/WhatsApp identities
 
-## MCP endpoints (Model Context Protocol shaped)
-- NOT a full MCP server (no initialize handshake, no stdio/SSE transport). Two HTTP endpoints matching MCP JSON shapes: `POST /api/mcp/tools/list` and `POST /api/mcp/tools/call`
-- Auth: standard WolfStack session cookie
-- **Read-only, three tools**: list_nodes, get_metrics, list_containers_local
+## MCP server (AI agents: Claude Code and other MCP clients)
+- Built-in MCP server at `https://<node>/mcp` (Streamable HTTP; MCP 2026-07-28 and 2025-03-26…2025-11-25). OFF by default; enable per node in Settings → AI Agents (MCP) after setting the node's public HTTPS URL. HTTPS only (or a TLS reverse proxy on the same host, which must send X-Forwarded-For).
+- Sign-in is OAuth 2.1: the client opens a WolfStack approval page; the user signs in with password + 2FA every time and ticks permissions (only `read` pre-ticked). SSO/passkey-only accounts can't approve. Optional per-node switch to also accept API keys that carry the `mcp` scope (a `*` key gives nothing).
+- Permissions: `read` (status, containers, VMs, backups, storage, Inbox findings), `logs` (container logs, secrets masked, opt-in), `containers` / `vms` (start/stop/restart), `backup` (run a schedule). Viewers and non-sudo Linux accounts get read/logs only. No exec, shells, files, delete, network or settings tools.
+- Claude Code: `claude mcp add --transport http wolfstack https://<node>:8553/mcp`, then `/mcp` to sign in. Approvals are listed and revocable in Settings → AI Agents (MCP); every call is in the API audit log (`mcp:` entries).
+- The old `/api/mcp/tools/list` and `/api/mcp/tools/call` endpoints were removed.
 
 ## SQL Connections + MySQL/MariaDB editor
 - **SQL Connections** (`/api/sql-connections/…`): guarded pool shared by WolfAgents and WolfFlow SqlQuery steps. MariaDB/MySQL/Postgres. Every exec: sqlparser statement classification against the connection's declared tier (Read/Update/Delete; DDL never allowed; stacked statements rejected), 5s connect / 30s exec timeouts, 10k rows / 10 MB caps, audit log at /var/log/wolfstack/sql-audit.log. Passwords AES-encrypted at rest. Saved queries + history
@@ -746,7 +748,7 @@ Startup-hang class (fixed v25.2.8–.11): journal stops right after "Public IP:"
 - **"Put my NAS shares / S3 bucket behind SMB/NFS"** → WolfStack Gateway
 - **"Manage my TrueNAS / Unraid / UniFi / NetBird from here"** → the matching integration pages
 - **"Back up my containers / VMs"** → Backups (7 destination types; pre/post hooks available)
-- **"Use WolfStack from Claude Desktop / Cursor"** → the /api/mcp endpoints are read-only tool stubs (3 tools) — not a full MCP server yet; say so honestly
+- **"Use WolfStack from Claude Code / other AI agents"** → the built-in MCP server: Settings → AI Agents (MCP), set the public HTTPS URL, enable, then add `https://<node>:8553/mcp` to the client and approve in the browser
 - **"Chat with my cluster from my phone"** → Discord / Telegram / WhatsApp bots
 
 ## Learn courses (in-app onboarding — THREE courses with a picker)

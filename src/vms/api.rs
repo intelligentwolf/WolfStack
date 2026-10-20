@@ -746,64 +746,80 @@ struct VmActionRequest {
 async fn vm_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<VmActionRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-
-    // A start must not bring up a second copy of a WolfNet IP already live
-    // elsewhere in the cluster. Read the IP under a brief lock, then release
-    // it before the async cluster check (never hold the mutex across await).
-    if body.action == "start" {
-        let ip = {
-            let manager = state.vms.lock().unwrap();
-            manager.get_vm(&name).and_then(|c| c.wolfnet_ip)
-        };
-        if let Some(ip) = ip.filter(|s| !s.trim().is_empty())
-            && let Some(holder) = crate::api::wolfnet_ip_active_elsewhere(&state, &ip).await
-        {
-            return HttpResponse::Conflict().json(serde_json::json!({
-                "error": format!("WolfNet IP already in use: {} (active on {})", ip.trim(), holder)
-            }));
-        }
+    if let Err(e) = vm_lifecycle_guard(&state, &name, &body.action).await {
+        return HttpResponse::Conflict().json(serde_json::json!({ "error": e }));
     }
-    // A WolfHA standby VM carries its primary's MAC and IPs — hand-starting
-    // it while the primary runs puts two identical machines on one L2.
-    // Promotion (the WolfHA page) is the sanctioned way to start it.
-    // Mirrors the LXC guard in api::mod.rs container actions.
-    if matches!(body.action.as_str(), "start" | "restart" | "resume") {
-        let store = crate::wolfha::HaStore::load();
-        let is_standby = store.get(&name).map(|e| {
-            e.kind == crate::wolfha::SubjectKind::Vm && e.role == crate::wolfha::HaRole::Replica
-        }).unwrap_or(false);
-        if is_standby {
-            return HttpResponse::Conflict().json(serde_json::json!({
-                "error": format!(
-                    "'{}' is a WolfHA standby — starting it here would collide with the active copy. Use Promote on the WolfHA page instead.",
-                    name
-                )
-            }));
-        }
-    }
-
-    let manager = state.vms.lock().unwrap();
-
-    let result = match body.action.as_str() {
-        "start" => manager.start_vm(&name),
-        // Graceful ACPI shutdown — tries to let the guest close cleanly.
-        // qm / virsh / SIGTERM variants depending on backend.
-        "stop" => manager.stop_vm(&name, false),
-        // Power-yank — equivalent to the old `stop` behaviour. For when
-        // the guest is wedged or the user needs an immediate halt.
-        "force-stop" => manager.stop_vm(&name, true),
-        // Reboot the guest (qm/virsh reboot; native QMP system_reset).
-        "restart" => manager.restart_vm(&name),
-        // Suspend/resume to RAM (qm/virsh suspend|resume; native QMP stop/cont).
-        "pause" => manager.pause_vm(&name),
-        "resume" => manager.resume_vm(&name),
-        _ => Err(format!("Unknown action: {}", body.action)),
-    };
-    
-    match result {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
+    match run_vm_action(&state, &name, &body.action).await {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
+}
+
+/// Refusals every path that changes a VM's run state must apply — the REST
+/// handler and the MCP tools both call this. `Err` is the operator-facing
+/// reason (answered as 409 by REST).
+///
+/// * start: never bring up a second copy of a WolfNet IP already live
+///   elsewhere in the cluster. The IP is read under a brief lock, released
+///   before the async cluster check (never hold the mutex across await).
+/// * start / restart / resume: a WolfHA standby VM carries its primary's MAC
+///   and IPs — hand-starting it while the primary runs puts two identical
+///   machines on one L2. Promotion (the WolfHA page) is the sanctioned way.
+pub(crate) async fn vm_lifecycle_guard(state: &web::Data<AppState>, name: &str, action: &str) -> Result<(), String> {
+    if action == "start" {
+        let ip = {
+            let manager = state.vms.lock().unwrap_or_else(|e| e.into_inner());
+            manager.get_vm(name).and_then(|c| c.wolfnet_ip)
+        };
+        if let Some(ip) = ip.filter(|s| !s.trim().is_empty())
+            && let Some(holder) = crate::api::wolfnet_ip_active_elsewhere(state, &ip).await
+        {
+            return Err(format!("WolfNet IP already in use: {} (active on {})", ip.trim(), holder));
+        }
+    }
+    if matches!(action, "start" | "restart" | "resume") {
+        let n = name.to_string();
+        let is_standby = web::block(move || {
+            let store = crate::wolfha::HaStore::load();
+            store.get(&n).map(|e| {
+                e.kind == crate::wolfha::SubjectKind::Vm && e.role == crate::wolfha::HaRole::Replica
+            }).unwrap_or(false)
+        }).await.unwrap_or(false);
+        if is_standby {
+            return Err(format!(
+                "'{}' is a WolfHA standby — starting it here would collide with the active copy. Use Promote on the WolfHA page instead.",
+                name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run a VM power action on the blocking pool (qm / virsh / QEMU all shell
+/// out; a graceful stop can take a while). The VmManager lock is taken
+/// inside the blocking closure, so it is never held by an actix worker.
+pub(crate) async fn run_vm_action(state: &web::Data<AppState>, name: &str, action: &str) -> Result<(), String> {
+    let (state, name, action) = (state.clone(), name.to_string(), action.to_string());
+    web::block(move || {
+        let manager = state.vms.lock().unwrap_or_else(|e| e.into_inner());
+        match action.as_str() {
+            "start" => manager.start_vm(&name),
+            // Graceful ACPI shutdown — tries to let the guest close cleanly.
+            // qm / virsh / SIGTERM variants depending on backend.
+            "stop" => manager.stop_vm(&name, false),
+            // Power-yank — equivalent to the old `stop` behaviour. For when
+            // the guest is wedged or the user needs an immediate halt.
+            "force-stop" => manager.stop_vm(&name, true),
+            // Reboot the guest (qm/virsh reboot; native QMP system_reset).
+            "restart" => manager.restart_vm(&name),
+            // Suspend/resume to RAM (qm/virsh suspend|resume; native QMP stop/cont).
+            "pause" => manager.pause_vm(&name),
+            "resume" => manager.resume_vm(&name),
+            _ => Err(format!("Unknown action: {}", action)),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("VM action task failed: {}", e)))
 }
 
 #[derive(Deserialize)]
