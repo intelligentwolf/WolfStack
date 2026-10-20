@@ -52279,10 +52279,45 @@ function setMcpUrlError(msg) {
 function renderMcpConnect(mcpUrl) {
     const box = document.getElementById('mcp-connect');
     if (!box) return;
+    // A result is only true of the URL it was run against.
+    const testResult = document.getElementById('mcp-test-result');
+    if (testResult) testResult.textContent = '';
     if (!mcpUrl) { box.style.display = 'none'; return; }
     document.getElementById('mcp-url-text').textContent = mcpUrl;
     document.getElementById('mcp-claude-cmd').textContent = `claude mcp add --transport http wolfstack ${mcpUrl}`;
     box.style.display = 'block';
+}
+
+// The node calls its own saved public URL exactly as an agent would and
+// reports, per step, what answered. Agents' own errors for a proxy that
+// intercepts the endpoint (e.g. Claude Code's CLIENT_HTTP_UNEXPECTED_CONTENT)
+// name neither the cause nor the fix.
+async function testMcpConnection() {
+    const btn = document.getElementById('mcp-test-btn');
+    const out = document.getElementById('mcp-test-result');
+    if (!btn || !out) return;
+    btn.disabled = true;
+    out.textContent = 'Testing…';
+    try {
+        const r = await fetch(apiUrl('/api/mcp/test'), { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        const checks = Array.isArray(d.checks) ? d.checks : [];
+        const summary = d.ok
+            ? '<div style="font-weight:600;margin-bottom:6px;">✓ Agents can reach this node — the connection test passed.</div>'
+            : '<div style="font-weight:600;margin-bottom:6px;color:var(--danger,#ef4444);">✗ Agents cannot connect yet — see what answered below.</div>';
+        out.innerHTML = summary + '<ul style="list-style:none;padding:0;margin:0;">' + checks.map(c => `
+            <li style="margin-bottom:8px;padding:8px 10px;border-radius:6px;background:var(--bg-tertiary);border-left:3px solid ${c.ok ? 'var(--success,#22c55e)' : 'var(--danger,#ef4444)'};">
+                <div><strong>${c.ok ? '✓ Passed' : '✗ Failed'}: ${escapeHtml(c.step)}</strong></div>
+                <div style="font-size:12px;color:var(--text-muted);word-break:break-all;"><code>${escapeHtml(c.url)}</code></div>
+                <div style="margin-top:4px;">${escapeHtml(c.detail)}</div>
+            </li>`).join('') + '</ul>';
+    } catch (e) {
+        out.textContent = '';
+        showToast('Could not run the connection test: ' + (e.message || e), 'error', 0);
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 async function copyMcpText(elementId) {
@@ -52469,6 +52504,7 @@ document.addEventListener('click', (ev) => {
 window.loadMcpTab = loadMcpTab;
 window.saveMcpSettings = saveMcpSettings;
 window.copyMcpText = copyMcpText;
+window.testMcpConnection = testMcpConnection;
 
 // ─── Enterprise API Keys ───
 

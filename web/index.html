@@ -8255,6 +8255,11 @@ dns_cloudflare_api_token = your_token_here"
                                 <button type="button" class="btn btn-sm" onclick="copyMcpText('mcp-claude-cmd')">Copy</button>
                             </div>
                             <p style="font-size:12px;color:var(--text-muted);margin:0;">Run <code>/mcp</code> in Claude Code to sign in. A WolfStack page opens: tick the permissions to give (only read is ticked to start with), sign in with your password and 2FA code, and approve.</p>
+                            <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                                <button type="button" class="btn btn-sm" id="mcp-test-btn" onclick="testMcpConnection()" aria-describedby="mcp-test-help">Test connection</button>
+                                <span id="mcp-test-help" style="font-size:12px;color:var(--text-muted);">Calls the URL above the way an agent does, and says what answers — useful behind a reverse proxy.</span>
+                            </div>
+                            <div id="mcp-test-result" role="status" aria-live="polite" style="margin-top:10px;font-size:13px;"></div>
                         </div>
 
                         <div style="margin-top:28px;">
