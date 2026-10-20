@@ -1235,7 +1235,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                     let name_for_skip = name.clone();
                     let policy_str = format!("{:?}", policy.policy);
                     handles.push(tokio::spawn(async move {
-                        iw::ImageUpdateEvent {
+                        Ok(iw::ImageUpdateEvent {
                             id: format!("evt-skip-{}", uuid::Uuid::new_v4().simple()),
                             container_name: name_for_skip,
                             image: String::new(),
@@ -1245,7 +1245,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                             status: iw::ImageUpdateStatus::Failed,
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             error: Some(format!("policy is {} — skipped", policy_str)),
-                        }
+                        })
                     }));
                     continue;
                 }
@@ -1257,9 +1257,12 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                 let fallback_name = name.clone();
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await.expect("semaphore closed");
+                    // Err(name) = that container is already being updated
+                    // (operator "Update now" or the auto-apply loop). Not a
+                    // failure and not history: reported in the run output.
                     tokio::task::spawn_blocking(move || {
-                        iw::perform_update_blocking(&name, &cfg)
-                    }).await.unwrap_or_else(|join_err| iw::ImageUpdateEvent {
+                        iw::perform_update_blocking(&name, &cfg).ok_or(name)
+                    }).await.unwrap_or_else(|join_err| Ok(iw::ImageUpdateEvent {
                         id: format!("evt-join-{}", chrono::Utc::now().timestamp()),
                         container_name: fallback_name,
                         image: String::new(),
@@ -1269,17 +1272,22 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                         status: iw::ImageUpdateStatus::Failed,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         error: Some(format!("worker join failed: {}", join_err)),
-                    })
+                    }))
                 }));
             }
             let mut events: Vec<iw::ImageUpdateEvent> = Vec::with_capacity(handles.len());
-            for h in handles { if let Ok(ev) = h.await { events.push(ev); } }
+            let mut already_updating: Vec<String> = Vec::new();
+            for h in handles {
+                match h.await {
+                    Ok(Ok(ev)) => events.push(ev),
+                    Ok(Err(name)) => already_updating.push(name),
+                    Err(_) => {}
+                }
+            }
             // Persist to audit history.
-            let mut latest = iw::ImageWatcherConfig::load();
-            latest.update_history.extend(events.clone());
-            let overflow = latest.update_history.len().saturating_sub(200);
-            if overflow > 0 { latest.update_history.drain(0..overflow); }
-            let _ = latest.save();
+            if let Err(e) = iw::append_history(events.clone()) {
+                tracing::warn!("wolfflow: failed to persist image update history: {}", e);
+            }
             let success_count = events.iter()
                 .filter(|e| matches!(e.status, iw::ImageUpdateStatus::Completed))
                 .count();
@@ -1288,10 +1296,15 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
             data.insert("total".to_string(), serde_json::json!(events.len()));
             data.insert("succeeded".to_string(), serde_json::json!(success_count));
             data.insert("failed".to_string(), serde_json::json!(events.len() - success_count));
-            Ok(structured_output(
-                format!("Updated {}/{} container(s) successfully", success_count, events.len()),
-                data,
-            ))
+            let mut summary = format!("Updated {}/{} container(s) successfully", success_count, events.len());
+            if !already_updating.is_empty() {
+                summary.push_str(&format!(
+                    "; skipped {} already being updated: {}",
+                    already_updating.len(), already_updating.join(", "),
+                ));
+            }
+            data.insert("already_updating".to_string(), serde_json::json!(already_updating));
+            Ok(structured_output(summary, data))
         }
 
         // ─── Backup ───
