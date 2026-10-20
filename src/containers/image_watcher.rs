@@ -614,6 +614,37 @@ impl ImageWatcherConfig {
     }
 }
 
+/// Serialises every load → modify → save of the config file. Updates now
+/// finish in the background, so two containers finishing together (or one
+/// finishing while the operator saves settings, or a cluster reconcile
+/// lands) each loaded, changed and wrote the file independently and the
+/// last writer silently dropped the other's change — a lost history event
+/// or a reverted setting. A std mutex: never hold the guard across `.await`.
+static CONFIG_RMW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the config read-modify-write lock (poison-tolerant: a panic in one
+/// writer must not wedge every later save).
+pub fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_RMW_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Most recent history events kept in the config file.
+const HISTORY_CAP: usize = 200;
+
+/// Append finished update events to the persisted audit history (capped at
+/// [`HISTORY_CAP`], oldest dropped first) under [`config_lock`]. Blocking
+/// file I/O — call from a blocking context.
+pub fn append_history(events: impl IntoIterator<Item = ImageUpdateEvent>) -> Result<(), String> {
+    let _g = config_lock();
+    let mut latest = ImageWatcherConfig::load();
+    latest.update_history.extend(events);
+    let overflow = latest.update_history.len().saturating_sub(HISTORY_CAP);
+    if overflow > 0 {
+        latest.update_history.drain(0..overflow);
+    }
+    latest.save()
+}
+
 // ═══════════════════════════════════════════════
 // ─── Local Digest ───
 // ═══════════════════════════════════════════════
@@ -1036,25 +1067,41 @@ pub async fn check_container_update(container_name: &str) -> Result<ImageCheckRe
 ///   6. `docker stop` + `docker rm` + recreate-from-inspect — the
 ///      tag's now pointing at the new image so recreate naturally
 ///      picks it up.
-///   7. Health check (if enabled): poll docker inspect for HEALTHCHECK
-///      status, OR fall back to "Running for ≥10 seconds" when no
-///      HEALTHCHECK is declared (very common for community images).
+///   7. Health check (if enabled): with a HEALTHCHECK, wait for
+///      `healthy` only, for at least the image's own verdict window; with
+///      none, fall back to "running for ≥10 seconds" (very common for
+///      community images). See `wait_for_healthy`.
 ///   8. On health failure: if `auto_rollback`, recreate with the OLD
 ///      image ID; otherwise mark Failed and leave the container in
 ///      its degraded state for the operator to inspect.
 ///
-/// Always returns an `ImageUpdateEvent` — the caller appends it to
-/// `config.update_history` regardless of outcome so the operator has
-/// a full audit trail.
-pub fn perform_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> ImageUpdateEvent {
-    let event = run_update_blocking(container_name, config);
+/// Returns `None` — having touched nothing — when an update of the same
+/// container is already running (see `try_begin_update`). Otherwise the
+/// `ImageUpdateEvent` is always returned and the caller appends it to
+/// `config.update_history` regardless of outcome, so the operator has a
+/// full audit trail. A `None` is deliberately NOT history-worthy: it is
+/// not a failed update, and recording it as one is what made a successful
+/// paperless-ngx update end its history with "failed" (2026-09-20 and
+/// 2026-10-08).
+pub fn perform_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Option<ImageUpdateEvent> {
+    let guard = try_begin_update(container_name).ok()?;
+    Some(perform_update_with_guard(guard, config))
+}
+
+/// Run the update for a container the caller has already claimed with
+/// `try_begin_update`. The operator "Update now" path claims first so it
+/// can answer 409 / 202-with-an-id before the work starts; everything
+/// else goes through `perform_update_blocking`.
+pub fn perform_update_with_guard(guard: UpdateGuard, config: &ImageWatcherConfig) -> ImageUpdateEvent {
+    let event = run_update_blocking(&guard, config);
+    guard.finish(&event);
 
     // WolfFunctions container_updated / container_update_failed triggers.
     // Two outcomes are deliberate non-events: a passive-policy refusal
     // (nothing was attempted) and the already-at-latest short circuit
     // (Completed + error set, no recreate happened). force_local: the
     // update runs on exactly this node.
-    let passive_refusal = config.policy_for(container_name).is_passive();
+    let passive_refusal = config.policy_for(&event.container_name).is_passive();
     let noop = event.status == ImageUpdateStatus::Completed && event.error.is_some();
     if !passive_refusal && !noop {
         let trigger = match event.status {
@@ -1076,6 +1123,150 @@ pub fn perform_update_blocking(container_name: &str, config: &ImageWatcherConfig
         }
     }
     event
+}
+
+// ─── In-flight update registry ───
+//
+// One update per container at a time. A second "Update now" clicked while
+// the first was still recreating ran its own pre-update `docker commit`
+// against the half-swapped container and failed ("snapshot … does not
+// exist"); a run that got further would have raced a second
+// stop/rename/recreate of the same container. The registry is also what
+// the UI polls for stage progress, so it keeps the live event of each
+// running update plus the last few finished ones.
+
+/// How many finished events stay pollable by id. Generous next to the
+/// 2-second UI poll — it only needs to outlive the gap between a run
+/// finishing and the browser's next poll.
+const FINISHED_EVENTS_KEPT: usize = 64;
+
+#[derive(Default)]
+struct UpdateRegistry {
+    /// Keyed by container name: the live event of the running update.
+    in_flight: HashMap<String, ImageUpdateEvent>,
+    /// Most recent last.
+    finished: std::collections::VecDeque<ImageUpdateEvent>,
+}
+
+static UPDATES: std::sync::LazyLock<std::sync::Mutex<UpdateRegistry>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(UpdateRegistry::default()));
+
+fn updates_lock() -> std::sync::MutexGuard<'static, UpdateRegistry> {
+    // A panic while holding this lock can only come from HashMap/VecDeque
+    // ops, which leave the data consistent — take it rather than wedge
+    // every future update behind a poisoned mutex.
+    UPDATES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl UpdateRegistry {
+    fn push_finished(&mut self, event: ImageUpdateEvent) {
+        self.finished.push_back(event);
+        while self.finished.len() > FINISHED_EVENTS_KEPT {
+            self.finished.pop_front();
+        }
+    }
+}
+
+/// Claim on a container's update slot. Dropping it releases the slot on
+/// every path: `finish` on a normal return, `Drop` if the worker panics
+/// (recorded as a Failed event so a poller is not left waiting forever).
+pub struct UpdateGuard {
+    container: String,
+    event_id: String,
+    finished: bool,
+}
+
+/// Claim the update slot for `container_name`. `Err` carries the live
+/// event of the update already running, so the caller can point the
+/// operator at it instead of starting a second one.
+pub fn try_begin_update(container_name: &str) -> Result<UpdateGuard, Box<ImageUpdateEvent>> {
+    let mut reg = updates_lock();
+    if let Some(running) = reg.in_flight.get(container_name) {
+        return Err(Box::new(running.clone()));
+    }
+    let event_id = format!("evt-{}", uuid::Uuid::new_v4().simple());
+    reg.in_flight.insert(container_name.to_string(), ImageUpdateEvent {
+        id: event_id.clone(),
+        container_name: container_name.to_string(),
+        image: String::new(),
+        old_digest: String::new(),
+        new_digest: String::new(),
+        backup_id: None,
+        status: ImageUpdateStatus::UpdateAvailable,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        error: None,
+    });
+    Ok(UpdateGuard { container: container_name.to_string(), event_id, finished: false })
+}
+
+impl UpdateGuard {
+    pub fn event_id(&self) -> &str { &self.event_id }
+
+    /// Publish the run's current stage for pollers.
+    fn publish(&self, event: &ImageUpdateEvent) {
+        let mut reg = updates_lock();
+        if let Some(slot) = reg.in_flight.get_mut(&self.container) {
+            *slot = event.clone();
+        }
+    }
+
+    /// Release the slot and keep the final event pollable. One lock
+    /// scope, so a poller never sees the run as neither running nor
+    /// finished.
+    fn finish(mut self, event: &ImageUpdateEvent) {
+        let mut reg = updates_lock();
+        reg.in_flight.remove(&self.container);
+        reg.push_finished(event.clone());
+        self.finished = true;
+    }
+}
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        if self.finished { return; }
+        let mut reg = updates_lock();
+        let mut event = reg.in_flight.remove(&self.container).unwrap_or_else(|| ImageUpdateEvent {
+            id: self.event_id.clone(),
+            container_name: self.container.clone(),
+            image: String::new(),
+            old_digest: String::new(),
+            new_digest: String::new(),
+            backup_id: None,
+            status: ImageUpdateStatus::Failed,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            error: None,
+        });
+        let stage = event.status.clone();
+        event.status = ImageUpdateStatus::Failed;
+        event.error = Some(format!(
+            "update worker stopped unexpectedly during {:?} — check the container's state",
+            stage,
+        ));
+        reg.push_finished(event);
+    }
+}
+
+/// Updates currently running on this node (live stage per container).
+pub fn updates_in_progress() -> Vec<ImageUpdateEvent> {
+    updates_lock().in_flight.values().cloned().collect()
+}
+
+/// Look an update up by event id: `(event, still_running)`. Checks the
+/// live and recently-finished events, then the persisted history (an
+/// event older than the in-memory window, or from before a restart).
+pub fn update_status(event_id: &str) -> Option<(ImageUpdateEvent, bool)> {
+    {
+        let reg = updates_lock();
+        if let Some(ev) = reg.in_flight.values().find(|e| e.id == event_id) {
+            return Some((ev.clone(), true));
+        }
+        if let Some(ev) = reg.finished.iter().rev().find(|e| e.id == event_id) {
+            return Some((ev.clone(), false));
+        }
+    }
+    ImageWatcherConfig::load().update_history.into_iter().rev()
+        .find(|e| e.id == event_id)
+        .map(|e| (e, false))
 }
 
 /// Collect the host source paths of every BIND mount on a container from
@@ -1102,8 +1293,9 @@ fn bind_mount_sources(inspect: &serde_json::Value) -> Vec<String> {
 
 /// The actual update pipeline — see `perform_update_blocking` (the public
 /// wrapper that also fires WolfFunctions trigger events) for the step list.
-fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> ImageUpdateEvent {
-    let event_id = format!("evt-{}", uuid::Uuid::new_v4().simple());
+fn run_update_blocking(guard: &UpdateGuard, config: &ImageWatcherConfig) -> ImageUpdateEvent {
+    let container_name = guard.container.as_str();
+    let event_id = guard.event_id.clone();
     let started_at_rfc = chrono::Utc::now().to_rfc3339();
     let policy = config.policy_for(container_name);
     let mut event = ImageUpdateEvent {
@@ -1188,6 +1380,7 @@ fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Ima
     // Step 3: optional backup.
     if policy.backup_before_update {
         event.status = ImageUpdateStatus::BackingUp;
+        guard.publish(&event);
         // Pre-update safety backup. Named volumes are always captured (they
         // hold real app state). Bind mounts — typically large external data
         // like NAS media arrays — are skipped when the operator has opted in
@@ -1216,6 +1409,7 @@ fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Ima
     // Step 4: pull. `pull_image` is the origin ref for a migrated snapshot,
     // the container's own image otherwise.
     event.status = ImageUpdateStatus::Pulling;
+    guard.publish(&event);
     if let Err(e) = crate::containers::docker_pull(&pull_image) {
         event.status = ImageUpdateStatus::Failed;
         event.error = Some(format!("docker pull failed: {}", e));
@@ -1250,6 +1444,7 @@ fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Ima
     // vanished from the list (RutgerDiehard 2026-07-17). Hand the fn the full
     // lifecycle; on failure it has already restored the original container.
     event.status = ImageUpdateStatus::Recreating;
+    guard.publish(&event);
     // For a migrated snapshot the recreate must resolve the ORIGIN image,
     // not the snapshot tag the inspect still names — recreate_with_image
     // rewrites Config.Image before handing over, which also makes the
@@ -1268,13 +1463,17 @@ fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Ima
     // Step 7+8: health check + optional rollback.
     if policy.health_check {
         event.status = ImageUpdateStatus::HealthChecking;
-        let healthy = wait_for_healthy(container_name, policy.health_check_timeout_secs);
-        if !healthy {
+        guard.publish(&event);
+        if let Err(reason) = wait_for_healthy(container_name, policy.health_check_timeout_secs) {
             if policy.auto_rollback {
                 warn!(
-                    "auto-update {} unhealthy after restart — rolling back to image {}",
-                    container_name, old_image_id,
+                    "auto-update {} failed its health check ({}) — rolling back to image {}",
+                    container_name, reason, old_image_id,
                 );
+                // Say so while it happens: the rollback is a whole second
+                // recreate, and the stage alone would read "health checking".
+                event.error = Some(format!("{} — rolling back to the previous image", reason));
+                guard.publish(&event);
                 // recreate_with_image → docker_recreate_from_inspect does its
                 // own stop + rename + create + rollback on the LIVE (new)
                 // container; pre-removing it here would leave nothing to
@@ -1282,12 +1481,12 @@ fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Ima
                 match recreate_with_image(&inspect, container_name, &old_image_id) {
                     Ok(_) => {
                         event.status = ImageUpdateStatus::RolledBack;
-                        event.error = Some("health check failed — rolled back to previous image".into());
+                        event.error = Some(format!("{} — rolled back to previous image", reason));
                     }
                     Err(e) => {
                         event.status = ImageUpdateStatus::Failed;
                         event.error = Some(format!(
-                            "health check failed AND rollback recreate failed: {}", e,
+                            "{} AND rollback recreate failed: {}", reason, e,
                         ));
                     }
                 }
@@ -1295,8 +1494,8 @@ fn run_update_blocking(container_name: &str, config: &ImageWatcherConfig) -> Ima
             }
             event.status = ImageUpdateStatus::Failed;
             event.error = Some(format!(
-                "health check failed after {}s — auto_rollback disabled, container left in degraded state",
-                policy.health_check_timeout_secs,
+                "{} — auto_rollback disabled, container left in degraded state",
+                reason,
             ));
             return event;
         }
@@ -1322,24 +1521,105 @@ fn recreate_with_image(
     crate::containers::docker_recreate_from_inspect(container_name, &rollback_inspect)
 }
 
-/// Poll `docker inspect` until the container reports healthy or the
-/// deadline lapses. Two modes, selected automatically:
-///
-/// 1. **Image declares HEALTHCHECK** — wait for `.State.Health.Status`
-///    to be `healthy`. Returns false on `unhealthy`, keeps polling on
-///    `starting`.
-/// 2. **No HEALTHCHECK declared** — wait for `.State.Status == "running"`
-///    to hold for ≥10 contiguous seconds. The 10s gate filters out
-///    images that crash-loop right after start (very common with
-///    misconfigured env vars).
-///
-/// Returns true on success, false on timeout / explicit unhealthy.
-fn wait_for_healthy(container_name: &str, timeout_secs: u64) -> bool {
-    let timeout = std::time::Duration::from_secs(timeout_secs.max(5));
-    let deadline = std::time::Instant::now() + timeout;
+/// Docker's own HEALTHCHECK defaults, which the daemon substitutes when an
+/// image leaves a timing at 0. Source: moby daemon/health.go —
+/// `defaultProbeInterval = 30 * time.Second`, `defaultProbeTimeout = 30 *
+/// time.Second`, `defaultStartPeriod = 0`, `defaultProbeRetries = 3`, applied
+/// by `timeoutWithDefault` (durations) and `if retries <= 0` (retries).
+const DOCKER_DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
+const DOCKER_DEFAULT_PROBE_TIMEOUT_SECS: u64 = 30;
+const DOCKER_DEFAULT_PROBE_RETRIES: u64 = 3;
+
+/// Upper bound on how far an image's HEALTHCHECK timings can stretch the
+/// wait. An image declaring a 1h interval would otherwise hold the update
+/// slot for hours; the operator can still configure a longer timeout.
+const HEALTH_WAIT_CAP_SECS: u64 = 1800;
+
+/// No-HEALTHCHECK fallback: "running" must hold this long, contiguously.
+/// Filters out images that crash-loop right after start.
+const NO_HEALTHCHECK_STABLE_SECS: u64 = 10;
+
+/// Worst-case seconds before Docker reaches its OWN verdict on a freshly
+/// started container, from `Config.Healthcheck` as `docker inspect` prints it
+/// (durations are integer nanoseconds: `{"Interval":7000000000,
+/// "Timeout":3000000000,"StartPeriod":45000000000,"Retries":4}` for
+/// `--interval=7s --timeout=3s --start-period=45s --retries=4`, verified on
+/// Docker 29.7.2). The first probe runs one interval after start; failures
+/// inside the start period do not count; after it, `retries` consecutive
+/// failures — each up to interval + timeout apart — mark it unhealthy
+/// (moby `handleProbeResult`). `None` when the image declares no usable
+/// HEALTHCHECK (absent, or `["NONE"]`).
+fn healthcheck_verdict_window_secs(healthcheck: &serde_json::Value) -> Option<u64> {
+    let test = healthcheck.get("Test").and_then(|t| t.as_array())?;
+    match test.first().and_then(|v| v.as_str()) {
+        None | Some("NONE") => return None,
+        _ => {}
+    }
+    let secs = |key: &str, default: u64| -> u64 {
+        match healthcheck.get(key).and_then(|v| v.as_u64()) {
+            Some(0) | None => default,
+            Some(ns) => ns.div_ceil(1_000_000_000),
+        }
+    };
+    let interval = secs("Interval", DOCKER_DEFAULT_PROBE_INTERVAL_SECS);
+    let timeout = secs("Timeout", DOCKER_DEFAULT_PROBE_TIMEOUT_SECS);
+    let start_period = secs("StartPeriod", 0);
+    let retries = match healthcheck.get("Retries").and_then(|v| v.as_i64()) {
+        Some(r) if r > 0 => r as u64,
+        _ => DOCKER_DEFAULT_PROBE_RETRIES,
+    };
+    // Saturating: every term comes from the image author's HEALTHCHECK, so a
+    // hostile `Retries` of 10^18 must clamp (the caller caps the result at
+    // HEALTH_WAIT_CAP_SECS), not panic in a debug build or wrap to a short
+    // window in release.
+    Some(interval
+        .saturating_add(start_period)
+        .saturating_add(retries.saturating_mul(interval.saturating_add(timeout))))
+}
+
+/// How long to wait for a verdict: the operator's timeout, raised to the
+/// image's own HEALTHCHECK verdict window (capped) when it declares one. A
+/// 60s timeout on an image whose start period alone is 120s would fail
+/// every update of it — or, under the old "starting counts" rule, pass
+/// every broken one.
+fn effective_health_timeout_secs(configured_secs: u64, healthcheck: Option<&serde_json::Value>) -> u64 {
+    let configured = configured_secs.max(5);
+    match healthcheck.and_then(healthcheck_verdict_window_secs) {
+        Some(window) => configured.max(window.min(HEALTH_WAIT_CAP_SECS)),
+        None => configured,
+    }
+}
+
+/// One poll's verdict. `health` is `.State.Health.Status`, or `"none"` when
+/// the container has no health state (no HEALTHCHECK). With a HEALTHCHECK
+/// ONLY `healthy` passes: `starting` means Docker has not decided yet, which
+/// used to count as a pass after 10s running and recorded a paperless-ngx
+/// update as completed ~180s before it was actually up. `unhealthy` is not
+/// final either — moby's `handleProbeResult` sets Healthy on any passing
+/// probe regardless of the previous status, and an app running migrations
+/// can dip to unhealthy and recover (paperless did). Failing on the first
+/// `unhealthy` would roll an image back mid-migration; the deadline decides.
+fn health_poll_passes(state_status: &str, health: &str, running_for_secs: u64) -> bool {
+    if health == "none" {
+        state_status == "running" && running_for_secs >= NO_HEALTHCHECK_STABLE_SECS
+    } else {
+        health == "healthy"
+    }
+}
+
+/// Poll `docker inspect` until the container passes (`health_poll_passes`)
+/// or the effective deadline lapses (`effective_health_timeout_secs`).
+/// `Err` carries an operator-readable reason naming the last state seen.
+fn wait_for_healthy(container_name: &str, timeout_secs: u64) -> Result<(), String> {
+    let healthcheck = crate::containers::docker_inspect(container_name).ok()
+        .and_then(|v| v.pointer("/Config/Healthcheck").cloned())
+        .filter(|v| !v.is_null());
+    let effective = effective_health_timeout_secs(timeout_secs, healthcheck.as_ref());
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(effective);
     let mut running_since: Option<std::time::Instant> = None;
+    let mut last_seen = String::from("not yet inspected");
     loop {
-        if std::time::Instant::now() > deadline { return false; }
         let out = Command::new("docker")
             .args([
                 "inspect", "--format",
@@ -1351,25 +1631,28 @@ fn wait_for_healthy(container_name: &str, timeout_secs: u64) -> bool {
             && o.status.success() {
                 let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 let (status, health) = raw.split_once('|').unwrap_or((raw.as_str(), "none"));
-                match health {
-                    "healthy" => return true,
-                    "unhealthy" => return false,
-                    _ => {
-                        // No HEALTHCHECK OR still "starting" — fall back
-                        // to "running for 10s contiguous" as a stability
-                        // signal. Reset if status drops off "running".
-                        if status == "running" {
-                            let now = std::time::Instant::now();
-                            let r = *running_since.get_or_insert(now);
-                            if now.duration_since(r) >= std::time::Duration::from_secs(10) {
-                                return true;
-                            }
-                        } else {
-                            running_since = None;
-                        }
-                    }
+                let now = std::time::Instant::now();
+                if status == "running" {
+                    running_since.get_or_insert(now);
+                } else {
+                    running_since = None;
                 }
+                let running_for = running_since.map(|r| now.duration_since(r).as_secs()).unwrap_or(0);
+                if health_poll_passes(status, health, running_for) {
+                    return Ok(());
+                }
+                last_seen = if health == "none" {
+                    format!("state {}, no HEALTHCHECK", status)
+                } else {
+                    format!("state {}, health {}", status, health)
+                };
             }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "health check failed: not healthy after {}s (last seen: {})",
+                effective, last_seen,
+            ));
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
@@ -2213,5 +2496,116 @@ mod tests {
 
         // No Mounts key → empty, never panics.
         assert!(bind_mount_sources(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn healthcheck_window_uses_declared_timings() {
+        // Exact shape `docker image inspect` printed on Docker 29.7.2 for
+        // HEALTHCHECK --interval=7s --timeout=3s --start-period=45s --retries=4.
+        let hc = serde_json::json!({
+            "Test": ["CMD-SHELL", "redis-cli ping"],
+            "Interval": 7_000_000_000u64, "Timeout": 3_000_000_000u64,
+            "StartPeriod": 45_000_000_000u64, "Retries": 4
+        });
+        // first probe after 7s + 45s start period + 4 × (7 + 3)
+        assert_eq!(healthcheck_verdict_window_secs(&hc), Some(7 + 45 + 4 * 10));
+    }
+
+    #[test]
+    fn healthcheck_window_applies_docker_defaults_for_zero_timings() {
+        // HEALTHCHECK with no options: moby substitutes 30s / 30s / 0 / 3.
+        let hc = serde_json::json!({ "Test": ["CMD", "true"], "Interval": 0, "Timeout": 0, "StartPeriod": 0, "Retries": 0 });
+        assert_eq!(healthcheck_verdict_window_secs(&hc), Some(30 + 3 * 60));
+        // Keys absent entirely behaves the same.
+        let bare = serde_json::json!({ "Test": ["CMD", "true"] });
+        assert_eq!(healthcheck_verdict_window_secs(&bare), Some(210));
+    }
+
+    #[test]
+    fn hostile_healthcheck_timings_saturate_and_hit_the_cap() {
+        // Every number here is image-author controlled.
+        let hc = serde_json::json!({
+            "Test": ["CMD", "true"],
+            "Interval": u64::MAX, "Timeout": u64::MAX,
+            "StartPeriod": u64::MAX, "Retries": i64::MAX
+        });
+        assert_eq!(healthcheck_verdict_window_secs(&hc), Some(u64::MAX));
+        assert_eq!(effective_health_timeout_secs(60, Some(&hc)), HEALTH_WAIT_CAP_SECS);
+    }
+
+    #[test]
+    fn healthcheck_none_or_missing_test_is_not_a_healthcheck() {
+        assert_eq!(healthcheck_verdict_window_secs(&serde_json::json!({ "Test": ["NONE"] })), None);
+        assert_eq!(healthcheck_verdict_window_secs(&serde_json::json!({})), None);
+        assert_eq!(healthcheck_verdict_window_secs(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn effective_timeout_is_raised_to_the_window_and_capped() {
+        let hc = serde_json::json!({ "Test": ["CMD", "true"], "StartPeriod": 120_000_000_000u64 });
+        // window = 30 + 120 + 3 × 60 = 330 > configured 60
+        assert_eq!(effective_health_timeout_secs(60, Some(&hc)), 330);
+        // an operator's longer timeout wins
+        assert_eq!(effective_health_timeout_secs(900, Some(&hc)), 900);
+        // absurd image timings are capped
+        let slow = serde_json::json!({ "Test": ["CMD", "true"], "Interval": 3_600_000_000_000u64 });
+        assert_eq!(effective_health_timeout_secs(60, Some(&slow)), HEALTH_WAIT_CAP_SECS);
+        // no HEALTHCHECK: configured, floored at 5
+        assert_eq!(effective_health_timeout_secs(60, None), 60);
+        assert_eq!(effective_health_timeout_secs(0, None), 5);
+    }
+
+    #[test]
+    fn with_a_healthcheck_only_healthy_passes() {
+        // "starting" used to pass after 10s running — the paperless bug.
+        assert!(!health_poll_passes("running", "starting", 600));
+        // unhealthy is not final (Docker flips back to healthy on a pass),
+        // so it never passes but also does not end the wait by itself.
+        assert!(!health_poll_passes("running", "unhealthy", 600));
+        assert!(health_poll_passes("running", "healthy", 0));
+    }
+
+    #[test]
+    fn without_a_healthcheck_ten_seconds_running_passes() {
+        assert!(!health_poll_passes("running", "none", 9));
+        assert!(health_poll_passes("running", "none", 10));
+        assert!(!health_poll_passes("restarting", "none", 60));
+    }
+
+    #[test]
+    fn one_update_per_container_and_the_slot_is_released() {
+        let name = format!("test-guard-{}", uuid::Uuid::new_v4().simple());
+        let guard = try_begin_update(&name).expect("first claim succeeds");
+        let id = guard.event_id().to_string();
+        let running = try_begin_update(&name).err().expect("second claim refused");
+        assert_eq!(running.id, id, "refusal carries the running event");
+        assert!(updates_in_progress().iter().any(|e| e.id == id));
+
+        let mut ev = *running;
+        ev.status = ImageUpdateStatus::Pulling;
+        guard.publish(&ev);
+        assert_eq!(update_status(&id).map(|(e, live)| (e.status, live)),
+            Some((ImageUpdateStatus::Pulling, true)));
+
+        ev.status = ImageUpdateStatus::Completed;
+        guard.finish(&ev);
+        assert_eq!(update_status(&id).map(|(e, live)| (e.status, live)),
+            Some((ImageUpdateStatus::Completed, false)));
+        assert!(try_begin_update(&name).is_ok(), "slot is free again after finish");
+    }
+
+    #[test]
+    fn a_dropped_guard_releases_the_slot_and_records_a_failure() {
+        let name = format!("test-guard-{}", uuid::Uuid::new_v4().simple());
+        let id = {
+            let guard = try_begin_update(&name).expect("claim");
+            guard.event_id().to_string()
+            // dropped here without finish — what a panicking worker does
+        };
+        let (ev, live) = update_status(&id).expect("event still pollable");
+        assert!(!live);
+        assert_eq!(ev.status, ImageUpdateStatus::Failed);
+        assert!(ev.error.unwrap_or_default().contains("stopped unexpectedly"));
+        assert!(try_begin_update(&name).is_ok());
     }
 }

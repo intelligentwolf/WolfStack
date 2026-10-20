@@ -21774,12 +21774,175 @@ async function fetchImageUpdateStatus() {
         imageUpdateResults = {};
         for (const r of arr) {
             if (r && r.container_name) {
-                imageUpdateResults[r.container_name] = r;
+                // The server refreshes its cached check AFTER the run is
+                // reported finished (a registry round-trip), so for a few
+                // seconds it can still say "update available" for the image
+                // just installed — and a second click would run a no-op
+                // update. A check older than our completed update is stale.
+                const appliedAt = imageUpdateAppliedAt[imageUpdateKey(r.container_name)];
+                const checkedAt = Date.parse(r.last_checked) || 0;
+                imageUpdateResults[r.container_name] = (appliedAt && r.update_available && checkedAt < appliedAt)
+                    ? { ...r, update_available: false }
+                    : r;
             }
         }
         applyImageUpdateBadges();
+        // Not awaited: a slow or unreachable node must not hold back the
+        // badges. Runs it finds render themselves via trackImageUpdate.
+        syncImageUpdatesInProgress();
         updateImageWatcherDisabledNote(arr.length);
     } catch (e) { /* silent — image watcher may be disabled */ }
+}
+
+// ─── Running "Update now" runs ───
+//
+// The apply endpoint answers 202 + an event id and the update runs on the
+// server; the UI polls its stage. The single long fetch it replaced looked
+// failed on a slow update (paperless-ngx: ~190s of migrations) and re-enabled
+// the button while the server was still recreating the container — the
+// second click then ran a second update into the first. Runs are keyed by
+// node + container (two nodes can each have a "grafana") and are rediscovered
+// from /api/image-watcher/in-progress, so a page refresh keeps the button
+// disabled. The button only comes back once the server says the run is over.
+const imageUpdateRuns = {};
+// node|container → ms timestamp of an update that completed from this page.
+const imageUpdateAppliedAt = {};
+const IMAGE_UPDATE_STAGES = {
+    update_available: 'Starting…',
+    backing_up: 'Backing up…',
+    pulling: 'Pulling image…',
+    recreating: 'Recreating container…',
+    health_checking: 'Waiting for healthy…',
+};
+
+function imageUpdateKey(containerName, nodeId = currentNodeId) {
+    return `${nodeId || ''}|${containerName}`;
+}
+
+function imageUpdateRunFor(containerName, nodeId = currentNodeId) {
+    return imageUpdateRuns[imageUpdateKey(containerName, nodeId)] || null;
+}
+
+function imageUpdateStageText(run) {
+    const ev = run.event || {};
+    let text = IMAGE_UPDATE_STAGES[ev.status] || 'Updating…';
+    // The server sets an error while a rollback runs, before the terminal status.
+    if (ev.status === 'health_checking' && ev.error) text = 'Rolling back…';
+    return text;
+}
+
+async function syncImageUpdatesInProgress() {
+    try {
+        const r = await fetch(apiUrl('/api/image-watcher/in-progress'));
+        if (!r.ok) return;
+        const list = await r.json();
+        for (const ev of (Array.isArray(list) ? list : [])) {
+            if (ev && ev.container_name && ev.id) trackImageUpdate(ev.container_name, ev.id, ev);
+        }
+    } catch (e) { /* older node without the endpoint, or unreachable — the badges just lack progress */ }
+}
+
+// `nodeId` is the node the run belongs to. The dialog and badges on screen
+// are for `currentNodeId`; a poll for a run on another node (the operator
+// switched node mid-update) must not touch a same-named container's dialog.
+function renderImageUpdateProgress(containerName, nodeId = currentNodeId) {
+    if (nodeId !== currentNodeId) return;
+    const modal = document.getElementById('image-update-modal-backdrop');
+    if (modal && modal.getAttribute('data-container') === containerName) {
+        const run = imageUpdateRunFor(containerName, nodeId);
+        const btn = document.getElementById('ium-update-now-btn');
+        const region = document.getElementById('ium-update-progress');
+        if (run) {
+            const stage = imageUpdateStageText(run);
+            if (btn) { btn.disabled = true; btn.textContent = stage; }
+            if (region) {
+                region.textContent = run.lostContact
+                    ? `${stage} Lost contact with the server — still retrying. The update keeps running there.`
+                    : `${stage} The update runs on the server; you can close this dialog.`;
+            }
+        } else {
+            if (btn) { btn.disabled = false; btn.textContent = 'Update now'; }
+            if (region) region.textContent = '';
+        }
+    }
+    applyImageUpdateBadges();
+}
+
+function trackImageUpdate(containerName, eventId, initialEvent) {
+    // Resolve the node and URL now: the operator may switch node while this runs.
+    const nodeAtStart = currentNodeId;
+    const key = imageUpdateKey(containerName, nodeAtStart);
+    const existing = imageUpdateRuns[key];
+    if (existing && existing.eventId === eventId) return;
+    if (existing && existing.timer) clearTimeout(existing.timer);
+    const statusUrl = apiUrl(`/api/image-watcher/update/${encodeURIComponent(eventId)}`);
+    const run = { eventId, event: initialEvent || null, failures: 0, lostContact: false, timer: null };
+    imageUpdateRuns[key] = run;
+    renderImageUpdateProgress(containerName, nodeAtStart);
+    const poll = async () => {
+        let status = 0, body = null;
+        try {
+            const r = await fetch(statusUrl);
+            status = r.status;
+            body = await r.json().catch(() => null);
+        } catch (e) { /* network — counted below */ }
+        if (imageUpdateRuns[key] !== run) return; // superseded
+        if (status === 200 && body && body.event) {
+            run.failures = 0;
+            run.lostContact = false;
+            run.event = body.event;
+            if (!body.in_progress) {
+                delete imageUpdateRuns[key];
+                finishImageUpdate(containerName, body.event, nodeAtStart);
+                return;
+            }
+        } else if (status === 404) {
+            delete imageUpdateRuns[key];
+            showToast(`${containerName}: ${(body && body.error) || 'the server has no record of this update'}`, 'error', 0);
+            renderImageUpdateProgress(containerName, nodeAtStart);
+            return;
+        } else if (status === 401 || status === 403) {
+            // Not a lost connection: retrying can never succeed, so say why
+            // and stop rather than spinning on "still retrying" forever.
+            delete imageUpdateRuns[key];
+            showToast(`${containerName}: ${status === 401 ? 'your session has expired' : 'you are not permitted to follow this update'} — sign in again to see how it ended. The update keeps running on the server.`, 'error', 0);
+            renderImageUpdateProgress(containerName, nodeAtStart);
+            return;
+        } else {
+            run.failures++;
+            run.lostContact = true;
+        }
+        renderImageUpdateProgress(containerName, nodeAtStart);
+        run.timer = setTimeout(poll, run.failures ? Math.min(2000 * (run.failures + 1), 15000) : 2000);
+    };
+    run.timer = setTimeout(poll, 1000);
+}
+
+function finishImageUpdate(containerName, event, nodeAtStart) {
+    const status = event.status || 'unknown';
+    if (status === 'completed' && event.error) {
+        // Pull found nothing newer — nothing was recreated.
+        showToast(`${containerName}: ${event.error}`, 'info');
+    } else if (status === 'completed') {
+        imageUpdateAppliedAt[imageUpdateKey(containerName, nodeAtStart)] = Date.parse(event.timestamp) || Date.now();
+        showToast(`${containerName}: updated successfully (${(event.new_digest || '').substring(0, 19)}…)`, 'success');
+    } else if (status === 'rolled_back') {
+        showToast(`${containerName}: ${event.error || 'health check failed'} — the previous image is running again`, 'error', 0);
+    } else {
+        showToast(`${containerName}: update ${status}${event.error ? ' — ' + event.error : ''}`, 'error', 0);
+    }
+    const modal = document.getElementById('image-update-modal-backdrop');
+    if (modal && modal.getAttribute('data-container') === containerName) closeImageUpdateModal();
+    // Only refresh the lists if they still show the node this ran on.
+    if (currentNodeId !== nodeAtStart) return;
+    applyImageUpdateBadges();
+    fetchImageUpdateStatus();
+    // Any apply that recreated the container (completed, rolled_back, or the
+    // failed-with-safety-net path) minted a NEW container id. Refresh the
+    // Docker list now so the row drops its stale object instead of lingering
+    // until the next 5s poll — an action against the dead id would fail with
+    // 'No such container'.
+    if (typeof loadDockerContainers === 'function') loadDockerContainers();
 }
 
 // An empty status list has two very different causes — the watcher is
@@ -21853,6 +22016,15 @@ function applyImageUpdateBadges() {
     document.querySelectorAll('[data-image-update-badge]').forEach(el => {
         const name = el.getAttribute('data-image-update-badge');
         const r = imageUpdateResults[name];
+        const run = imageUpdateRunFor(name);
+        if (run) {
+            el.innerHTML = `<span role="button" tabindex="0"
+                onclick="openImageUpdateModal('${escapeAttr(name)}')"
+                onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openImageUpdateModal('${escapeAttr(name)}')}"
+                style="display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;background:#3b82f622;color:#3b82f6;border:1px solid #3b82f644;cursor:pointer;"
+                title="Docker image update in progress — click for progress">${escapeHtml(imageUpdateStageText(run).toLowerCase())}</span>`;
+            return;
+        }
         if (!r) {
             el.innerHTML = '';
             return;
@@ -21935,7 +22107,7 @@ async function openImageUpdateModal(containerName, imageHint) {
         .map(o => `<option value="${o[0]}"${String(_ci) === String(o[0]) ? ' selected' : ''}>${o[1]}</option>`).join('');
 
     const html = `
-        <div id="image-update-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="iumt"
+        <div id="image-update-modal-backdrop" data-container="${escapeAttr(containerName)}" role="dialog" aria-modal="true" aria-labelledby="iumt"
              style="position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;"
              onclick="if(event.target===this)closeImageUpdateModal()">
             <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:24px;max-width:520px;width:100%;max-height:90vh;overflow:auto;">
@@ -21981,16 +22153,18 @@ async function openImageUpdateModal(containerName, imageHint) {
                 </div>
                 <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">How often WolfStack checks this container's registry for a newer image. "Default" uses the global setting on the <a href="#" onclick="const n = currentNodeId; closeImageUpdateModal(); openDockerUpdatesSettings(n); return false;" style="color:var(--accent-light);text-decoration:underline;">Docker Updates page</a>.</div>
 
+                <div id="ium-update-progress" role="status" aria-live="polite" style="font-size:12px;margin-top:14px;color:var(--text-secondary);"></div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;">
                     <button class="btn" onclick="closeImageUpdateModal()">Cancel</button>
                     <button class="btn btn-primary" onclick="saveImageUpdatePolicy('${escapeAttr(containerName)}')">Save policy</button>
-                    ${r.update_available ? `<button class="btn btn-primary" onclick="applyImageUpdateNow('${escapeAttr(containerName)}', this)" style="background:#3b82f6;border-color:#3b82f6;">Update now</button>` : ''}
+                    ${(r.update_available || imageUpdateRunFor(containerName)) ? `<button id="ium-update-now-btn" class="btn btn-primary" onclick="applyImageUpdateNow('${escapeAttr(containerName)}', this)" style="background:#3b82f6;border-color:#3b82f6;">Update now</button>` : ''}
                 </div>
             </div>
         </div>`;
     const host = document.createElement('div');
     host.innerHTML = html;
     document.body.appendChild(host.firstElementChild);
+    renderImageUpdateProgress(containerName);
 }
 
 function closeImageUpdateModal() {
@@ -22054,33 +22228,42 @@ async function saveImageUpdatePolicy(containerName) {
 }
 
 async function applyImageUpdateNow(containerName, btn) {
+    if (imageUpdateRunFor(containerName)) return; // the button is disabled; belt and braces
     if (!await wolfConfirm(`Update Docker image for "${containerName}" now? The container will be stopped, recreated with the new image, and health-checked. Backup-before-update + auto-rollback are governed by the per-container settings above.`, 'Update Docker image')) return;
-    const origHtml = btn ? btn.innerHTML : '';
-    if (btn) { btn.disabled = true; btn.innerHTML = 'Updating…'; }
+    const origText = btn ? btn.textContent : '';
+    const restore = () => { if (btn && !imageUpdateRunFor(containerName)) { btn.disabled = false; btn.textContent = origText; } };
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    let r, body;
     try {
-        const r = await fetch(apiUrl(`/api/image-watcher/apply/${encodeURIComponent(containerName)}`), { method: 'POST' });
-        const event = await r.json();
-        if (!r.ok) throw new Error(event.error || `HTTP ${r.status}`);
-        const status = event.status || 'unknown';
-        if (status === 'completed') {
-            showToast(`${containerName}: updated successfully (${(event.new_digest||'').substring(0,19)}…)`, 'success');
-        } else if (status === 'rolled_back') {
-            showToast(`${containerName}: health-check failed, rolled back to previous image`, 'error');
-        } else {
-            showToast(`${containerName}: ${status}${event.error ? ' — ' + event.error : ''}`, 'error');
-        }
-        closeImageUpdateModal();
-        fetchImageUpdateStatus();
-        // Any apply that recreated the container (completed, rolled_back,
-        // or the failed-with-safety-net path) minted a NEW container id.
-        // Refresh the full Docker list now so the on-screen row drops its
-        // stale object instead of lingering until the next 5s poll — an
-        // action against the dead id would fail with 'No such container'.
-        if (typeof loadDockerContainers === 'function') loadDockerContainers();
+        r = await fetch(apiUrl(`/api/image-watcher/apply/${encodeURIComponent(containerName)}`), { method: 'POST' });
+        body = await r.json().catch(() => ({}));
     } catch (e) {
-        showToast('Update failed: ' + (e.message || e), 'error');
-        if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+        // We can't tell whether the server started it — ask it before
+        // offering the button again. (A repeat click is refused with 409
+        // server-side anyway, and attaches to the running update.)
+        showToast(`${containerName}: could not confirm the update started (${e.message || e}). Checking the server…`, 'warning', 0);
+        await syncImageUpdatesInProgress();
+        restore();
+        return;
     }
+    if (r.status === 202 && body.event_id) {
+        trackImageUpdate(containerName, body.event_id);
+        return;
+    }
+    if (r.status === 200 && body.status) {
+        // A node on an older WolfStack ran the whole update inside the
+        // request and answered with the finished event.
+        finishImageUpdate(containerName, body, currentNodeId);
+        restore();
+        return;
+    }
+    if (r.status === 409 && body.in_progress && body.event && body.event.id) {
+        showToast(`${containerName}: an update is already running — showing its progress`, 'info');
+        trackImageUpdate(containerName, body.event.id, body.event);
+        return;
+    }
+    showToast(`${containerName}: ${body.error || `update could not start (HTTP ${r.status})`}`, 'error', 0);
+    restore();
 }
 
 window.fetchImageUpdateStatus = fetchImageUpdateStatus;
@@ -30879,7 +31062,12 @@ async function openContainerUpdates(runtime, container) {
 
     try {
         const resp = await fetch(apiUrl(`/api/containers/${runtime}/${encodeURIComponent(container)}/updates/check`), { method: 'POST' });
-        const data = await resp.json();
+        const data = await resp.json().catch(() => ({}));
+        // Without this a 403/500 rendered "System is up to date" — a false
+        // all-clear on a check that never ran.
+        if (!resp.ok || !data.ok) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
         const count = data.count || 0;
         const list = data.list || '';
         const pm = data.package_manager || 'unknown';
@@ -30899,10 +31087,11 @@ async function openContainerUpdates(runtime, container) {
                     ${count > 0 ? `<button class="btn btn-sm btn-primary" onclick="applyContainerUpdates('${runtime}', '${container.replace(/'/g, "\\'")}')">⬆️ Apply Updates</button>` : ''}
                 </div>
             </div>
+            ${runtime === 'docker' ? `<p style="margin:0 0 12px;font-size:12px;color:var(--text-muted);">Packages updated inside a running Docker container are lost the next time it is recreated (for example by an image update). Pulling a newer image is the lasting fix.</p>` : ''}
             ${list ? `<pre style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:var(--font-mono);font-size:12px;max-height:400px;overflow-y:auto;color:var(--text);white-space:pre-wrap;word-break:break-all;">${escapeHtml(list)}</pre>` : ''}
         `;
     } catch (e) {
-        body.innerHTML = `<p style="color:#ef4444;">Failed to check updates: ${escapeHtml(e.message)}</p>`;
+        body.innerHTML = `<p role="alert" style="color:#ef4444;">Failed to check updates: ${escapeHtml(e.message)}</p>`;
     }
 }
 

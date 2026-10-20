@@ -392,6 +392,26 @@ pub struct Node {
 }
 
 impl Node {
+    /// Copy of this node safe to return from the REST API: the PVE
+    /// token keeps only its `USER@REALM!TOKENID` half, never the secret
+    /// after `=` (the UI composes it as `tokenId + '=' + tokenSecret`).
+    /// `/api/nodes` returned the full token to every caller — viewer
+    /// sessions and `read` API keys included. Peers don't need it from
+    /// here: they learn tokens through cluster-authenticated gossip
+    /// (`StatusReport.known_nodes` on `/api/agent/status`), and the UI
+    /// only shows the ID and checks that a token exists. A malformed
+    /// token with no `=` is replaced outright, since it may be the bare
+    /// secret.
+    pub fn redacted_for_api(mut self) -> Self {
+        if let Some(t) = self.pve_token.take() {
+            self.pve_token = Some(match t.split_once('=') {
+                Some((id, _secret)) => id.to_string(),
+                None => "(configured)".to_string(),
+            });
+        }
+        self
+    }
+
     /// Host to dial for MIGRATION / bulk data transfer to this node. Returns
     /// the operator-set `migration_address` when present and non-blank,
     /// otherwise falls back to `address`. Everything that is NOT migration

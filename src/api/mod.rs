@@ -3855,7 +3855,8 @@ pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResp
     // helper returns "cluster-node" for those and find() below misses,
     // so the unfiltered path kicks in. Admin users also pass through
     // — the helper handles that.
-    let filtered = filter_nodes_for_caller(&caller, nodes);
+    let filtered: Vec<crate::agent::Node> = filter_nodes_for_caller(&caller, nodes)
+        .into_iter().map(crate::agent::Node::redacted_for_api).collect();
     HttpResponse::Ok().json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "nodes": filtered,
@@ -3896,7 +3897,7 @@ pub async fn get_node(req: HttpRequest, state: web::Data<AppState>, path: web::P
                             "error": "You don't have access to this cluster"
                         }));
                     }
-            HttpResponse::Ok().json(node)
+            HttpResponse::Ok().json(node.redacted_for_api())
         },
         None => HttpResponse::NotFound().json(serde_json::json!({
             "error": "Node not found"
@@ -7490,6 +7491,24 @@ fn container_exec_cmd(runtime: &str, container: &str, cmd_args: &[&str]) -> std:
     }
 }
 
+/// Like `container_exec_cmd`, but always as root inside the container.
+/// Package managers need root to take their lock and write their log
+/// (`/var/log/apk.log`, `/var/lib/dpkg/lock`), and `docker exec` without
+/// `-u` runs as the image's USER — Grafana's uid 472 made every apk
+/// upgrade fail with "Unable to open log: Permission denied". `pct exec`
+/// and `lxc-attach` already attach as uid 0, so LXC is unchanged. The
+/// general /exec endpoint deliberately keeps the image's default user.
+fn container_exec_cmd_as_root(runtime: &str, container: &str, cmd_args: &[&str]) -> std::process::Command {
+    if runtime == "docker" {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("exec").arg("-u").arg("0").arg(container);
+        for a in cmd_args { cmd.arg(a); }
+        cmd
+    } else {
+        lxc_exec_cmd(container, cmd_args)
+    }
+}
+
 /// Build a Command with stdin piped for writing into a container.
 fn container_exec_cmd_stdin(runtime: &str, container: &str, cmd_args: &[&str]) -> std::process::Command {
     if runtime == "docker" {
@@ -7592,7 +7611,7 @@ pub async fn container_cron_delete(req: HttpRequest, state: web::Data<AppState>,
 fn detect_container_pkg_manager(runtime: &str, container: &str) -> &'static str {
     for pm in &["apt", "dnf", "yum", "pacman", "apk"] {
         let check = format!("command -v {} >/dev/null 2>&1 && echo found", pm);
-        let out = container_exec_cmd(runtime, container, &["sh", "-c", &check]).output();
+        let out = container_exec_cmd_as_root(runtime, container, &["sh", "-c", &check]).output();
         if let Ok(o) = out {
             let stdout = String::from_utf8_lossy(&o.stdout);
             if o.status.success() && stdout.trim() == "found" { return pm; }
@@ -7617,7 +7636,7 @@ fn quick_container_update_count(runtime: &str, container: &str) -> (String, usiz
         "apk"    => "apk version -l '<' 2>/dev/null | tail -n +2 | grep -c .",
         _ => return (pm.to_string(), 0),
     };
-    let out = container_exec_cmd(runtime, container, &["sh", "-c", cmd]).output();
+    let out = container_exec_cmd_as_root(runtime, container, &["sh", "-c", cmd]).output();
     let count = out.ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().unwrap_or(0))
         .unwrap_or(0);
@@ -7673,40 +7692,50 @@ pub async fn container_updates_summary(req: HttpRequest, state: web::Data<AppSta
 
 /// POST /api/containers/{runtime}/{id}/updates/check — check for updates inside a container
 pub async fn container_updates_check(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    // Refreshes the package index as root inside the container (apt-get
+    // update, apk update, pacman -Sy) — a write, so the same operator gate
+    // as apply rather than plain require_auth.
+    if let Err(resp) = require_operator_auth(&req, &state) { return resp; }
     let (runtime, container) = path.into_inner();
-    let pkg_manager = detect_container_pkg_manager(&runtime, &container);
 
-    let output = match pkg_manager {
-        "apt" => {
-            let _ = container_exec_cmd(&runtime, &container, &["sh", "-c", "apt-get update -qq 2>/dev/null"]).output();
-            container_exec_cmd(&runtime, &container, &["sh", "-c", "apt list --upgradable 2>/dev/null | grep -v '^Listing'"])
+    // Detection plus the index refresh is up to five `exec` probes and a
+    // network-bound package-index download — 10-60s. Blocking pool, not an
+    // actix worker, or a few concurrent checks stall the heartbeat.
+    let result = web::block(move || {
+        let pkg_manager = detect_container_pkg_manager(&runtime, &container);
+        let run = |cmd: &str| -> String {
+            container_exec_cmd_as_root(&runtime, &container, &["sh", "-c", cmd])
                 .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
-        }
-        "dnf" => {
-            container_exec_cmd(&runtime, &container, &["sh", "-c", "dnf check-update --quiet 2>/dev/null"])
-                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
-        }
-        "yum" => {
-            container_exec_cmd(&runtime, &container, &["sh", "-c", "yum check-update --quiet 2>/dev/null"])
-                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
-        }
-        "pacman" => {
-            let _ = container_exec_cmd(&runtime, &container, &["sh", "-c", "pacman -Sy 2>/dev/null"]).output();
-            container_exec_cmd(&runtime, &container, &["sh", "-c", "pacman -Qu 2>/dev/null"])
-                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
-        }
-        "apk" => {
-            let _ = container_exec_cmd(&runtime, &container, &["sh", "-c", "apk update 2>/dev/null"]).output();
-            // tail -n +2 drops apk's unconditional `Installed: Available:`
-            // header — without this the modal rendered the header as a
-            // phantom single "update" with blank columns (JJ, 2026-06-10).
-            container_exec_cmd(&runtime, &container, &["sh", "-c", "apk version -l '<' 2>/dev/null | tail -n +2"])
-                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
-        }
-        _ => String::new(),
+        };
+        let output = match pkg_manager {
+            "apt" => {
+                run("apt-get update -qq 2>/dev/null");
+                run("apt list --upgradable 2>/dev/null | grep -v '^Listing'")
+            }
+            "dnf" => run("dnf check-update --quiet 2>/dev/null"),
+            "yum" => run("yum check-update --quiet 2>/dev/null"),
+            "pacman" => {
+                run("pacman -Sy 2>/dev/null");
+                run("pacman -Qu 2>/dev/null")
+            }
+            "apk" => {
+                run("apk update 2>/dev/null");
+                // tail -n +2 drops apk's unconditional `Installed: Available:`
+                // header — without this the modal rendered the header as a
+                // phantom single "update" with blank columns (JJ, 2026-06-10).
+                run("apk version -l '<' 2>/dev/null | tail -n +2")
+            }
+            _ => String::new(),
+        };
+        (pkg_manager, output)
+    }).await;
+
+    let (pkg_manager, output) = match result {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("update check task failed: {}", e),
+        })),
     };
-
     let count = output.lines().filter(|l| !l.trim().is_empty()).count();
     HttpResponse::Ok().json(serde_json::json!({
         "ok": true,
@@ -7722,7 +7751,14 @@ pub async fn container_updates_apply(req: HttpRequest, state: web::Data<AppState
     // command execution, so the same operator gate as container_exec.
     if let Err(resp) = require_operator_auth(&req, &state) { return resp; }
     let (runtime, container) = path.into_inner();
-    let pkg_manager = detect_container_pkg_manager(&runtime, &container);
+    // Detection is up to five sequential `exec` probes — blocking pool.
+    let (runtime_d, container_d) = (runtime.clone(), container.clone());
+    let pkg_manager = match web::block(move || detect_container_pkg_manager(&runtime_d, &container_d)).await {
+        Ok(pm) => pm,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("package manager detection failed: {}", e),
+        })),
+    };
 
     let cmd = match pkg_manager {
         "apt" => "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 2>&1",
@@ -7738,7 +7774,7 @@ pub async fn container_updates_apply(req: HttpRequest, state: web::Data<AppState
     let runtime_b = runtime.clone();
     let container_b = container.clone();
     let output = web::block(move || {
-        container_exec_cmd(&runtime_b, &container_b, &["sh", "-c", cmd]).output()
+        container_exec_cmd_as_root(&runtime_b, &container_b, &["sh", "-c", cmd]).output()
     }).await;
     match output {
         Ok(Ok(o)) => {
@@ -22546,7 +22582,28 @@ pub async fn backup_list(
     req: HttpRequest, state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    HttpResponse::Ok().json(backup::list_backups())
+    match web::block(backup::list_backups).await {
+        Ok(entries) => HttpResponse::Ok().json(backup_entries_for_api(entries)),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("backup list task: {}", e),
+        })),
+    }
+}
+
+/// Backup entries as returned by the API. Each entry carries a full
+/// copy of its `BackupStorage` (S3 secret key, PBS token secret / password,
+/// SMB password) and, for Docker targets, the raw `docker inspect` JSON in
+/// `docker_config` — whose `Config.Env` holds the container's environment
+/// (database passwords, API tokens). Both went out verbatim to every
+/// authenticated caller, viewer sessions and `read` API keys included.
+/// Restores look the entry up server-side by id, and nothing client-side
+/// reads `docker_config`, so it is dropped (empty → skipped on serialize)
+/// and the storage secrets are masked like the schedules endpoint does.
+fn backup_entries_for_api(entries: Vec<backup::BackupEntry>) -> Vec<serde_json::Value> {
+    entries.into_iter().map(|mut e| {
+        e.docker_config.clear();
+        crate::secrets::to_redacted_json(&e)
+    }).collect()
 }
 
 /// POST /api/backups — create a backup now
@@ -22591,7 +22648,7 @@ pub async fn backup_create(
     let fail_count = entries.iter().filter(|e| e.status == backup::BackupStatus::Failed).count();
     HttpResponse::Ok().json(serde_json::json!({
         "message": format!("{} backup(s) completed, {} failed", success_count, fail_count),
-        "entries": entries,
+        "entries": backup_entries_for_api(entries),
     }))
 }
 
@@ -36438,13 +36495,15 @@ async fn resolve_proposal_target(
         },
     };
 
-    // Resolve the console target from scope.resource_id. The format
-    // mirrors the resource-id conventions each analyzer uses, so a
-    // finding on `docker:postgres` opens a docker exec session into
-    // postgres; `lxc:web` → lxc-attach; `vm:opnsense:...` → VM
-    // serial console; everything else → host shell on the node the
-    // finding lives on.
-    let (console_type, console_name) = resolve_console_target(&p);
+    // Remediation commands run in the HOST shell of the finding's node,
+    // whatever the scope. Every analyzer writes its recipe for the host
+    // (`lxc-attach -n <ct> -- apt-get …`, `docker pull …`, `docker logs …`,
+    // `qemu-img info …`), so running it in the container's own console
+    // typed `lxc-attach` into the container: "command not found", nothing
+    // updated, every LXC update card stuck (proxmoxve1 lxc:230 report,
+    // v25.34.4). "Open terminal" still uses `resolve_console_target` —
+    // there the operator wants a shell inside the guest.
+    let (console_type, console_name) = recipe_console_target();
 
     // Cross-node: if the finding is on a peer (scope.node_id !=
     // this server's node_id), surface the peer's id so console.html
@@ -36606,10 +36665,10 @@ fn resolve_node_hostname(state: &web::Data<AppState>, node_id: &str) -> String {
 /// command list. Used by the Inbox's "Open terminal" button: the
 /// operator wants an interactive shell on the proposal's target
 /// (host / docker exec / lxc-attach / vm serial) so they can poke
-/// around manually instead of running the suggested command. Uses
-/// the same scope→target resolver as `predictive_proposal_command`
-/// so the two paths can never disagree about *where* a proposal
-/// lives.
+/// around manually instead of running the suggested command. This
+/// deliberately differs from `predictive_proposal_command`: commands
+/// run in the host shell (recipes are written for it), while this
+/// opens a shell on the resource itself via `resolve_console_target`.
 pub async fn predictive_proposal_console_target(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -36877,17 +36936,42 @@ async fn fetch_proposal_from_peers(
     None
 }
 
-/// Map a proposal's `scope.resource_id` to a `(console_type,
-/// console_name)` pair compatible with the existing `/ws/console/
+/// Console target for running a proposal's remediation commands: always
+/// the host shell, because every analyzer writes its recipe to be pasted
+/// on the host (see the call site in `resolve_proposal_target`).
+fn recipe_console_target() -> (String, String) {
+    ("host".into(), "host".into())
+}
+
+/// Console target for "Open terminal" — a shell on the finding's
+/// resource itself. Map a proposal's `scope.resource_id` to a
+/// `(console_type, console_name)` pair compatible with the existing `/ws/console/
 /// {type}/{name}` route + `console.html?type=...&name=...` URL.
 /// Conventions match what each analyzer writes into resource_id.
 fn resolve_console_target(p: &crate::predictive::Proposal) -> (String, String) {
-    let rid = p.scope.resource_id.as_deref().unwrap_or("");
+    console_target_for_resource(p.scope.resource_id.as_deref().unwrap_or(""))
+}
+
+/// The `resource_id` → console mapping behind `resolve_console_target`,
+/// split out so it is unit-testable without building a `Proposal`.
+fn console_target_for_resource(rid: &str) -> (String, String) {
     if let Some(name) = rid.strip_prefix("docker:") {
         return ("docker".into(), name.to_string());
     }
     if let Some(name) = rid.strip_prefix("lxc:") {
+        // container_boot scopes are `lxc:boot:<ct>` / `lxc:boot:pbs:<ct>`
+        // (distinct ids so they can't collide with other per-LXC
+        // findings on dedup) — the console wants the container name.
+        let name = name.strip_prefix("boot:pbs:")
+            .or_else(|| name.strip_prefix("boot:"))
+            .unwrap_or(name);
         return ("lxc".into(), name.to_string());
+    }
+    // `vm:wolfnet:<tap-label>` is a host-side finding (the VM's TAP and
+    // dnsmasq live on the host) and the label is a truncated TAP name,
+    // not a VM name — so it gets the host shell, not a serial console.
+    if rid.starts_with("vm:wolfnet:") {
+        return ("host".into(), "host".into());
     }
     if let Some(rest) = rid.strip_prefix("vm:") {
         // vm scope is `vm:<name>:<disk_path>` — take the name only.
@@ -43532,6 +43616,10 @@ pub async fn image_watcher_config_save(
     // per-container policies + audit history); an operator edit — local OR
     // proxied — applies the full incoming config, restoring only this host's
     // history. See ImageWatcherConfig::resolve_on_save.
+    // Held from load to save so a background history append or a cluster
+    // reconcile can't interleave and be overwritten; dropped before the
+    // fan-out `.await` below.
+    let cfg_lock = crate::containers::image_watcher::config_lock();
     let existing = crate::containers::image_watcher::ImageWatcherConfig::load();
     let incoming = body.into_inner();
     let cluster_changed = !existing.cluster_settings_eq(&incoming);
@@ -43569,7 +43657,9 @@ pub async fn image_watcher_config_save(
         };
     }
 
-    if let Err(e) = cfg.save() {
+    let saved = cfg.save();
+    drop(cfg_lock);
+    if let Err(e) = saved {
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
 
@@ -43706,6 +43796,7 @@ pub async fn image_watcher_reconcile_from_peers(
         // Reload rather than reusing the copy from the top of the pass: an
         // operator save or an inbound propagation may have landed while we
         // were querying peers, and merge must apply onto the latest state.
+        let cfg_lock = crate::containers::image_watcher::config_lock();
         let mut merged = crate::containers::image_watcher::ImageWatcherConfig::load();
         if newer.cluster_rev <= merged.cluster_rev {
             return; // something newer arrived mid-pass — nothing to do
@@ -43713,7 +43804,9 @@ pub async fn image_watcher_reconcile_from_peers(
         let was_rev = merged.cluster_rev;
         let was_enabled = merged.enabled;
         merged.merge_cluster_settings_from(&newer);
-        match merged.save() {
+        let saved = merged.save();
+        drop(cfg_lock);
+        match saved {
             Ok(()) => {
                 tracing::info!(
                     "image_watcher: reconciled cluster settings to rev {} (was rev {}, enabled {} -> {})",
@@ -43808,23 +43901,31 @@ pub async fn image_watcher_check(
 }
 
 /// POST /api/image-watcher/apply/{container} — operator-triggered
-/// "Update now" for a single container. Runs the full apply pipeline
-/// (backup → pull → recreate → health-check → optional rollback) using
-/// the current ImageWatcherConfig's per-container policy settings. The
-/// returned `ImageUpdateEvent` carries the status trail; the event is
-/// also appended to `update_history` for the audit log.
+/// "Update now" for a single container. Claims the container's update slot
+/// and answers 202 `{event_id}` straight away; the full pipeline (backup →
+/// pull → recreate → health-check → optional rollback, per the container's
+/// policy) runs in the background and the UI polls
+/// `GET /api/image-watcher/update/{event_id}` for the stage. The finished
+/// event is appended to `update_history` for the audit log.
 ///
-/// Refuses (HTTP 409) when the container's policy is Pinned or
-/// Ignore — operator must explicitly switch policy first to avoid
-/// fighting their own pin/ignore decision via a stray UI click.
+/// Holding the request open for the whole update is what made a slow one
+/// (paperless-ngx: backup + pull + ~190s of migrations) look failed — the
+/// node proxy gives a POST 300s — and the operator's second click then ran
+/// a second update into the first one's recreate.
+///
+/// 409 when the policy is Pinned or Ignore (operator must switch policy
+/// first rather than fight their own pin via a stray click), and 409 with
+/// `in_progress: true` + the live `event` when this container is already
+/// being updated, so the UI attaches to that run instead.
 pub async fn image_watcher_apply(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
+    use crate::containers::image_watcher as iw;
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let container = path.into_inner();
-    let config = crate::containers::image_watcher::ImageWatcherConfig::load();
+    let config = iw::ImageWatcherConfig::load();
     let policy = config.policy_for(&container);
     if policy.is_passive() {
         return HttpResponse::Conflict().json(serde_json::json!({
@@ -43834,36 +43935,99 @@ pub async fn image_watcher_apply(
             ),
         }));
     }
-    let cfg_for_apply = config.clone();
-    let container_for_apply = container.clone();
-    let event = match tokio::task::spawn_blocking(move || {
-        crate::containers::image_watcher::perform_update_blocking(
-            &container_for_apply, &cfg_for_apply,
-        )
-    }).await {
-        Ok(ev) => ev,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("worker join failed: {}", e),
+    let guard = match iw::try_begin_update(&container) {
+        Ok(g) => g,
+        Err(running) => return HttpResponse::Conflict().json(serde_json::json!({
+            "error": format!("an update of '{}' is already in progress", container),
+            "in_progress": true,
+            "event": running,
         })),
     };
-    // Persist the event to the audit history (re-load fresh to avoid
-    // clobbering settings the operator may have changed mid-apply).
-    let mut latest = crate::containers::image_watcher::ImageWatcherConfig::load();
-    latest.update_history.push(event.clone());
-    let overflow = latest.update_history.len().saturating_sub(200);
-    if overflow > 0 { latest.update_history.drain(0..overflow); }
-    if let Err(e) = latest.save() {
-        tracing::warn!("image_watcher: failed to persist apply event: {}", e);
-    }
-    // Refresh the cache entry so the UI re-renders with the new state.
-    if matches!(event.status, crate::containers::image_watcher::ImageUpdateStatus::Completed) {
-        let _ = crate::containers::image_watcher::check_container_update(&container).await
-            .map(|r| {
-                state.image_watcher_cache.write().unwrap()
+    let event_id = guard.event_id().to_string();
+    let event_id_bg = event_id.clone();
+    let container_bg = container.clone();
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        let event = match tokio::task::spawn_blocking(move || {
+            iw::perform_update_with_guard(guard, &config)
+        }).await {
+            Ok(ev) => ev,
+            // The guard's Drop already published a Failed event for pollers
+            // under this id; record the same id in the history.
+            Err(e) => iw::ImageUpdateEvent {
+                id: event_id_bg,
+                container_name: container_bg.clone(),
+                image: String::new(),
+                old_digest: String::new(),
+                new_digest: String::new(),
+                backup_id: None,
+                status: iw::ImageUpdateStatus::Failed,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                error: Some(format!("update worker failed: {}", e)),
+            },
+        };
+        // Persist the event to the audit history (re-load fresh to avoid
+        // clobbering settings the operator may have changed mid-apply).
+        let completed = matches!(event.status, iw::ImageUpdateStatus::Completed);
+        // Same as the auto-update loop: the image just installed IS the
+        // latest, so clear the cached flag now rather than after the registry
+        // round-trip below — until then the badge offered a no-op re-update.
+        if completed
+            && let Some(r) = state_bg.image_watcher_cache.write().unwrap().get_mut(&container_bg) {
+                r.update_available = false;
+                r.last_checked = chrono::Utc::now().to_rfc3339();
+            }
+        let persisted = tokio::task::spawn_blocking(move || iw::append_history([event])).await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("image_watcher: failed to persist apply event: {}", e),
+            Err(e) => tracing::warn!("image_watcher: persist task failed: {}", e),
+        }
+        // Refresh the cache entry so the UI re-renders with the new state.
+        if completed
+            && let Ok(r) = iw::check_container_update(&container_bg).await {
+                state_bg.image_watcher_cache.write().unwrap()
                     .insert(r.container_name.clone(), r);
-            });
+            }
+    });
+    HttpResponse::Accepted().json(serde_json::json!({
+        "event_id": event_id,
+        "container_name": container,
+        "in_progress": true,
+    }))
+}
+
+/// GET /api/image-watcher/update/{event_id} — stage of one update started
+/// by `image_watcher_apply`: `{event, in_progress}`. Finished runs stay
+/// answerable from memory for a while, then from `update_history`.
+pub async fn image_watcher_update_status(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let event_id = path.into_inner();
+    // update_status may read image-watcher.json — keep it off the worker.
+    match web::block(move || crate::containers::image_watcher::update_status(&event_id)).await {
+        Ok(Some((event, in_progress))) => HttpResponse::Ok().json(serde_json::json!({
+            "event": event,
+            "in_progress": in_progress,
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "this node has no record of that update — WolfStack may have restarted while it ran; check the container and its update history",
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("status lookup failed: {}", e),
+        })),
     }
-    HttpResponse::Ok().json(event)
+}
+
+/// GET /api/image-watcher/in-progress — every update running on this node,
+/// with its live stage. The UI uses it to keep "Update now" disabled (and
+/// show progress) across a page refresh.
+pub async fn image_watcher_in_progress(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::containers::image_watcher::updates_in_progress())
 }
 
 #[derive(Debug, Deserialize)]
@@ -43877,7 +44041,8 @@ pub struct ImageWatcherApplyManyRequest {
 /// multiple containers. Honours `max_parallel_updates` from config so
 /// the host doesn't get crushed by N concurrent docker pulls. Returns
 /// the full list of `ImageUpdateEvent`s — operator-facing UI can show
-/// which succeeded and which failed.
+/// which succeeded and which failed — plus `already_updating`, the names
+/// skipped because an update of them was already running.
 pub async fn image_watcher_apply_many(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -43901,7 +44066,7 @@ pub async fn image_watcher_apply_many(
         let policy = config.policy_for(&name);
         if policy.is_passive() {
             handles.push(tokio::spawn(async move {
-                crate::containers::image_watcher::ImageUpdateEvent {
+                Ok(crate::containers::image_watcher::ImageUpdateEvent {
                     id: format!("evt-skip-{}", uuid::Uuid::new_v4().simple()),
                     container_name: name,
                     image: String::new(),
@@ -43911,7 +44076,7 @@ pub async fn image_watcher_apply_many(
                     status: crate::containers::image_watcher::ImageUpdateStatus::Failed,
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     error: Some(format!("policy is {:?} — skipped", policy.policy)),
-                }
+                })
             }));
             continue;
         }
@@ -43923,10 +44088,12 @@ pub async fn image_watcher_apply_many(
         let fallback_name = name.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
+            // Err(name) = already being updated (single "Update now" or
+            // the auto-apply loop): reported, not recorded as a failure.
             tokio::task::spawn_blocking(move || {
-                crate::containers::image_watcher::perform_update_blocking(&name, &cfg)
+                crate::containers::image_watcher::perform_update_blocking(&name, &cfg).ok_or(name)
             }).await.unwrap_or_else(|join_err| {
-                crate::containers::image_watcher::ImageUpdateEvent {
+                Ok(crate::containers::image_watcher::ImageUpdateEvent {
                     id: format!("evt-join-{}", chrono::Utc::now().timestamp()),
                     container_name: fallback_name,
                     image: String::new(),
@@ -43936,20 +44103,26 @@ pub async fn image_watcher_apply_many(
                     status: crate::containers::image_watcher::ImageUpdateStatus::Failed,
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     error: Some(format!("worker join failed: {}", join_err)),
-                }
+                })
             })
         }));
     }
     let mut events: Vec<crate::containers::image_watcher::ImageUpdateEvent> = Vec::with_capacity(handles.len());
+    let mut already_updating: Vec<String> = Vec::new();
     for h in handles {
-        if let Ok(ev) = h.await { events.push(ev); }
+        match h.await {
+            Ok(Ok(ev)) => events.push(ev),
+            Ok(Err(name)) => already_updating.push(name),
+            Err(_) => {}
+        }
     }
     // Persist history.
-    let mut latest = crate::containers::image_watcher::ImageWatcherConfig::load();
-    latest.update_history.extend(events.clone());
-    let overflow = latest.update_history.len().saturating_sub(200);
-    if overflow > 0 { latest.update_history.drain(0..overflow); }
-    let _ = latest.save();
+    let to_persist = events.clone();
+    match web::block(move || crate::containers::image_watcher::append_history(to_persist)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("image_watcher: failed to persist apply-many history: {}", e),
+        Err(e) => tracing::warn!("image_watcher: apply-many persist task failed: {}", e),
+    }
     // Refresh cache entries for the containers that completed.
     {
         let mut cache = state.image_watcher_cache.write().unwrap();
@@ -43964,7 +44137,10 @@ pub async fn image_watcher_apply_many(
             }
         }
     }
-    HttpResponse::Ok().json(serde_json::json!({ "events": events }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "events": events,
+        "already_updating": already_updating,
+    }))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -48569,6 +48745,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // containers doesn't get crushed by N concurrent docker pulls.
         .route("/api/image-watcher/apply/{container}", web::post().to(image_watcher_apply))
         .route("/api/image-watcher/apply-many", web::post().to(image_watcher_apply_many))
+        .route("/api/image-watcher/update/{event_id}", web::get().to(image_watcher_update_status))
+        .route("/api/image-watcher/in-progress", web::get().to(image_watcher_in_progress))
         // Certificates
         .route("/api/certificates", web::post().to(request_certificate))
         .route("/api/certificates/list", web::get().to(list_certificates))
@@ -51409,6 +51587,77 @@ mod autofix_command_tests {
         assert!(!AUTOFIX_FINDING_TYPES.contains(&"tamper_detection"));
         assert!(!AUTOFIX_FINDING_TYPES.contains(&"disk_fill_eta"));
         assert_eq!(AUTOFIX_FINDING_TYPES.len(), 2);
+    }
+
+    #[test]
+    fn remediation_commands_run_in_the_host_console() {
+        // Recipes are host-side (`lxc-attach -n <ct> -- …`, `docker pull …`);
+        // running them in the container's own console typed lxc-attach
+        // into the container (lxc:230 report, v25.34.4).
+        assert_eq!(super::recipe_console_target(), ("host".to_string(), "host".to_string()));
+    }
+
+    #[test]
+    fn open_terminal_target_mapping() {
+        use super::console_target_for_resource as t;
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(t("lxc:230"), pair("lxc", "230"));
+        assert_eq!(t("lxc:boot:web"), pair("lxc", "web"));
+        assert_eq!(t("lxc:boot:pbs:backup1"), pair("lxc", "backup1"));
+        assert_eq!(t("docker:postgres"), pair("docker", "postgres"));
+        assert_eq!(t("vm:opnsense:/var/lib/vm/disk.qcow2"), pair("vm", "opnsense"));
+        assert_eq!(t("vm:wolfnet:myvm"), pair("host", "host"));
+        assert_eq!(t("osv:lxc:230"), pair("host", "host"));
+        assert_eq!(t("/var/log"), pair("host", "host"));
+        assert_eq!(t(""), pair("host", "host"));
+    }
+}
+
+#[cfg(test)]
+mod api_secret_redaction_tests {
+    fn node(pve_token: Option<&str>) -> crate::agent::Node {
+        serde_json::from_value(serde_json::json!({
+            "id": "pve1", "hostname": "pve1", "address": "10.0.0.5",
+            "port": 8006, "last_seen": 0, "metrics": null,
+            "components": [], "online": true, "is_self": false,
+            "node_type": "proxmox", "pve_token": pve_token,
+        })).unwrap()
+    }
+
+    #[test]
+    fn node_api_view_keeps_token_id_and_drops_secret() {
+        let n = node(Some("root@pam!wolfstack=8f1c2d3e-aaaa-bbbb-cccc-1234567890ab")).redacted_for_api();
+        assert_eq!(n.pve_token.as_deref(), Some("root@pam!wolfstack"));
+        let json = serde_json::to_string(&n).unwrap();
+        assert!(!json.contains("8f1c2d3e"), "secret leaked: {json}");
+    }
+
+    #[test]
+    fn node_api_view_never_echoes_a_malformed_token() {
+        let n = node(Some("bare-secret-without-id")).redacted_for_api();
+        assert_eq!(n.pve_token.as_deref(), Some("(configured)"));
+        assert!(node(None).redacted_for_api().pve_token.is_none());
+    }
+
+    #[test]
+    fn backup_entries_drop_storage_secrets_and_docker_env() {
+        let e: crate::backup::BackupEntry = serde_json::from_value(serde_json::json!({
+            "id": "b1", "filename": "f.tar.gz", "size_bytes": 1,
+            "created_at": "2026-10-20T00:00:00Z", "status": "completed",
+            "target": { "type": "docker", "name": "db" },
+            "storage": {
+                "type": "s3", "bucket": "bk", "access_key": "AKIAEXAMPLE",
+                "secret_key": "S3SECRET", "pbs_token_secret": "PBSSECRET",
+                "pbs_password": "PBSPASS", "smb_password": "SMBPASS",
+            },
+            "docker_config": "{\"Config\":{\"Env\":[\"DB_PASSWORD=hunter2\"]}}",
+        })).unwrap();
+        let out = serde_json::to_string(&super::backup_entries_for_api(vec![e])).unwrap();
+        for leaked in ["S3SECRET", "PBSSECRET", "PBSPASS", "SMBPASS", "AKIAEXAMPLE", "hunter2"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(!out.contains("docker_config"), "{out}");
+        assert!(out.contains("\"bucket\":\"bk\""), "non-secret fields kept: {out}");
     }
 }
 

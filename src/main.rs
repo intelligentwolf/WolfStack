@@ -3289,7 +3289,19 @@ async fn main() -> std::io::Result<()> {
                                         let _permit = sem.acquire_owned().await
                                             .expect("semaphore closed");
                                         tokio::task::spawn_blocking(move || {
-                                            iw::perform_update_blocking(&name, &cfg)
+                                            // None = an operator "Update now" (or
+                                            // a WolfFlow run) already holds this
+                                            // container. Skip rather than race a
+                                            // second recreate; the next pass
+                                            // re-evaluates it.
+                                            let ev = iw::perform_update_blocking(&name, &cfg);
+                                            if ev.is_none() {
+                                                tracing::info!(
+                                                    "image_watcher: {} is already being updated — auto-apply skipped it this pass",
+                                                    name,
+                                                );
+                                            }
+                                            ev
                                         }).await.unwrap_or_else(|join_err| {
                                             let event = iw::ImageUpdateEvent {
                                                 id: format!("evt-join-{}", chrono::Utc::now().timestamp()),
@@ -3310,13 +3322,13 @@ async fn main() -> std::io::Result<()> {
                                                 serde_json::to_value(&event).unwrap_or_default(),
                                                 true,
                                             );
-                                            event
+                                            Some(event)
                                         })
                                     }));
                                 }
                                 let mut events: Vec<iw::ImageUpdateEvent> = Vec::with_capacity(handles.len());
                                 for h in handles {
-                                    if let Ok(ev) = h.await {
+                                    if let Ok(Some(ev)) = h.await {
                                         events.push(ev);
                                     }
                                 }
@@ -3340,17 +3352,16 @@ async fn main() -> std::io::Result<()> {
                                 // config fresh because the apply pass
                                 // can take minutes and the operator
                                 // may have edited settings mid-flight.
+                                // File I/O under the config lock — blocking pool.
                                 if !events.is_empty() {
-                                    let mut latest = iw::ImageWatcherConfig::load();
-                                    latest.update_history.extend(events);
-                                    let overflow = latest.update_history.len().saturating_sub(200);
-                                    if overflow > 0 {
-                                        latest.update_history.drain(0..overflow);
-                                    }
-                                    if let Err(e) = latest.save() {
-                                        tracing::warn!(
+                                    match tokio::task::spawn_blocking(move || iw::append_history(events)).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => tracing::warn!(
                                             "image_watcher: failed to persist update history: {}", e,
-                                        );
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            "image_watcher: update history persist task failed: {}", e,
+                                        ),
                                     }
                                 }
                             }
