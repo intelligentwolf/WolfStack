@@ -293,7 +293,16 @@ fn should_refuse_shell_launch(running_as_service: bool, foreground: bool, has_ar
 /// serve. The node is functional (cluster API still bound) but this user
 /// hit the wrong door: they should manage it from the cluster's master
 /// node UI, not by hitting this node directly.
-async fn agent_index_handler() -> HttpResponse {
+///
+/// Only a browser's GET/HEAD gets the page. Any other method is an API client
+/// that asked for a path this node does not serve, and a 200 HTML answer told
+/// it the request worked: Claude Code, pointed at `/mcp` on an agent node
+/// without that route, reported CLIENT_HTTP_UNEXPECTED_CONTENT instead of
+/// "not found" (klas, 2026-10-20).
+async fn agent_index_handler(req: HttpRequest) -> HttpResponse {
+    if !matches!(*req.method(), actix_web::http::Method::GET | actix_web::http::Method::HEAD) {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Not found" }));
+    }
     let html = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -5573,5 +5582,25 @@ mod shell_launch_tests {
             let has_args = true;
             assert!(!should_refuse_shell_launch(false, false, has_args));
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_index_tests {
+    use super::agent_index_handler;
+    use actix_web::{test, web, App};
+
+    #[actix_web::test]
+    async fn agent_page_is_for_browsers_and_api_clients_get_not_found() {
+        let app = test::init_service(App::new().default_service(web::to(agent_index_handler))).await;
+
+        let get = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        assert_eq!(get.status(), 200);
+
+        // A POST to a path this node lacks must not look like success — that
+        // is what Claude Code reported as CLIENT_HTTP_UNEXPECTED_CONTENT.
+        let post = test::call_service(&app, test::TestRequest::post().uri("/mcp").to_request()).await;
+        assert_eq!(post.status(), 404);
+        assert_eq!(post.headers().get("content-type").unwrap(), "application/json");
     }
 }

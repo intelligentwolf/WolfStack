@@ -59,6 +59,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     )
     .route("/api/mcp/settings", web::get().to(admin_get_settings))
     .route("/api/mcp/settings", web::post().to(admin_save_settings))
+    .route("/api/mcp/test", web::post().to(admin_test_connection))
     .route("/api/mcp/grants", web::get().to(admin_list_grants))
     .route("/api/mcp/grants/{id}", web::delete().to(admin_revoke_grant))
     .route("/api/mcp/clients", web::get().to(admin_list_clients))
@@ -990,6 +991,214 @@ async fn admin_save_settings(req: HttpRequest, state: web::Data<AppState>, body:
     }
 }
 
+// ─── Connection test ───
+//
+// An agent that reaches something other than this endpoint fails with an
+// error that names neither the cause nor the fix: Claude Code reports
+// "CLIENT_HTTP_UNEXPECTED_CONTENT" when a reverse proxy's SSO page answers
+// the POST (klas, 2026-10-20). So the node makes the same three requests an
+// agent makes, against its own saved public URL, and says in words what
+// answered each one. Admin-only, and the URL is the saved one — never one
+// from the request — so this cannot be pointed at an arbitrary host.
+
+/// Most of a response body worth reading for a diagnosis.
+const PROBE_BODY_LIMIT: usize = 16 * 1024;
+
+#[derive(Debug, serde::Serialize)]
+struct ProbeCheck {
+    step: &'static str,
+    url: String,
+    ok: bool,
+    detail: String,
+}
+
+/// What came back from one probe request, reduced to what the diagnosis needs.
+struct ProbeReply {
+    status: u16,
+    content_type: String,
+    location: Option<String>,
+    www_authenticate: Option<String>,
+    body: String,
+}
+
+/// The `<title>` of an HTML page, so the admin can recognise who answered
+/// ("Authelia", "Sign in – Cloudflare Access").
+fn html_title(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let open_end = start + lower[start..].find('>')? + 1;
+    let close = open_end + lower[open_end..].find("</title")?;
+    let title = clean(body.get(open_end..close)?.trim());
+    (!title.is_empty()).then_some(title)
+}
+
+/// Shared reading of a reply that is not what WolfStack sends.
+fn explain_foreign(reply: &ProbeReply) -> String {
+    if (300..400).contains(&reply.status) {
+        let to = reply.location.as_deref().map(clean).unwrap_or_else(|| "an unnamed address".into());
+        return format!(
+            "Got a redirect (HTTP {}) to {} instead of WolfStack. A sign-in layer on your reverse proxy \
+             (Authelia, Authentik, Cloudflare Access, forward-auth) or an http→https rule is catching this path. \
+             Exempt /mcp, /oauth/ and /.well-known/ from it — WolfStack does its own sign-in for agents.",
+            reply.status, to);
+    }
+    let ct = reply.content_type.to_ascii_lowercase();
+    if ct.starts_with("text/html") || reply.body.trim_start().starts_with('<') {
+        let who = html_title(&reply.body).map(|t| format!(" titled \"{}\"", t)).unwrap_or_default();
+        if reply.body.contains("WolfStack Agent Node") {
+            return "An agent-only WolfStack node older than v25.36.0 answered with its information page. \
+                    Upgrade the node this URL points at, then enable MCP on it.".into();
+        }
+        return format!(
+            "Got an HTML page{} (HTTP {}) instead of WolfStack. Something in front of this node answered: \
+             most often a sign-in page on the reverse proxy, or a proxy rule that sends this path to another site. \
+             This is what makes Claude Code report CLIENT_HTTP_UNEXPECTED_CONTENT.",
+            who, reply.status);
+    }
+    if reply.status == 404 {
+        return "Not found (HTTP 404). Either MCP is not enabled on the node this URL reaches — the public URL may \
+                point at a different node — or the reverse proxy does not forward this path.".into();
+    }
+    if reply.status == 403 && reply.body.contains("insecure_transport") {
+        return "WolfStack refused the request because it arrived over plain HTTP from another machine. Point your \
+                reverse proxy at this node's HTTPS port (8553), or run the proxy on this same machine.".into();
+    }
+    if reply.status == 429 {
+        return "Rate-limited (HTTP 429) after too many unauthenticated tries from this address. Wait a minute and test again.".into();
+    }
+    if reply.status == 502 || reply.status == 503 || reply.status == 504 {
+        return format!("The reverse proxy could not reach WolfStack (HTTP {}). Check the proxy's upstream address and port.", reply.status);
+    }
+    let ct = if reply.content_type.is_empty() { "no content type".to_string() } else { clean(&reply.content_type) };
+    format!("Unexpected answer: HTTP {} with {}.", reply.status, ct)
+}
+
+/// Step 1: an agent's first, unauthenticated `initialize` must be refused
+/// with 401 and a challenge naming this node's metadata document.
+fn judge_mcp(reply: &ProbeReply, issuer: &str) -> (bool, String) {
+    if reply.status == 401 {
+        let expected = resource_metadata_url(issuer);
+        return match reply.www_authenticate.as_deref() {
+            Some(c) if c.contains(&expected) => (true, "WolfStack answered and asked the agent to sign in — correct.".into()),
+            Some(c) => (false, format!(
+                "Got a sign-in challenge, but not WolfStack's: {}. Something in front of this node demands its own authentication.",
+                clean(c))),
+            None => (false, "Got HTTP 401 without a WWW-Authenticate challenge — not WolfStack. A reverse proxy or another \
+                             service is answering this path.".into()),
+        };
+    }
+    (false, explain_foreign(reply))
+}
+
+/// Steps 2 and 3: the discovery documents must be WolfStack's JSON and name
+/// this node, or the agent cannot find where to sign in.
+fn judge_metadata(reply: &ProbeReply, field: &str, expected: &str) -> (bool, String) {
+    if reply.status == 200 && reply.content_type.to_ascii_lowercase().starts_with("application/json") {
+        return match serde_json::from_str::<Value>(&reply.body).ok().and_then(|v| v.get(field).and_then(|f| f.as_str()).map(String::from)) {
+            Some(v) if v == expected => (true, "Served by WolfStack — correct.".into()),
+            Some(v) => (false, format!(
+                "Served, but it names {} instead of {}. Another node or service answers this address — check the public URL.",
+                clean(&v), expected)),
+            None => (false, format!("Got JSON that is not WolfStack's discovery document (no \"{}\").", field)),
+        };
+    }
+    (false, explain_foreign(reply))
+}
+
+async fn probe(req: reqwest::RequestBuilder) -> Result<ProbeReply, String> {
+    let resp = req.send().await.map_err(|e| {
+        let mut msg = e.to_string();
+        let mut src = std::error::Error::source(&e);
+        while let Some(s) = src {
+            msg.push_str(": ");
+            msg.push_str(&s.to_string());
+            src = s.source();
+        }
+        msg
+    })?;
+    let header = |name: reqwest::header::HeaderName| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(String::from);
+    let status = resp.status().as_u16();
+    let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_default();
+    let location = header(reqwest::header::LOCATION);
+    let www_authenticate = header(reqwest::header::WWW_AUTHENTICATE);
+    // Always consume the body so the connection is released (see
+    // tests/resource_safety.rs), keeping only the start of it.
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let body = String::from_utf8_lossy(&bytes[..bytes.len().min(PROBE_BODY_LIMIT)]).into_owned();
+    Ok(ProbeReply { status, content_type, location, www_authenticate, body })
+}
+
+fn unreachable_detail(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("certificate") || lower.contains("unknownissuer") || lower.contains("invalid peer") {
+        return format!(
+            "The TLS certificate was not accepted: {}. Agents check certificates too, so the public URL needs a \
+             certificate a normal client trusts (for example Let's Encrypt).", clean(err));
+    }
+    format!(
+        "This node could not reach its own public URL: {}. If the URL works from other machines, your router may \
+         not let a server reach its own public address — test with the claude command from another computer.",
+        clean(err))
+}
+
+async fn admin_test_connection(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let caller = match require_admin(&req, &state) { Ok(c) => c, Err(r) => return r };
+    let cfg = config();
+    let (Some(issuer), Some(resource)) = (cfg.issuer(), cfg.resource()) else {
+        return HttpResponse::BadRequest().json(json!({ "error": "Enable MCP and save the public URL first, then test." }));
+    };
+    let client = match reqwest::Client::builder()
+        // Bound the connect, not just the request (tests/resource_safety.rs).
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        // A redirect is itself the finding — an agent following it to a
+        // sign-in page is exactly the failure being diagnosed.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError().json(json!({ "error": format!("could not build HTTP client: {}", e) })),
+    };
+
+    let init = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "wolfstack-connection-test", "version": env!("CARGO_PKG_VERSION") } },
+    });
+    let prm_url = resource_metadata_url(&issuer);
+    let asm_url = format!("{}/.well-known/oauth-authorization-server", issuer);
+
+    let mut checks = Vec::new();
+    let mcp = probe(client.post(&resource)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .body(init.to_string())).await;
+    let reached = mcp.is_ok();
+    let (ok, detail) = match &mcp {
+        Ok(r) => judge_mcp(r, &issuer),
+        Err(e) => (false, unreachable_detail(e)),
+    };
+    checks.push(ProbeCheck { step: "MCP endpoint", url: resource.clone(), ok, detail });
+
+    // Without a connection there is nothing more to learn — the same error
+    // three times would only bury it.
+    if reached {
+        for (step, url, field, expected) in [
+            ("Sign-in discovery (protected resource)", prm_url, "resource", resource.as_str()),
+            ("Sign-in discovery (authorization server)", asm_url, "issuer", issuer.as_str()),
+        ] {
+            let (ok, detail) = match probe(client.get(&url).header(reqwest::header::ACCEPT, "application/json")).await {
+                Ok(r) => judge_metadata(&r, field, expected),
+                Err(e) => (false, unreachable_detail(&e)),
+            };
+            checks.push(ProbeCheck { step, url, ok, detail });
+        }
+    }
+
+    let ok = checks.iter().all(|c| c.ok);
+    tracing::info!("mcp: connection test by '{}' against {}: {}", caller, issuer, if ok { "passed" } else { "failed" });
+    HttpResponse::Ok().json(json!({ "ok": ok, "checks": checks }))
+}
+
 async fn admin_list_grants(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(r) = require_admin(&req, &state) { return r; }
     match web::block(|| OAUTH.list_grants()).await {
@@ -1039,6 +1248,104 @@ async fn admin_delete_client(req: HttpRequest, state: web::Data<AppState>, path:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reply(status: u16, content_type: &str, body: &str) -> ProbeReply {
+        ProbeReply { status, content_type: content_type.into(), location: None, www_authenticate: None, body: body.into() }
+    }
+
+    const ISSUER: &str = "https://ws.example.com";
+
+    #[test]
+    fn connection_test_passes_only_on_wolfstacks_own_challenge() {
+        let mut r = reply(401, "application/json", "{}");
+        r.www_authenticate = Some(format!("Bearer resource_metadata=\"{}\", scope=\"read\"", resource_metadata_url(ISSUER)));
+        assert!(judge_mcp(&r, ISSUER).0);
+
+        r.www_authenticate = Some("Basic realm=\"proxy\"".into());
+        let (ok, detail) = judge_mcp(&r, ISSUER);
+        assert!(!ok && detail.contains("not WolfStack's"), "{detail}");
+
+        r.www_authenticate = None;
+        assert!(!judge_mcp(&r, ISSUER).0);
+    }
+
+    #[test]
+    fn connection_test_names_an_sso_page_that_answered_the_post() {
+        // The klas failure: a 200 HTML page where WolfStack's JSON belongs.
+        let r = reply(200, "text/html; charset=utf-8", "<html><head><TITLE> Authelia </TITLE></head></html>");
+        let (ok, detail) = judge_mcp(&r, ISSUER);
+        assert!(!ok);
+        assert!(detail.contains("\"Authelia\"") && detail.contains("CLIENT_HTTP_UNEXPECTED_CONTENT"), "{detail}");
+
+        let mut r = reply(302, "", "");
+        r.location = Some("https://auth.example.com/login?rd=x".into());
+        let (ok, detail) = judge_mcp(&r, ISSUER);
+        assert!(!ok && detail.contains("https://auth.example.com/login") && detail.contains("/.well-known/"), "{detail}");
+    }
+
+    #[test]
+    fn connection_test_recognises_wolfstack_refusals() {
+        assert!(judge_mcp(&reply(404, "", ""), ISSUER).1.contains("MCP is not enabled"));
+        let r = reply(403, "application/json", r#"{"error":"insecure_transport"}"#);
+        assert!(judge_mcp(&r, ISSUER).1.contains("8553"));
+        let r = reply(200, "text/html", "<title>WolfStack Agent Node</title>");
+        assert!(judge_mcp(&r, ISSUER).1.contains("v25.36.0"));
+    }
+
+    #[test]
+    fn connection_test_checks_discovery_documents_name_this_node() {
+        let resource = format!("{}/mcp", ISSUER);
+        let ok_body = json!({ "resource": resource }).to_string();
+        assert!(judge_metadata(&reply(200, "application/json", &ok_body), "resource", &resource).0);
+
+        let other = json!({ "resource": "https://other.example.com/mcp" }).to_string();
+        let (ok, detail) = judge_metadata(&reply(200, "application/json", &other), "resource", &resource);
+        assert!(!ok && detail.contains("other.example.com"), "{detail}");
+
+        assert!(!judge_metadata(&reply(200, "text/html", "<html></html>"), "resource", &resource).0);
+    }
+
+    /// One canned HTTP response on a local socket, per request accepted.
+    fn canned_server(responses: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for resp in responses {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn probe_reports_a_redirect_instead_of_following_it() {
+        let base = canned_server(vec![
+            "HTTP/1.1 302 Found\r\nLocation: https://auth.example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 34\r\nConnection: close\r\n\r\n<html><title>Login</title></html>\n",
+        ]);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .build().unwrap();
+        let r = probe(client.post(format!("{}/mcp", base)).body("{}")).await.unwrap();
+        assert_eq!(r.status, 302);
+        assert_eq!(r.location.as_deref(), Some("https://auth.example.com/"));
+
+        let r = probe(client.post(format!("{}/mcp", base)).body("{}")).await.unwrap();
+        assert_eq!((r.status, r.content_type.as_str()), (200, "text/html"));
+        assert!(judge_mcp(&r, ISSUER).1.contains("\"Login\""));
+    }
+
+    #[test]
+    fn html_title_is_cleaned_and_optional() {
+        assert_eq!(html_title("<title>Sign\nin</title>").as_deref(), Some("Sign in"));
+        assert_eq!(html_title("<html>no title</html>"), None);
+        assert_eq!(html_title("<title></title>"), None);
+    }
 
     #[test]
     fn html_escaping_covers_attribute_and_text_contexts() {
