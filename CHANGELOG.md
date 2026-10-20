@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.36.0: MCP server so AI agents can manage a node safely, and tamper protection asks before undoing a new user** _(2026-10-20 — [`afaee567`](https://github.com/intelligentwolf/WolfStack/commit/afaee5673fbe0804dd763cb6b9af1c4dfa99e3bb))_
 - **v25.35.0: stop leaking PVE tokens and backup credentials, and make container updates safe for non-root images and slow apps** _(2026-10-20 — [`f420e8a5`](https://github.com/intelligentwolf/WolfStack/commit/f420e8a5d499beda7165d1231e7fe3225b468780))_
 - **v25.34.4: run drive self-tests on the host being viewed, not the node serving the UI** _(2026-10-16 — [`922a8a8e`](https://github.com/intelligentwolf/WolfStack/commit/922a8a8e924333b9ad90c465fd3f022071188057))_
 - **v25.34.3: SSL sites made in WolfStack no longer put HTTPS on port 80 over IPv6** _(2026-10-12 — [`fe535165`](https://github.com/intelligentwolf/WolfStack/commit/fe535165e2aca2d36df9abce1b3d1c89880c95e3))_
