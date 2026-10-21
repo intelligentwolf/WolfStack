@@ -4540,7 +4540,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             }
         });
 
-        // Background: Status page health check runner (every 30s)
+        // Background: Status page health check scheduler. Ticks every second;
+        // run_checks only probes monitors whose own interval_secs has elapsed.
         let sp_state = statuspage_state.clone();
         let sp_cluster = app_state.cluster.clone();
         let sp_secret = app_state.cluster_secret.clone();
@@ -4549,7 +4550,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
                 statuspage::run_checks(&sp_state, &sp_cluster, &sp_secret).await;
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
 

@@ -708,6 +708,9 @@ impl MonitorStatus {
 // ─── Check Runner ───
 // ═══════════════════════════════════════════════
 
+/// Floor on a monitor's interval so a 0 (or absurdly small) value can't spin.
+const MIN_MONITOR_INTERVAL_SECS: u64 = 5;
+
 /// Pause before the single retry of a failed check.
 const CHECK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -744,10 +747,24 @@ pub async fn run_checks(
     cluster: &crate::agent::ClusterState,
     cluster_secret: &str,
 ) {
+    let now_secs = || std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Only monitors whose own `interval_secs` has elapsed since their last
+    // check are run. The scheduler in main.rs ticks every second, so this is
+    // what makes a 60s monitor run 1,440 times a day instead of the old
+    // fixed every-monitor-every-30s (2,880). A monitor with no result yet
+    // (newly saved, or after a restart) is due immediately.
     let monitors = {
         let config = state.config.read().unwrap();
         config.monitors.iter()
             .filter(|m| m.enabled)
+            .filter(|m| match state.latest_result(&m.id) {
+                Some(last) => now_secs() >= last.timestamp + m.interval_secs.max(MIN_MONITOR_INTERVAL_SECS),
+                None => true,
+            })
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -763,6 +780,10 @@ pub async fn run_checks(
 
     for monitor in &monitors {
         let start = std::time::Instant::now();
+        // Stamp the result with the time the check STARTED, so the due-check
+        // above measures start-to-start and the cadence doesn't drift by the
+        // probe's own latency.
+        let started_at = now_secs();
 
         let (mut success, mut error) = probe_monitor(monitor, cluster, cluster_secret).await;
 
@@ -779,13 +800,9 @@ pub async fn run_checks(
         }
 
         let latency_ms = start.elapsed().as_millis() as u32;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
 
         state.record_result(&monitor.id, CheckResult {
-            timestamp: now,
+            timestamp: started_at,
             success,
             latency_ms,
             error,
