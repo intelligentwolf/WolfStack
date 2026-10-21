@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.37.1: uptime bar hover shows the day's checks and the 90-day total** _(2026-10-21 — [`536c8d3e`](https://github.com/intelligentwolf/WolfStack/commit/536c8d3e946a70ef79c237f2e869063ddb8be8d0))_
 - **v25.37.0: test whether agents can reach a node's MCP endpoint, and say what is in the way** _(2026-10-20 — [`a43d83b7`](https://github.com/intelligentwolf/WolfStack/commit/a43d83b73340472352012b612411f5af3f985c17))_
 - **v25.36.0: MCP server so AI agents can manage a node safely, and tamper protection asks before undoing a new user** _(2026-10-20 — [`afaee567`](https://github.com/intelligentwolf/WolfStack/commit/afaee5673fbe0804dd763cb6b9af1c4dfa99e3bb))_
 - **v25.35.0: stop leaking PVE tokens and backup credentials, and make container updates safe for non-root images and slow apps** _(2026-10-20 — [`f420e8a5`](https://github.com/intelligentwolf/WolfStack/commit/f420e8a5d499beda7165d1231e7fe3225b468780))_
