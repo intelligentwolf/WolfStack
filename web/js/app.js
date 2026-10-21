@@ -60479,7 +60479,7 @@ function renderStatusMonitors(monitors) {
         const typeLabel = mon.check?.type || '?';
         const uptime = (m.uptime_percent || 100).toFixed(2);
 
-        const uptimeHistory = renderUptimeBar(m.history || [], 90);
+        const uptimeHistory = renderUptimeBar(m.history || [], 90, m.uptime_percent);
 
         return `<div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:16px;">
             <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
@@ -60523,7 +60523,8 @@ function renderStatusMonitors(monitors) {
 // `history` is the server's daily_uptime list, oldest first, one entry per day
 // that actually recorded a check — days with no checks are simply absent, so
 // bars are placed by date, never by array index.
-function renderUptimeBar(history, days) {
+function renderUptimeBar(history, days, overallPct) {
+    const totalTxt = typeof overallPct === 'number' ? ` · ${days}-day total ${overallPct.toFixed(2)}%` : '';
     const bars = [];
     const colors = { up: '#22c55e', degraded: '#eab308', down: '#ef4444', unknown: '#374151' };
     const byDate = new Map((history || []).map(d => [d.date, d]));
@@ -60535,7 +60536,7 @@ function renderUptimeBar(history, days) {
         const dayData = byDate.get(date);
 
         if (!dayData) {
-            bars.push(`<div style="flex:1; background:${colors.unknown};" title="${date}: no data"></div>`);
+            bars.push(`<div style="flex:1; background:${colors.unknown};" title="${date}: no data${totalTxt}"></div>`);
             continue;
         }
         const pct = dayData.uptime_percent || 0;
@@ -60543,7 +60544,7 @@ function renderUptimeBar(history, days) {
         // "unknown" grey, which read as "no data" on the admin card while the
         // public page showed the same day red.
         const color = pct >= 99.5 ? colors.up : (pct >= 95 ? colors.degraded : colors.down);
-        bars.push(`<div style="flex:1; background:${color}; transition:background 0.2s;" title="${date}: ${pct.toFixed(2)}% uptime"></div>`);
+        bars.push(`<div style="flex:1; background:${color}; transition:background 0.2s;" title="${date}: ${pct.toFixed(2)}% uptime that day (${dayData.successful_checks}/${dayData.total_checks} checks OK)${totalTxt}"></div>`);
     }
 
     return bars.join('');
