@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.37.3: monitors honour their own check interval instead of a fixed 30s** _(2026-10-21 — [`fa7c68bd`](https://github.com/intelligentwolf/WolfStack/commit/fa7c68bd0e5decb3cbe2a59547740f110e7d9c5f))_
 - **v25.37.2: one-packet blips no longer count as failed uptime checks** _(2026-10-21 — [`6cbd9e00`](https://github.com/intelligentwolf/WolfStack/commit/6cbd9e0037b1b72f0d3043f300bce1da920e1a7b))_
 - **v25.37.1: uptime bar hover shows the day's checks and the 90-day total** _(2026-10-21 — [`536c8d3e`](https://github.com/intelligentwolf/WolfStack/commit/536c8d3e946a70ef79c237f2e869063ddb8be8d0))_
 - **v25.37.0: test whether agents can reach a node's MCP endpoint, and say what is in the way** _(2026-10-20 — [`a43d83b7`](https://github.com/intelligentwolf/WolfStack/commit/a43d83b73340472352012b612411f5af3f985c17))_
