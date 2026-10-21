@@ -1302,7 +1302,7 @@ pub fn render_public_page_inner(state: &Arc<StatusPageState>, page: &StatusPage)
             let uptime = state.uptime_percent(mid);
 
             let daily = state.get_daily_uptime(mid);
-            let bars_html = build_uptime_bars(&daily, tc.bar_empty);
+            let bars_html = build_uptime_bars(&daily, uptime, tc.bar_empty);
 
             services_html.push_str(&format!(
                 r#"<div class="service-row">
@@ -1626,7 +1626,7 @@ fn uptime_bar_color(uptime_percent: f32) -> &'static str {
     }
 }
 
-fn build_uptime_bars(daily: &[DailyUptime], bar_empty: &str) -> String {
+fn build_uptime_bars(daily: &[DailyUptime], overall_percent: f32, bar_empty: &str) -> String {
     // Anchor every bar to a calendar date rather than walking the stored
     // entries in order. Days with no checks at all (monitor paused, node
     // down) write no entry, so index-walking would silently slide older
@@ -1640,12 +1640,13 @@ fn build_uptime_bars(daily: &[DailyUptime], bar_empty: &str) -> String {
         let date = (today - chrono::Duration::days(offset)).format("%Y-%m-%d").to_string();
         match by_date.get(date.as_str()) {
             Some(day) => bars.push_str(&format!(
-                r#"<div class="uptime-bar" style="background:{};" title="{}: {:.1}% uptime"></div>"#,
-                uptime_bar_color(day.uptime_percent), day.date, day.uptime_percent
+                r#"<div class="uptime-bar" style="background:{};" title="{}: {:.2}% uptime that day ({}/{} checks OK) · 90-day total {:.2}%"></div>"#,
+                uptime_bar_color(day.uptime_percent), day.date, day.uptime_percent,
+                day.successful_checks, day.total_checks, overall_percent
             )),
             None => bars.push_str(&format!(
-                r#"<div class="uptime-bar" style="background:{};" title="{}: no data"></div>"#,
-                bar_empty, date
+                r#"<div class="uptime-bar" style="background:{};" title="{}: no data · 90-day total {:.2}%"></div>"#,
+                bar_empty, date, overall_percent
             )),
         }
     }
