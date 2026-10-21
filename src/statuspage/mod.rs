@@ -708,6 +708,35 @@ impl MonitorStatus {
 // ─── Check Runner ───
 // ═══════════════════════════════════════════════
 
+/// Pause before the single retry of a failed check.
+const CHECK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run one probe of a monitor and return (success, error).
+async fn probe_monitor(
+    monitor: &Monitor,
+    cluster: &crate::agent::ClusterState,
+    cluster_secret: &str,
+) -> (bool, Option<String>) {
+    let timeout = std::time::Duration::from_secs(monitor.timeout_secs);
+    match &monitor.check {
+        CheckType::Http { url, expected_status } => {
+            run_http_check(url, *expected_status, timeout).await
+        }
+        CheckType::Tcp { host, port } => {
+            run_tcp_check(host, *port, timeout).await
+        }
+        CheckType::Ping { host } => {
+            run_ping_check(host, timeout).await
+        }
+        CheckType::Container { runtime, name, node_id } => {
+            run_container_check_routed(runtime, name, node_id, cluster, cluster_secret).await
+        }
+        CheckType::Wolfrun { service_id, min_healthy, health_check, .. } => {
+            run_wolfrun_check(service_id, *min_healthy, health_check).await
+        }
+    }
+}
+
 /// Run all enabled monitors and record results.
 /// Called periodically by the background task in main.rs.
 pub async fn run_checks(
@@ -733,26 +762,21 @@ pub async fn run_checks(
     }
 
     for monitor in &monitors {
-        let timeout = std::time::Duration::from_secs(monitor.timeout_secs);
         let start = std::time::Instant::now();
 
-        let (success, error) = match &monitor.check {
-            CheckType::Http { url, expected_status } => {
-                run_http_check(url, *expected_status, timeout).await
-            }
-            CheckType::Tcp { host, port } => {
-                run_tcp_check(host, *port, timeout).await
-            }
-            CheckType::Ping { host } => {
-                run_ping_check(host, timeout).await
-            }
-            CheckType::Container { runtime, name, node_id } => {
-                run_container_check_routed(runtime, name, node_id, cluster, cluster_secret).await
-            }
-            CheckType::Wolfrun { service_id, min_healthy, health_check, .. } => {
-                run_wolfrun_check(service_id, *min_healthy, health_check).await
-            }
-        };
+        let (mut success, mut error) = probe_monitor(monitor, cluster, cluster_secret).await;
+
+        // One quick retry before a failure is recorded. A single lost
+        // ICMP packet or a momentary connect timeout is noise, not an
+        // outage, and counting it drags healthy monitors to ~98%. Healthy
+        // monitors never retry, and a monitor already Down (DOWN_THRESHOLD
+        // consecutive failures) skips it so a dead target costs no more
+        // than before. The delay is short because checks run sequentially
+        // and a long wait would hold up every other monitor on the node.
+        if !success && state.monitor_status(&monitor.id) != MonitorStatus::Down {
+            tokio::time::sleep(CHECK_RETRY_DELAY).await;
+            (success, error) = probe_monitor(monitor, cluster, cluster_secret).await;
+        }
 
         let latency_ms = start.elapsed().as_millis() as u32;
         let now = std::time::SystemTime::now()
