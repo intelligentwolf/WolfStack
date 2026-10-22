@@ -53434,9 +53434,29 @@ async function setupTotp(username) {
             _totpSetupUser = username;
             _totpSetupSecret = data.secret;
             document.getElementById('totp-secret-display').textContent = data.secret;
-            document.getElementById('totp-qr').innerHTML = '<div style="padding:16px;background:#fff;border-radius:8px;display:inline-block;"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.uri) + '" alt="QR Code" style="width:200px;height:200px;"></div>';
+            // The QR is rendered by this host (qr_svg). It encodes the TOTP
+            // secret, so it must never be fetched from a third-party QR
+            // service. Shown as a data: <img> so the SVG is inert markup.
+            const qr = document.getElementById('totp-qr');
+            qr.replaceChildren();
+            if (data.qr_svg) {
+                const wrap = document.createElement('div');
+                wrap.style.cssText = 'padding:16px;background:#fff;border-radius:8px;display:inline-block;';
+                const img = document.createElement('img');
+                img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(data.qr_svg);
+                img.alt = 'QR code for your authenticator app';
+                img.style.cssText = 'width:200px;height:200px;display:block;';
+                wrap.appendChild(img);
+                qr.appendChild(wrap);
+            } else {
+                const p = document.createElement('p');
+                p.style.cssText = 'font-size:13px;color:var(--text-primary);margin:0;';
+                p.textContent = "The QR code couldn't be generated. Type the manual entry key below into your authenticator app instead.";
+                qr.appendChild(p);
+            }
             document.getElementById('totp-confirm-code').value = '';
             document.getElementById('totp-setup-modal').style.display = 'flex';
+            try { document.getElementById('totp-confirm-code').focus(); } catch (_) {}
         } else showToast(data.error || 'Failed', 'error');
     } catch (e) { showToast('Error: ' + e.message, 'error'); }
 }
@@ -60500,6 +60520,7 @@ function renderStatusMonitors(monitors) {
                     <div style="display:flex; gap:4px; margin-left:12px;">
                         <button class="btn btn-sm" onclick="showMonitorDetails('${mon.id}')" style="font-size:11px;" title="View Details"><span class="ws-icon-clean-wrap" data-icon="eye"></span></button>
                         <button class="btn btn-sm" onclick="editMonitor('${mon.id}')" style="font-size:11px;" title="Edit"><span class="ws-icon-clean-wrap" data-icon="edit"></span></button>
+                        <button class="btn btn-sm" onclick="resetMonitorHistory('${mon.id}')" style="font-size:11px;" title="Reset uptime history" aria-label="Reset uptime history"><span class="ws-icon-clean-wrap" data-icon="x-circle"></span></button>
                         <button class="btn btn-sm" onclick="deleteMonitor('${mon.id}')" style="font-size:11px; color:#ef4444;" title="Delete"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
                     </div>
                 </div>
@@ -60742,6 +60763,22 @@ async function saveMonitor() {
         document.getElementById('sp-monitor-form').style.display = 'none';
         loadStatusPageData();
     } catch (e) { showToast('Failed to save monitor: ' + e.message, 'error'); }
+}
+
+// Wipes the monitor's 90-day bars and recent checks on every node in its
+// cluster (the reset rides the replicated config). The monitor itself and
+// its settings are untouched.
+async function resetMonitorHistory(id) {
+    if (!(await showConfirm(
+        "Reset this monitor's uptime history? Its 90-day bars, uptime percentage and recent checks are cleared on every node in the cluster and start again from the next check. A node that is offline now clears its copy when it next syncs. This can't be undone.",
+        'Reset uptime history'))) return;
+    try {
+        const resp = await fetch(spUrl(`statuspage/monitors/${id}/reset-history`), { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        showToast('Uptime history reset', 'success');
+        loadStatusPageData();
+    } catch (e) { showToast('Failed to reset uptime history: ' + e.message, 'error', 0); }
 }
 
 async function deleteMonitor(id) {
@@ -70934,15 +70971,15 @@ window.declareSupportFromReceipt = declareSupportFromReceipt;
 // show — so neither prompt reappears on refresh or in-app navigation within
 // the same session, only on the next login.
 //
-// Two prompts, never stacked:
+// Both prompts are for non-supporters only (no licence, no paying Patreon
+// pledge, no GitHub Sponsor self-attest). Supporters see neither. Fail-safe:
+// on ANY error we treat the user as a supporter, so we never prompt someone
+// who might be paying. Two prompts, never stacked:
 //   • Welcome modal — shown while the operator hasn't ticked "Don't show
 //     again" (permanent localStorage flag). Promotes the Getting Started
 //     course, Discord, and sponsorship.
-//   • Support nag — once the welcome is dismissed for good, non-supporters
-//     (no licence, no paying Patreon pledge, no GitHub Sponsor self-attest)
-//     get a focused, freely-dismissible ask to sponsor or buy a licence.
-//     Supporters see nothing further. Fail-safe: on ANY error we treat the
-//     user as a supporter, so we never nag someone who might be paying.
+//   • Support nag — once the welcome is dismissed for good, a focused,
+//     freely-dismissible ask to sponsor or buy a licence.
 const WELCOME_DISMISS_KEY = 'wolfstack_welcome_dismissed';
 const WELCOME_FRESH_KEY = 'wolfstack_fresh_login';
 // Set when the operator ticks "I'm supporting already" — a permanent,
@@ -70957,20 +70994,13 @@ async function maybeShowLoginPrompt() {
     // Consume the per-login flag so a prompt shows once per login only.
     try { sessionStorage.removeItem(WELCOME_FRESH_KEY); } catch (_) {}
 
-    let permanent = false;
-    try { permanent = localStorage.getItem(WELCOME_DISMISS_KEY) === '1'; } catch (_) {}
-    // Welcome still active → it shows (and already carries a sponsor ask); don't
-    // pile the nag on top.
-    if (!permanent) { showWelcomeModal(); return; }
-
-    // Welcome dismissed → focused support nag for non-supporters only.
-    // First honour a prior self-declaration ("I'm supporting already") without
-    // a round-trip — this never reappears once they've ticked the box.
+    // A prior self-declaration ("I'm supporting already") ends both prompts
+    // in this browser without a round-trip.
     let declared = false;
     try { declared = localStorage.getItem(NAG_DECLARED_KEY) === '1'; } catch (_) {}
     if (declared) return;
 
-    let supporter = true; // fail SAFE: never nag on error / unknown / older binary
+    let supporter = true; // fail SAFE: never prompt on error / unknown / older binary
     try {
         const r = await fetch('/api/supporter/status');
         if (r.ok) {
@@ -70978,7 +71008,14 @@ async function maybeShowLoginPrompt() {
             supporter = (d && d.is_supporter !== false);
         }
     } catch (_) { supporter = true; }
-    if (!supporter) showSupportNag();
+    if (supporter) return;
+
+    let permanent = false;
+    try { permanent = localStorage.getItem(WELCOME_DISMISS_KEY) === '1'; } catch (_) {}
+    // Welcome still active → it shows (and already carries a sponsor ask); don't
+    // pile the nag on top. Once it's dismissed for good, the focused nag.
+    if (!permanent) showWelcomeModal();
+    else showSupportNag();
 }
 
 // ── Support nag (non-supporters, once per login) ─────────────────────

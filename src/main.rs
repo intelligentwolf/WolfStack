@@ -4546,8 +4546,17 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
         let sp_cluster = app_state.cluster.clone();
         let sp_secret = app_state.cluster_secret.clone();
         tokio::spawn(async move {
-            // Short delay after startup, then run first check immediately
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Hold the first check until the cluster poll has seen every
+            // peer once. Before that, peers loaded from nodes.json all read
+            // offline, so a container monitor pinned to one failed both its
+            // try and its retry, went Degraded and raised an auto-incident
+            // on every restart, then cleared on its next check (RutgerDiehard,
+            // 2026-10-21). Capped so an unusually slow first poll can't stall
+            // monitoring for long.
+            let boot = std::time::Instant::now();
+            while !agent::first_poll_done() && boot.elapsed() < Duration::from_secs(60) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             loop {
                 statuspage::run_checks(&sp_state, &sp_cluster, &sp_secret).await;
                 tokio::time::sleep(Duration::from_secs(1)).await;

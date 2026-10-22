@@ -3538,10 +3538,20 @@ pub async fn setup_2fa(req: HttpRequest, state: web::Data<AppState>, path: web::
 
     let secret = crate::auth::users::generate_totp_secret();
     let uri = crate::auth::users::totp_uri(&secret, &username);
+    // None only if the URI overflows a QR code; the dialog then falls back
+    // to the manual entry key, which is always shown.
+    let qr_svg = match crate::auth::users::totp_qr_svg(&uri) {
+        Ok(svg) => Some(svg),
+        Err(e) => {
+            tracing::warn!("2FA setup for {}: QR render failed: {}", username, e);
+            None
+        }
+    };
 
     HttpResponse::Ok().json(serde_json::json!({
         "secret": secret,
         "uri": uri,
+        "qr_svg": qr_svg,
     }))
 }
 
@@ -39268,10 +39278,13 @@ pub async fn statuspage_monitors_list(req: HttpRequest, state: web::Data<AppStat
 /// POST /api/statuspage/monitors — create or update a monitor
 pub async fn statuspage_monitor_save(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::statuspage::Monitor>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let monitor = body.into_inner();
+    let mut monitor = body.into_inner();
     {
         let mut config = state.statuspage.config.write().unwrap();
         if let Some(existing) = config.monitors.iter_mut().find(|m| m.id == monitor.id) {
+            // The edit form doesn't carry the reset stamp; keep the stored one
+            // so saving a monitor can't wind it back.
+            monitor.history_reset_at = existing.history_reset_at;
             *existing = monitor.clone();
         } else {
             config.monitors.push(monitor.clone());
@@ -39307,6 +39320,43 @@ pub async fn statuspage_monitor_delete(req: HttpRequest, state: web::Data<AppSta
     drop(config);
     sp_broadcast(&state);
     HttpResponse::Ok().json(serde_json::json!({ "deleted": true }))
+}
+
+/// POST /api/statuspage/monitors/{id}/reset-history — wipe a monitor's uptime
+/// history (daily bars and recent checks) on every node in its cluster. Each
+/// node keeps its own history, so the reset is carried by the replicated
+/// `history_reset_at` stamp rather than a one-off RPC.
+pub async fn statuspage_monitor_reset_history(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let id = path.into_inner();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let name = {
+        let mut config = state.statuspage.config.write().unwrap();
+        let Some(monitor) = config.monitors.iter_mut().find(|m| m.id == id) else {
+            return HttpResponse::NotFound().json(serde_json::json!({ "error": "Monitor not found" }));
+        };
+        // Strictly increasing, so peers always see it rise even if two resets
+        // land in the same second.
+        let previous = monitor.history_reset_at;
+        monitor.history_reset_at = now.max(previous + 1);
+        let name = monitor.name.clone();
+        if let Err(e) = config.save() {
+            // Not persisted, so not applied: put the stamp back, or the next
+            // broadcast would carry a reset the operator was told failed.
+            if let Some(m) = config.monitors.iter_mut().find(|m| m.id == id) {
+                m.history_reset_at = previous;
+            }
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+        }
+        name
+    };
+    state.statuspage.clear_history(&id);
+    tracing::info!("StatusPage: {} reset uptime history for monitor '{}' ({})", caller, name, id);
+    sp_broadcast(&state);
+    HttpResponse::Ok().json(serde_json::json!({ "reset": true }))
 }
 
 /// GET /api/statuspage/pages — list all status pages with current status
@@ -49930,6 +49980,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/statuspage/monitors", web::get().to(statuspage_monitors_list))
         .route("/api/statuspage/monitors", web::post().to(statuspage_monitor_save))
         .route("/api/statuspage/monitors/{id}", web::delete().to(statuspage_monitor_delete))
+        .route("/api/statuspage/monitors/{id}/reset-history", web::post().to(statuspage_monitor_reset_history))
         .route("/api/statuspage/pages", web::get().to(statuspage_pages_list))
         .route("/api/statuspage/pages", web::post().to(statuspage_page_save))
         .route("/api/statuspage/pages/{id}", web::delete().to(statuspage_page_delete))

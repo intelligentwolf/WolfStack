@@ -131,6 +131,14 @@ pub struct Monitor {
     pub timeout_secs: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Unix time an operator last reset this monitor's uptime history, 0 if
+    /// never. Each node keeps its own history, so the reset travels inside the
+    /// replicated config: a node that sees this value rise clears its local
+    /// history (see `merge_from_peer`). It never goes backwards. A node that
+    /// was offline at the time applies the reset when it next receives this
+    /// cluster's status-page config, like any other monitor edit.
+    #[serde(default)]
+    pub history_reset_at: u64,
 }
 
 fn default_true() -> bool { true }
@@ -463,7 +471,7 @@ impl StatusPageState {
 
     /// Merge status page config received from a cluster peer.
     /// Replaces all local pages/monitors/incidents for the incoming clusters.
-    pub fn merge_from_peer(&self, peer_config: StatusPageConfig) {
+    pub fn merge_from_peer(&self, mut peer_config: StatusPageConfig) {
         // Identify which clusters the peer is sending data for
         let peer_clusters: std::collections::HashSet<String> = peer_config.pages.iter()
             .map(|p| p.cluster.clone())
@@ -474,6 +482,23 @@ impl StatusPageState {
         if peer_clusters.is_empty() { return; }
 
         let mut config = self.config.write().unwrap();
+
+        // A monitor whose history_reset_at rose was reset on another node;
+        // clear this node's copy of its history too. The stamp only moves
+        // forward: a peer that hasn't seen the reset yet (or runs a build that
+        // predates it and sends 0) must not wind it back, or the next sync
+        // carrying the real stamp would wipe the history a second time.
+        let mut reset_ids: Vec<String> = Vec::new();
+        for incoming in peer_config.monitors.iter_mut() {
+            let local = config.monitors.iter()
+                .find(|m| m.id == incoming.id)
+                .map(|m| m.history_reset_at)
+                .unwrap_or(0);
+            if incoming.history_reset_at > local {
+                reset_ids.push(incoming.id.clone());
+            }
+            incoming.history_reset_at = incoming.history_reset_at.max(local);
+        }
 
         // Remove all local data for the incoming clusters
         config.pages.retain(|p| !peer_clusters.contains(&p.cluster));
@@ -487,6 +512,21 @@ impl StatusPageState {
 
         drop(config);
         self.config.read().unwrap().save().ok();
+
+        for id in &reset_ids {
+            self.clear_history(id);
+        }
+    }
+
+    /// Forget a monitor's uptime history on this node: the 90-day daily bars
+    /// and the recent results. The monitor then reads Unknown until its next
+    /// check, which is due at once because it has no last result.
+    pub fn clear_history(&self, monitor_id: &str) {
+        self.results.write().unwrap().remove(monitor_id);
+        let mut daily = self.daily_uptime.write().unwrap();
+        if daily.remove(monitor_id).is_some() {
+            Self::save_daily_uptime_data(&daily);
+        }
     }
 
 }
@@ -800,6 +840,15 @@ pub async fn run_checks(
         }
 
         let latency_ms = start.elapsed().as_millis() as u32;
+
+        // The history was reset while this probe ran: its result belongs to
+        // the old record, so drop it rather than seed the fresh one with it.
+        let reset_since_start = state.config.read().unwrap().monitors.iter()
+            .find(|m| m.id == monitor.id)
+            .is_some_and(|m| m.history_reset_at > monitor.history_reset_at);
+        if reset_since_start {
+            continue;
+        }
 
         state.record_result(&monitor.id, CheckResult {
             timestamp: started_at,
@@ -1776,5 +1825,71 @@ mod tests {
             let result: Result<Monitor, _> = serde_json::from_str(json);
             assert!(result.is_ok(), "{} failed: {:?}", label, result.err());
         }
+    }
+
+    // ONE test fn on purpose: paths::set_for_test mutates process-global
+    // state and cargo runs tests in parallel.
+    #[test]
+    fn history_reset_replicates_through_peer_merge() {
+        let tmp = std::env::temp_dir()
+            .join(format!("statuspage-reset-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp statuspage dir");
+        crate::paths::set_for_test(crate::paths::FileLocations {
+            statuspage_config: tmp.join("statuspage.json").to_string_lossy().into_owned(),
+            statuspage_uptime: tmp.join("statuspage-uptime.json").to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        let monitor = |reset_at: u64| Monitor {
+            id: "m1".into(),
+            name: "Web".into(),
+            check: CheckType::Ping { host: "127.0.0.1".into() },
+            cluster: "c1".into(),
+            interval_secs: 60,
+            timeout_secs: 10,
+            enabled: true,
+            history_reset_at: reset_at,
+        };
+        let peer = |reset_at: u64| StatusPageConfig {
+            monitors: vec![monitor(reset_at)],
+            ..Default::default()
+        };
+        let state = StatusPageState {
+            config: RwLock::new(StatusPageConfig { monitors: vec![monitor(0)], ..Default::default() }),
+            results: RwLock::new(HashMap::new()),
+            daily_uptime: RwLock::new(HashMap::new()),
+            down_since: RwLock::new(HashMap::new()),
+        };
+        let fail = CheckResult { timestamp: 1, success: false, latency_ms: 5, error: None };
+        let has_history = |s: &StatusPageState| {
+            s.latest_result("m1").is_some() || !s.get_daily_uptime("m1").is_empty()
+        };
+
+        // An ordinary sync (stamp unchanged) keeps the local history.
+        state.record_result("m1", fail.clone());
+        state.merge_from_peer(peer(0));
+        assert!(has_history(&state), "a sync without a new reset must not clear history");
+
+        // The stamp rose on another node: this node clears its own copy.
+        state.merge_from_peer(peer(100));
+        assert!(!has_history(&state), "a raised reset stamp must clear local history");
+        assert_eq!(state.monitor_status("m1"), MonitorStatus::Unknown);
+
+        // New checks after the reset are kept, and the same stamp arriving
+        // again (any later sync) does not wipe them.
+        state.record_result("m1", fail);
+        state.merge_from_peer(peer(100));
+        assert!(has_history(&state), "re-receiving the same stamp must not clear again");
+
+        // A peer that hasn't applied the reset yet sends the old stamp (or 0
+        // from an older build). The stamp must not go backwards, so when the
+        // real stamp comes round again it does not wipe the history twice.
+        state.merge_from_peer(peer(0));
+        assert_eq!(state.config.read().unwrap().monitors[0].history_reset_at, 100);
+        state.merge_from_peer(peer(100));
+        assert!(has_history(&state), "a stale peer must not cause a second wipe");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

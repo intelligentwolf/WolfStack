@@ -71,6 +71,9 @@ hex = "0.4"
 base64 = "0.22"
 regex = "1"
 urlencoding = "2"
+# 2FA setup QR code, rendered on this host so the TOTP secret never leaves it
+# (it used to go to api.qrserver.com). SVG renderer only: no image crate.
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 # Already in the tree via reqwest (Cargo.lock 2.5.8). MCP OAuth parses
 # redirect URIs and the public URL with it rather than by hand.
 url = "2.5"
