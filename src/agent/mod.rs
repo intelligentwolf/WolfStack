@@ -198,6 +198,26 @@ pub fn is_usable_addr(addr: &str) -> bool {
     true
 }
 
+/// Set once the first `poll_remote_nodes` cycle since boot has finished.
+/// Until then every peer loaded from nodes.json reads `online = false`
+/// (see `load_nodes`), which says "not polled yet", not "down".
+static FIRST_POLL_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True once every known peer has been polled at least once since boot, so
+/// `Node::online` is an observation rather than the load-time default.
+pub fn first_poll_done() -> bool {
+    FIRST_POLL_DONE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Marks the first poll done when `poll_remote_nodes` returns, whichever
+/// path it returns by.
+struct FirstPollMark;
+impl Drop for FirstPollMark {
+    fn drop(&mut self) {
+        FIRST_POLL_DONE.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Track consecutive poll failures per node — only mark offline after 2+ failures
 static POLL_FAIL_COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -2238,6 +2258,7 @@ pub async fn sweep_replicate_control_plane(cluster: Arc<ClusterState>, cluster_s
 
 /// Poll remote nodes for their status
 pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: String, ai_agent: Option<Arc<crate::ai::AiAgent>>) {
+    let _first_poll_mark = FirstPollMark;
     // Snapshot previous online state BEFORE polling
     let previous_states: HashMap<String, (bool, String)> = {
         let nodes = cluster.nodes_read();

@@ -2294,7 +2294,6 @@
                 </div>
             </div>
         </div>
-        </div>
 
         <!-- Port Forward Modal -->
         <div id="wolfrun-pf-modal" class="modal-overlay">
@@ -2454,7 +2453,6 @@
                     </div>
                 </div>
             </div>
-        </div>
         </div>
 
         <!-- Scaling Progress Modal -->
@@ -11508,7 +11506,6 @@ region = us-east-1"></textarea>
                 </div>
             </div>
         </div>
-        </div>
 
     <!-- Task Log Footer -->
     <div id="task-log-footer" style="display:none; position:fixed; bottom:0; right:0; z-index:150; height:220px; flex-direction:column; background:var(--bg-primary); border-top:2px solid var(--accent); box-shadow:0 -4px 20px rgba(0,0,0,0.3);">
@@ -11628,6 +11625,12 @@ region = us-east-1"></textarea>
                 <button class="btn btn-primary" onclick="addServer()">Add Server</button>
             </div>
         </div>
+    </div>
+    <!-- add-server-modal closes above. Everything below must stay a direct
+         child of <body>: this </div> went missing in d45d141f and every modal
+         after it (2FA setup, welcome, support nag, course drawer) rendered inside the
+         invisible overlay (Mancolt, 2026-10-22). tests/web_modal_nesting.rs
+         guards it. -->
         <!-- Console Modal -->
         <div id="console-modal"
             style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:9999;display:none;align-items:center;justify-content:center;">
@@ -11930,9 +11933,9 @@ region = us-east-1"></textarea>
         </script>
 
 <!-- 2FA Setup Modal (must be at body level for z-index) -->
-<div id="totp-setup-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:99999;align-items:center;justify-content:center;">
+<div id="totp-setup-modal" role="dialog" aria-modal="true" aria-labelledby="totp-setup-title" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:99999;align-items:center;justify-content:center;">
     <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:400px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
-        <h3 style="margin:0 0 12px 0;font-size:16px;">Set Up Two-Factor Authentication</h3>
+        <h3 id="totp-setup-title" style="margin:0 0 12px 0;font-size:16px;">Set Up Two-Factor Authentication</h3>
         <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
             Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.), then enter the 6-digit code to confirm.
         </p>

@@ -361,6 +361,32 @@ pub fn totp_uri(secret_b32: &str, username: &str) -> String {
     )
 }
 
+/// Render an otpauth:// URI as an SVG QR code on this host. The URI carries
+/// the TOTP secret, so it must never be handed to a third-party QR service.
+pub fn totp_qr_svg(uri: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(200, 200)
+        .quiet_zone(true)
+        .build())
+}
+
+#[cfg(test)]
+mod totp_qr_tests {
+    #[test]
+    fn qr_is_a_self_contained_svg() {
+        let secret = super::generate_totp_secret();
+        let svg = super::totp_qr_svg(&super::totp_uri(&secret, "admin")).expect("render");
+        assert!(svg.contains("<svg") && svg.ends_with("</svg>"));
+        // The only URL is the SVG namespace: nothing is fetched from anywhere,
+        // and neither the URI nor the secret appears as text.
+        assert_eq!(svg.matches("http").count(), 1);
+        assert!(svg.contains(r#"xmlns="http://www.w3.org/2000/svg""#));
+        assert!(!svg.contains("otpauth") && !svg.contains(&secret));
+    }
+}
+
 /// Authenticate a WolfStack user (password check, no 2FA)
 pub fn authenticate_wolfstack_user(username: &str, password: &str) -> Option<WolfUser> {
     let store = UserStore::load();
