@@ -29764,8 +29764,13 @@ pub async fn system_upgrade(
     // in as root and has no sudo binary, so `curl | sudo bash` errored
     // with "sudo: command not found"). Pipe straight to bash — we're
     // already root.
+    // The trailing status line tells a watcher of /api/upgrade/log that the
+    // run ended. Without it a failed run is indistinguishable from a slow
+    // one, and Upgrade All's rolling mode waits on each node in turn.
+    // pipefail so a failed download counts as a failed run.
     let cmd = format!(
-        "curl -sSL https://raw.githubusercontent.com/intelligentwolf/WolfStack/{}/setup.sh | bash -s --{}",
+        "set -o pipefail; curl -sSL https://raw.githubusercontent.com/intelligentwolf/WolfStack/{}/setup.sh | bash -s --{}; \
+         echo \"=== WolfStack upgrade exited with status $? ===\"",
         branch, flag
     );
 

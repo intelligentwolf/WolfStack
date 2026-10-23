@@ -947,6 +947,9 @@ SUPERVISOR_EOF
     echo ""
     echo "  Verify:  tail -f $WS_APPDATA/wolfstack.log"
     echo ""
+    # The same end-of-run line as the main path: Upgrade All's rolling mode
+    # reads it from /api/upgrade/log to know this node has finished.
+    echo "**** UPGRADE COMPLETE ****"
     # This Unraid branch is self-contained and exits before the rest of the
     # script. When run via `curl ... | bash`, exiting while curl still has the
     # remaining ~1500 lines to send breaks the pipe and curl dies with
@@ -2237,6 +2240,20 @@ WOLFNET_UNIT_EOF
     systemctl daemon-reload
 }
 
+# True when both files exist with identical bytes. With neither cmp nor
+# sha256sum available it answers "different", which falls back to the
+# replace-and-restart that upgrades always did.
+same_file() {
+    [ -f "$1" ] && [ -f "$2" ] || return 1
+    if command -v cmp >/dev/null 2>&1; then
+        cmp -s "$1" "$2"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        [ "$(sha256sum < "$1")" = "$(sha256sum < "$2")" ]
+    else
+        return 1
+    fi
+}
+
 # Helper: download prebuilt WolfNet binaries or build from source.
 # Sets WOLFNET_BUILT=true on success.
 # Requires WOLFNET_SRC_DIR to be set if building from source.
@@ -2358,20 +2375,35 @@ if command -v wolfnet >/dev/null 2>&1 && systemctl is-active --quiet wolfnet 2>/
     # aborting here would leave the node with WolfNet stopped and the rest of
     # the upgrade unrun — strictly worse than an upgrade that didn't happen.
     if build_or_download_wolfnet && [ -f "$WOLFNET_STAGE_DIR/wolfnet" ]; then
-        systemctl stop wolfnet 2>/dev/null || true
-        mv -f "$WOLFNET_STAGE_DIR/wolfnet" /usr/local/bin/wolfnet ||
-            echo "  ⚠ Could not replace /usr/local/bin/wolfnet — keeping the existing binary"
-        chmod +x /usr/local/bin/wolfnet || true
+        # wolfnetctl is a CLI the daemon never loads — swap it in place.
         if [ -f "$WOLFNET_STAGE_DIR/wolfnetctl" ]; then
             mv -f "$WOLFNET_STAGE_DIR/wolfnetctl" /usr/local/bin/wolfnetctl || true
             chmod +x /usr/local/bin/wolfnetctl || true
         fi
+        # A unit change applies at the daemon's next start; rewriting it does
+        # not need a restart.
         write_wolfnet_unit
-        # A unit sitting in failed/start-limit state ignores `start` silently,
-        # which is how nodes stayed offline until someone rebooted them.
-        systemctl reset-failed wolfnet 2>/dev/null || true
-        systemctl start wolfnet 2>/dev/null || true
-        echo "  ✓ WolfNet updated and restarted"
+        if same_file "$WOLFNET_STAGE_DIR/wolfnet" /usr/local/bin/wolfnet; then
+            # Most WolfStack releases ship no new WolfNet. Restarting it anyway
+            # dropped every connection over the overlay on every upgrade — on
+            # every node at once under Upgrade All, which a Galera cluster
+            # running over WolfNet does not survive.
+            echo "  ✓ WolfNet is already the latest release — left running"
+        else
+            # Ask the old daemon to keep wolfnet0 (address and routes) for the
+            # new one, so connections over the overlay ride out the swap.
+            # Daemons older than WolfNet 0.5.36 ignore the marker.
+            mkdir -p /var/run/wolfnet && touch /var/run/wolfnet/restart-handoff || true
+            systemctl stop wolfnet 2>/dev/null || true
+            mv -f "$WOLFNET_STAGE_DIR/wolfnet" /usr/local/bin/wolfnet ||
+                echo "  ⚠ Could not replace /usr/local/bin/wolfnet — keeping the existing binary"
+            chmod +x /usr/local/bin/wolfnet || true
+            # A unit sitting in failed/start-limit state ignores `start` silently,
+            # which is how nodes stayed offline until someone rebooted them.
+            systemctl reset-failed wolfnet 2>/dev/null || true
+            systemctl start wolfnet 2>/dev/null || true
+            echo "  ✓ WolfNet updated and restarted"
+        fi
     else
         # Nothing new was staged — the running daemon was never touched.
         echo "  ⚠ WolfNet update unavailable — leaving the running version in place"

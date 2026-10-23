@@ -43095,8 +43095,14 @@ async function pullPbsFromNode(nodeId) {
 // binary, so every WolfStack would light up "Update available" for a
 // release that can't be downloaded yet.
 async function fetchLatestWolfStackVersion() {
+    return fetchLatestReleaseVersion('intelligentwolf/WolfStack');
+}
+
+// Latest published release of `repo` ("owner/name"), without the leading v,
+// or null when GitHub can't be reached.
+async function fetchLatestReleaseVersion(repo) {
     try {
-        var r = await fetch('https://api.github.com/repos/intelligentwolf/WolfStack/releases/latest', {
+        var r = await fetch('https://api.github.com/repos/' + repo + '/releases/latest', {
             headers: { 'Accept': 'application/vnd.github+json' }
         });
         if (!r.ok) return null;
@@ -47074,6 +47080,24 @@ function showProgressModal(icon, title) {
             var st = row.querySelector('.pm-status');
             if (st) { st.style.color = success ? '#10b981' : '#ef4444'; st.textContent = statusText; }
         },
+        // A row that is not finished yet: 'waiting' (queued, not started) or
+        // 'working' (spinner). updateRow above is for the final outcome.
+        setRowState: function (id, state, statusText) {
+            var row = document.getElementById('pm-row-' + id);
+            if (!row) return;
+            var ic = row.querySelector('.pm-icon');
+            if (ic) {
+                if (state === 'waiting') {
+                    ic.style.cssText = 'font-size:16px; flex-shrink:0;';
+                    ic.textContent = '\u23F3';
+                } else {
+                    ic.textContent = '';
+                    ic.style.cssText = 'display:inline-block;width:18px;height:18px;border:2px solid rgba(59, 130, 246,0.2);border-top-color:rgba(59, 130, 246,0.8);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0;';
+                }
+            }
+            var st = row.querySelector('.pm-status');
+            if (st) { st.style.color = 'var(--text-muted)'; st.textContent = statusText; }
+        },
         setTitle: function (text) { overlay.querySelector('.pm-title').innerHTML = text; },
         setFooter: function (html) { var f = overlay.querySelector('.pm-footer'); f.innerHTML = html; f.style.display = 'block'; },
         showDone: function () { overlay.querySelector('.pm-actions').style.display = 'block'; },
@@ -47279,13 +47303,29 @@ async function issuesUpgradeAll(overrideTargets) {
         return;
     }
 
+    showToast('Checking which servers get a new WolfNet\u2026', 'info', 4000, 'upgrade-wolfnet-plan');
+    var wolfnetChanges = await _planWolfNetRestarts(targets);
+    var plan = _planUpgradeOrder(targets, wolfnetChanges);
+    var selfTarget = plan.rolling.find(function (r) { return _isSelfTarget(r); });
+
     var nodeList = targets.map(function (r) { return '\uD83D\uDDA5\uFE0F ' + escapeHtml(r.hostname || r.node_id) + ' (v' + (r.version || '?') + ')'; });
+    var modeHtml = plan.rolling.length === 0
+        ? 'Each node runs its upgrade independently in the background — <strong>fan-out, not sequential</strong>. '
+        : 'This upgrade restarts WolfNet on ' + plan.wolfnetCount + ' of these servers, and a restart briefly '
+          + 'disconnects anything running over it. So they upgrade <strong>one at a time</strong>: each waits '
+          + 'for the one before to finish and for its WolfNet to come back, which keeps a majority of any '
+          + 'cluster that runs over WolfNet (a Galera database, for example). '
+          + (plan.together.length ? 'The other ' + plan.together.length + ' upgrade together straight away. ' : '')
+          + (selfTarget ? escapeHtml(selfTarget.hostname || selfTarget.node_id) + ', the server this page is connected to, goes last, because restarting it ends your session. ' : '')
+          + '<strong>Keep this tab open until the last server has started</strong> — the one-at-a-time order runs in this browser. ';
     try {
         await showIssuesConfirm('\u26A1', 'Upgrade ' + targets.length + ' Server' + (targets.length !== 1 ? 's' : '') + '?',
-            'Each node runs its upgrade independently in the background — <strong>fan-out, not sequential</strong>. '
+            modeHtml
             + 'Typical completion is a few minutes per node; slow hardware (Raspberry Pi, low-core VPS) can take up to ~50 minutes. '
             + 'Each server restarts automatically once its new binary is built. '
-            + 'Progress is tracked in the task log and persists across browser refresh.'
+            + (plan.rolling.length
+                ? 'Servers that have started are tracked in the task log, which survives a browser refresh.'
+                : 'Progress is tracked in the task log and persists across browser refresh.')
             + (function () {
                 // HTTPS-by-default warning. Fleet operators are most
                 // likely to have a mix of HTTP/HTTPS nodes \u2014 warn
@@ -47318,47 +47358,37 @@ async function issuesUpgradeAll(overrideTargets) {
 
     var channel = (document.getElementById('issues-channel-select') || {}).value || 'master';
 
-    // Track each node upgrade — persist to localStorage so tracking survives page reload.
-    // Drop any already-done trackers left over from a prior upgrade so they don't
-    // accumulate (and so a re-upgrade of the same node gets a fresh tracker).
-    var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]').filter(function (t) { return t && !t.done; });
-    for (var i = 0; i < targets.length; i++) {
-        var r = targets[i];
-        var node = allNodes.find(function (n) { return n.id === r.node_id; });
-        var safeId = (r.node_id || 'local').replace(/[^a-z0-9_-]/gi, '-');
-        var url = (node && !node.is_self) ? '/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/upgrade?channel=' + channel : '/api/upgrade?channel=' + channel;
+    plan.rolling.forEach(function (r, i) {
+        modal.setRowState(_upgradeRowId(r.node_id), 'waiting', 'Waiting \u2014 ' + (i + 1) + ' of ' + plan.rolling.length + ' in turn');
+    });
 
-        // Capture the node's CURRENT version BEFORE the upgrade POST (which
-        // triggers a restart). The tracker uses a version bump as a
-        // restart-proof "done" signal — unlike the offline→online heuristic
-        // below, a version comparison still works when the browser never
-        // witnessed the brief offline window (logout/login mid-upgrade, or a
-        // binary restart faster than the ~20s cluster offline detection).
-        // Issues-page targets already carry r.version from the scan; the
-        // per-node-settings path (upgradeNode) passes '?', so probe it here.
-        var preVersion = (r.version && r.version !== '?') ? r.version : null;
-        if (!preVersion && node && !node.is_self) {
-            try {
-                var vr = await fetch('/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/nodes', { credentials: 'include' });
-                if (vr.ok) { var vd = await vr.json(); if (vd && vd.version) preVersion = vd.version; }
-            } catch (_) { /* unreachable now → version probe falls back to offline heuristic */ }
-        }
-
-        try {
-            await fetch(url, { method: 'POST' });
-            modal.updateRow(safeId, true, 'Upgrading...');
-            trackers.push({ nodeId: r.node_id, hostname: r.hostname || r.node_id, cluster: (node && node.cluster_name) || 'WolfStack', startedAt: Date.now(), done: false, preVersion: preVersion });
-        } catch (e) {
-            modal.updateRow(safeId, false, 'Failed: ' + e.message);
+    var started = 0;
+    for (var i = 0; i < plan.together.length; i++) {
+        var r = plan.together[i];
+        var res = await _sendNodeUpgrade(r, channel);
+        if (res.ok) {
+            started++;
+            modal.updateRow(_upgradeRowId(r.node_id), true, 'Upgrading...');
+        } else {
+            modal.updateRow(_upgradeRowId(r.node_id), false, 'Failed: ' + res.error);
         }
     }
-    localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(trackers));
 
-    modal.setTitle('Upgrades In Progress (' + trackers.length + ' nodes)');
+    modal.setTitle(plan.rolling.length === targets.length
+        ? 'Upgrading ' + targets.length + ' Servers One at a Time'
+        : plan.rolling.length
+        ? 'Upgrading ' + targets.length + ' Servers (' + plan.rolling.length + ' one at a time)'
+        : 'Upgrades In Progress (' + started + ' nodes)');
     modal.setFooter('<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:10px; padding:16px; text-align:center;">'
         + '<div style="font-size:24px; margin-bottom:8px;">\u23F3</div>'
         + '<div style="font-weight:600; color:var(--text-primary); font-size:14px; margin-bottom:4px;">Upgrades in progress — tracking in task log</div>'
-        + '<div style="color:var(--text-secondary); font-size:12px;">Raspberry Pi may take up to 50 minutes. Tracking persists across browser refresh.</div>'
+        + '<div style="color:var(--text-secondary); font-size:12px;">Raspberry Pi may take up to 50 minutes. '
+            + (plan.rolling.length ? 'Servers that have started stay tracked across a browser refresh.' : 'Tracking persists across browser refresh.') + '</div>'
+        + (plan.rolling.length
+            ? '<div id="pm-rolling-status" role="status" aria-live="polite" style="margin-top:10px; color:var(--text-primary); font-size:13px; font-weight:600;"></div>'
+              + '<div id="pm-rolling-alert" role="alert" style="margin-top:10px; color:var(--text-primary); font-size:13px; text-align:left;"></div>'
+              + '<div style="color:var(--text-secondary); font-size:12px; margin-top:6px;">You can close this dialog. Closing the browser tab stops the servers still waiting their turn from starting.</div>'
+            : '')
         + ((function () {
             var httpsSwitchFleet = window.location.protocol === 'http:'
                 || targets.some(function (r) {
@@ -47424,6 +47454,208 @@ async function issuesUpgradeAll(overrideTargets) {
 
     // Start the persistent upgrade tracker
     _startUpgradeTracking();
+
+    if (plan.rolling.length) await _rollingUpgrade(plan.rolling, channel, modal);
+}
+
+function _upgradeRowId(nodeId) {
+    return (nodeId || 'local').replace(/[^a-z0-9_-]/gi, '-');
+}
+
+function _isSelfTarget(r) {
+    var node = allNodes.find(function (n) { return n.id === r.node_id; });
+    return !node || !!node.is_self;
+}
+
+// API path on the node an upgrade target refers to: the local route for this
+// server, the node proxy for any other.
+function _upgradeTargetUrl(r, path) {
+    return _isSelfTarget(r) ? '/api/' + path : '/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/' + path;
+}
+
+// Which targets will get a new WolfNet binary, keyed by node_id. setup.sh
+// leaves an identical binary running and restarts WolfNet only to replace it;
+// a node with WolfNet stopped or absent loses nothing either way. Anything we
+// can't find out — node or GitHub unreachable, version unreadable — counts as
+// a restart: one-at-a-time is slower, never unsafe.
+async function _planWolfNetRestarts(targets) {
+    var latest = await fetchLatestReleaseVersion('intelligentwolf/WolfNet');
+    var restarts = {};
+    await Promise.all(targets.map(async function (r) {
+        var wolfnet = null;
+        try {
+            var resp = await fetch(_upgradeTargetUrl(r, 'components'), { signal: AbortSignal.timeout(15000) });
+            if (resp.ok) {
+                var list = await resp.json();
+                wolfnet = Array.isArray(list) ? list.find(function (c) { return c && c.component === 'wolfnet'; }) : null;
+            }
+        } catch (_) { /* unknown — treated as a restart below */ }
+        if (wolfnet && (!wolfnet.installed || !wolfnet.running)) return;
+        if (wolfnet && latest && wolfnet.version && compareVersions(wolfnet.version, latest) === 0) return;
+        restarts[r.node_id] = true;
+    }));
+    return restarts;
+}
+
+// Split targets into the ones that can upgrade together and the ones that go
+// one at a time. A single WolfNet restart can't overlap another, so the order
+// only matters from two upward. When it does, this server goes last whatever
+// its WolfNet does: its restart ends the browser session that drives the
+// sequence (sessions live in memory), so nothing could follow it.
+function _planUpgradeOrder(targets, wolfnetChanges) {
+    var changing = targets.filter(function (r) { return wolfnetChanges[r.node_id]; });
+    if (changing.length < 2) return { together: targets.slice(), rolling: [], wolfnetCount: changing.length };
+    var rolling = changing.filter(function (r) { return !_isSelfTarget(r); });
+    var together = targets.filter(function (r) { return !wolfnetChanges[r.node_id] && !_isSelfTarget(r); });
+    var self = targets.find(function (r) { return _isSelfTarget(r); });
+    if (self) rolling.push(self);
+    return { together: together, rolling: rolling, wolfnetCount: changing.length };
+}
+
+// POST the upgrade to one node and start tracking it. Returns {ok, error}.
+async function _sendNodeUpgrade(r, channel) {
+    var node = allNodes.find(function (n) { return n.id === r.node_id; });
+    // Capture the node's CURRENT version BEFORE the upgrade POST (which
+    // triggers a restart). The tracker uses a version bump as a
+    // restart-proof "done" signal — unlike the offline→online heuristic,
+    // a version comparison still works when the browser never witnessed
+    // the brief offline window (logout/login mid-upgrade, or a binary
+    // restart faster than the ~20s cluster offline detection).
+    // Issues-page targets already carry r.version from the scan; the
+    // per-node-settings path (upgradeNode) passes '?', so probe it here.
+    var preVersion = (r.version && r.version !== '?') ? r.version : null;
+    if (!preVersion && node && !node.is_self) {
+        try {
+            var vr = await fetch('/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/nodes', { credentials: 'include' });
+            if (vr.ok) { var vd = await vr.json(); if (vd && vd.version) preVersion = vd.version; }
+        } catch (_) { /* unreachable now → version probe falls back to offline heuristic */ }
+    }
+    try {
+        var resp = await fetch(_upgradeTargetUrl(r, 'upgrade?channel=' + encodeURIComponent(channel)), { method: 'POST' });
+        if (!resp.ok) {
+            var detail = '';
+            try { var body = await resp.json(); detail = body && body.error ? ': ' + body.error : ''; } catch (_) {}
+            return { ok: false, error: 'HTTP ' + resp.status + detail };
+        }
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+    _addUpgradeTracker({ nodeId: r.node_id, hostname: r.hostname || r.node_id, cluster: (node && node.cluster_name) || 'WolfStack', startedAt: Date.now(), done: false, preVersion: preVersion });
+    return { ok: true };
+}
+
+function _upgradeSleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// Follow a started upgrade through the node's /api/upgrade/log until setup.sh
+// reports the end of the run. Returns {ok, reason}.
+async function _waitForUpgradeEnd(r, onProgress) {
+    var started = Date.now();
+    // setup.sh can take ~50 minutes on a Raspberry Pi; allow for that and more.
+    var deadline = started + 75 * 60 * 1000;
+    while (Date.now() < deadline) {
+        await _upgradeSleep(5000);
+        try {
+            var resp = await fetch(_upgradeTargetUrl(r, 'upgrade/log?tail=16384'), { cache: 'no-store' });
+            if (resp.status === 404) {
+                return { ok: false, reason: 'its WolfStack is too old to report upgrade progress, so the next server could not safely follow it' };
+            }
+            if (resp.ok) {
+                var d = await resp.json();
+                var text = (d && d.content) || '';
+                // setup.sh prints this as the last thing a successful run does.
+                if (text.indexOf('**** UPGRADE COMPLETE ****') !== -1) return { ok: true };
+                // system_upgrade appends this when the run ends either way.
+                var m = text.match(/=== WolfStack upgrade exited with status (\d+) ===/);
+                if (m) return { ok: false, reason: 'its upgrade ended without completing (exit status ' + m[1] + ') \u2014 see its upgrade log' };
+            }
+        } catch (_) { /* restarting or briefly unreachable — keep waiting */ }
+        var mins = Math.floor((Date.now() - started) / 60000);
+        onProgress('Upgrading\u2026 ' + (mins ? mins + ' min' : 'under a minute'));
+    }
+    return { ok: false, reason: 'its upgrade had not finished after 75 minutes' };
+}
+
+// True once the node reports WolfNet running again (or has no WolfNet).
+async function _waitForWolfNet(r) {
+    var deadline = Date.now() + 3 * 60 * 1000;
+    while (Date.now() < deadline) {
+        try {
+            var resp = await fetch(_upgradeTargetUrl(r, 'components'), { cache: 'no-store', signal: AbortSignal.timeout(15000) });
+            if (resp.ok) {
+                var list = await resp.json();
+                var wolfnet = Array.isArray(list) ? list.find(function (c) { return c && c.component === 'wolfnet'; }) : null;
+                if (!wolfnet || !wolfnet.installed || wolfnet.running) return true;
+            }
+        } catch (_) { /* WolfStack restarting after its upgrade — keep waiting */ }
+        await _upgradeSleep(3000);
+    }
+    return false;
+}
+
+// Upgrade `queue` one server at a time: start it, wait for its setup.sh to
+// finish and its WolfNet to answer, then start the next. The first failure
+// stops the sequence, leaving the rest untouched, so the overlay never loses
+// two servers at once.
+async function _rollingUpgrade(queue, channel, modal) {
+    function say(text) {
+        var el = document.getElementById('pm-rolling-status');
+        if (el) el.textContent = text;
+    }
+    function halt(index, reason) {
+        var r = queue[index];
+        var name = r.hostname || r.node_id;
+        var left = queue.slice(index + 1);
+        left.forEach(function (n) { modal.updateRow(_upgradeRowId(n.node_id), false, 'Not started'); });
+        var msg = 'Stopped at ' + name + ': ' + reason + '.'
+            + (left.length ? ' ' + left.length + (left.length !== 1 ? ' servers were not started, so their' : ' server was not started, so its') + ' WolfNet stayed up. Sort out ' + name + ', then run the upgrade again.' : '');
+        say('One-at-a-time upgrade stopped');
+        var alertEl = document.getElementById('pm-rolling-alert');
+        if (alertEl) alertEl.textContent = msg;
+        // Also outside the modal, which the operator may have closed by now.
+        showToast('One-at-a-time upgrade stopped at ' + name + ': ' + msg.slice(('Stopped at ' + name + ': ').length), 'error', 0);
+    }
+    function guard(e) { e.preventDefault(); e.returnValue = ''; }
+    window.addEventListener('beforeunload', guard);
+    try {
+        for (var i = 0; i < queue.length; i++) {
+            var r = queue[i];
+            var rowId = _upgradeRowId(r.node_id);
+            var name = r.hostname || r.node_id;
+            say('Upgrading ' + name + ' (' + (i + 1) + ' of ' + queue.length + ')\u2026');
+            modal.setRowState(rowId, 'working', 'Starting\u2026');
+            var res = await _sendNodeUpgrade(r, channel);
+            if (!res.ok) {
+                modal.updateRow(rowId, false, 'Failed: ' + res.error);
+                halt(i, 'the upgrade could not be started (' + res.error + ')');
+                return;
+            }
+            if (_isSelfTarget(r)) {
+                // Always last (see _planUpgradeOrder). Its restart ends this
+                // session, so the task log tracker takes over from here.
+                modal.updateRow(rowId, true, 'Upgrading \u2014 sign in again after it restarts');
+                say('Last server started \u2014 this page will need a fresh sign-in once it restarts');
+                return;
+            }
+            var end = await _waitForUpgradeEnd(r, function (text) { modal.setRowState(rowId, 'working', text); });
+            if (!end.ok) {
+                modal.updateRow(rowId, false, 'Failed');
+                halt(i, end.reason);
+                return;
+            }
+            modal.setRowState(rowId, 'working', 'Waiting for WolfNet\u2026');
+            if (!(await _waitForWolfNet(r))) {
+                modal.updateRow(rowId, false, 'WolfNet not running');
+                halt(i, 'its WolfNet was not running 3 minutes after the upgrade');
+                return;
+            }
+            modal.updateRow(rowId, true, 'Done');
+        }
+        say('All ' + queue.length + ' servers upgraded one at a time');
+    } finally {
+        window.removeEventListener('beforeunload', guard);
+    }
 }
 
 // In-flight / throttle guards for the version probe. Kept in memory (NOT
@@ -47466,8 +47698,37 @@ function _probeUpgradeVersion(t) {
 }
 
 // Persistent upgrade tracker — survives page reload
+// The one running tracker loop and the list it polls. A second loop would
+// poll its own snapshot and overwrite this one's in localStorage every tick,
+// so later calls hand new trackers to the running loop instead.
+var _upgradeTrackers = null;
+var _upgradeTrackTimer = null;
+
+// Record a just-started node upgrade and make sure it is being tracked.
+// Synchronous end to end, so the running loop can't save its own list
+// between our read and our write.
+function _addUpgradeTracker(tracker) {
+    var stored = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]')
+        .filter(function (t) { return t && !t.done; });
+    stored.push(tracker);
+    localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(stored));
+    _startUpgradeTracking();
+}
+
 function _startUpgradeTracking() {
-    var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
+    var stored = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
+    if (_upgradeTrackTimer) {
+        stored.forEach(function (s) {
+            if (!s || s.done) return;
+            var known = _upgradeTrackers.some(function (t) {
+                return t.nodeId === s.nodeId && t.startedAt === s.startedAt;
+            });
+            if (!known) _upgradeTrackers.push(s);
+        });
+    } else {
+        _upgradeTrackers = stored;
+    }
+    var trackers = _upgradeTrackers;
     if (trackers.length === 0) return;
 
     // Create task log entries for any pending trackers. Recreate when the
@@ -47501,7 +47762,9 @@ function _startUpgradeTracking() {
         }
     });
 
-    var pollTimer = setInterval(function() {
+    if (_upgradeTrackTimer) return; // the running loop polls the adopted trackers
+
+    _upgradeTrackTimer = setInterval(function() {
         var pending = 0;
         trackers.forEach(function(t) {
             if (t.done) return;
@@ -47565,7 +47828,9 @@ function _startUpgradeTracking() {
         localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(trackers));
 
         if (pending === 0) {
-            clearInterval(pollTimer);
+            clearInterval(_upgradeTrackTimer);
+            _upgradeTrackTimer = null;
+            _upgradeTrackers = null;
             localStorage.removeItem('wolfstack_upgrade_trackers');
         }
     }, 5000);

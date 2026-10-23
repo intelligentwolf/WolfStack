@@ -2152,8 +2152,22 @@ fn reload_or_restart_wolfnet() {
     }
 }
 
+/// Read by the WolfNet daemon (v0.5.36+) as it shuts down: present and fresh
+/// means a new daemon follows, so it keeps wolfnet0 — address and routes —
+/// instead of letting the kernel delete it. Older daemons ignore the file.
+/// Same path as RESTART_HANDOFF_PATH in WolfNet's src/main.rs.
+const WOLFNET_RESTART_HANDOFF: &str = "/var/run/wolfnet/restart-handoff";
+
 /// Restart or start WolfNet service
 pub fn wolfnet_service_action(action: &str) -> Result<String, String> {
+    if action == "restart" {
+        // Without this a restart deletes wolfnet0 and every route through it,
+        // dropping anything running over the overlay (a Galera cluster, say).
+        let _ = std::fs::create_dir_all("/var/run/wolfnet");
+        if let Err(e) = std::fs::write(WOLFNET_RESTART_HANDOFF, b"") {
+            warn!("Could not write {}: {} — wolfnet0 will be rebuilt on restart", WOLFNET_RESTART_HANDOFF, e);
+        }
+    }
     // Unraid: no systemd, the agent is the supervisor — every verb has a
     // supervisor equivalent there (klas, 2026-09-10: the WolfNet page's
     // Start button answered "systemctl isn't available").
