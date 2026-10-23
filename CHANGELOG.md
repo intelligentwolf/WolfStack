@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.39.0: upgrades no longer drop WolfNet; Upgrade All goes one at a time when WolfNet changes** _(2026-10-23 — [`9223cbb1`](https://github.com/intelligentwolf/WolfStack/commit/9223cbb1169b4c192285b64da2377738e234f20a))_
 - **v25.38.0: 2FA setup was invisible and leaked its secret to a QR service; monitor uptime history can be reset** _(2026-10-22 — [`fd5c0d37`](https://github.com/intelligentwolf/WolfStack/commit/fd5c0d37e21c341cc1798c87e73424dfa6262fcd))_
 - **v25.37.3: monitors honour their own check interval instead of a fixed 30s** _(2026-10-21 — [`fa7c68bd`](https://github.com/intelligentwolf/WolfStack/commit/fa7c68bd0e5decb3cbe2a59547740f110e7d9c5f))_
 - **v25.37.2: one-packet blips no longer count as failed uptime checks** _(2026-10-21 — [`6cbd9e00`](https://github.com/intelligentwolf/WolfStack/commit/6cbd9e0037b1b72f0d3043f300bce1da920e1a7b))_
