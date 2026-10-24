@@ -60858,19 +60858,6 @@ async function showMonitorDetails(monitorId) {
         checkDetails = `Service: <code>${escapeHtml(c.service_name)}</code><br>Min healthy: ${c.min_healthy}`;
     }
 
-    const recentChecks = (m.recent_checks || []).slice(0, 10).map(chk => {
-        // chk.timestamp is Unix SECONDS (CheckResult.timestamp = as_secs());
-        // new Date() wants milliseconds, so ×1000 — without it every check
-        // rendered as 21/01/1970 (Rutger, 2026-07-15).
-        const time = new Date(chk.timestamp * 1000).toLocaleString();
-        const statusColor = chk.success ? colors.up : colors.down;
-        return `<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
-            <span style="color:${statusColor};">${chk.success ? '' : ''}</span>
-            <span style="font-size:11px; color:var(--text-muted);">${time}</span>
-            <span style="font-size:11px;">${chk.latency_ms}ms</span>
-        </div>`;
-    }).join('') || '<div style="color:var(--text-muted); padding:12px;">No recent checks</div>';
-
     // CSS exposes `.modal-overlay` (fixed-position centering layer)
     // and `.modal` (inner card). Earlier this code set `class="modal
     // active"` on the outer div and `class="modal-content"` on the
@@ -60896,7 +60883,7 @@ async function showMonitorDetails(monitorId) {
                     </div>
                     <div>
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">Uptime (90 days)</div>
-                        <div style="font-size:16px; font-weight:600;">${(m.uptime_percent || 100).toFixed(2)}%</div>
+                        <div style="font-size:16px; font-weight:600;">${(m.uptime_percent ?? 100).toFixed(2)}%</div>
                     </div>
                     <div>
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">Check Interval</div>
@@ -60914,16 +60901,161 @@ async function showMonitorDetails(monitorId) {
                         ${checkDetails}
                     </div>
                 </div>
-                <div>
-                    <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Recent Checks</div>
-                    <div style="background:var(--bg-tertiary); padding:12px; border-radius:8px; max-height:200px; overflow-y:auto;">
-                        ${recentChecks}
-                    </div>
+                <div id="sp-mon-history" aria-live="polite">
+                    <div style="color:var(--text-muted); padding:12px;">Loading check history…</div>
                 </div>
             </div>
         </div>
     `;
     document.body.appendChild(modal);
+    loadMonitorHistory(mon.id);
+}
+
+// Result history for the details dialog: a pass/fail strip and a response-time
+// chart over every check this node still holds (up to 1,440, in memory since
+// the last restart), then the failed checks with their error text. Each node
+// runs its own checks, so the view is labelled with the node that made them.
+async function loadMonitorHistory(monitorId) {
+    const el = () => document.getElementById('sp-mon-history');
+    let data;
+    try {
+        const resp = await fetch(spUrl(`statuspage/monitors/${encodeURIComponent(monitorId)}/results`));
+        data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    } catch (e) {
+        if (el()) el().innerHTML = `<div role="alert" style="color:var(--danger); padding:12px;">Could not load check history: ${escapeHtml(e.message)}</div>`;
+        return;
+    }
+    if (!el()) return; // dialog closed while loading
+    renderMonitorHistory(el(), data);
+}
+
+function renderMonitorHistory(el, data) {
+    const results = data.results || [];
+    const OK = '#22c55e', FAIL = '#ef4444', LATENCY = '#3b82f6';
+    const fmtTime = ts => new Date(ts * 1000).toLocaleString();
+    const node = data.checked_by ? escapeHtml(data.checked_by) : 'this node';
+
+    if (!results.length) {
+        el.innerHTML = `<div style="color:var(--text-muted); padding:12px;">No checks recorded on ${node} yet.</div>`;
+        return;
+    }
+
+    const failed = results.filter(r => !r.success);
+    const failPct = (failed.length / results.length * 100).toFixed(2);
+
+    // Bucket into at most 180 columns so a full day of 60s checks stays legible.
+    const MAX_COLS = 180;
+    const per = Math.ceil(results.length / MAX_COLS);
+    const bins = [];
+    for (let i = 0; i < results.length; i += per) {
+        const chunk = results.slice(i, i + per);
+        const okLat = chunk.filter(r => r.success).map(r => r.latency_ms);
+        bins.push({
+            from: chunk[0].timestamp,
+            to: chunk[chunk.length - 1].timestamp,
+            count: chunk.length,
+            fails: chunk.filter(r => !r.success),
+            // Failed checks are left out: their "latency" is the timeout plus
+            // the retry, not a response time.
+            avg: okLat.length ? Math.round(okLat.reduce((a, b) => a + b, 0) / okLat.length) : null,
+            max: okLat.length ? Math.max(...okLat) : null,
+        });
+    }
+    const yMax = Math.max(1, ...bins.map(b => b.avg || 0));
+    const n = bins.length;
+
+    const strip = bins.map((b, i) =>
+        `<rect x="${i + 0.1}" y="0" width="0.8" height="1" fill="${b.fails.length ? FAIL : OK}"/>`).join('');
+    const bars = bins.map((b, i) => b.avg === null ? '' :
+        `<rect x="${i + 0.1}" y="${1 - b.avg / yMax}" width="0.8" height="${b.avg / yMax}" fill="${LATENCY}"/>`).join('');
+
+    const failRows = failed.slice().reverse().slice(0, 200).map(r => `
+        <div style="display:flex; gap:12px; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px;">
+            <span style="color:var(--text-muted); white-space:nowrap;">${escapeHtml(fmtTime(r.timestamp))}</span>
+            <span style="word-break:break-word;">${escapeHtml(r.error || 'No error recorded')}</span>
+        </div>`).join('');
+
+    const recentRows = results.slice(-20).reverse().map(r => `
+        <div style="display:flex; gap:12px; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px;">
+            <span style="color:${r.success ? OK : FAIL}; font-weight:600; min-width:48px;">${r.success ? '✓ OK' : '✗ Failed'}</span>
+            <span style="color:var(--text-muted); white-space:nowrap;">${escapeHtml(fmtTime(r.timestamp))}</span>
+            <span style="white-space:nowrap;">${r.latency_ms}ms</span>
+            ${r.success ? '' : `<span style="word-break:break-word;">${escapeHtml(r.error || '')}</span>`}
+        </div>`).join('');
+
+    const summary = `${results.length} checks by ${node} since ${escapeHtml(fmtTime(results[0].timestamp))} · ${failed.length} failed (${failPct}%)`;
+
+    el.innerHTML = `
+        <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Check History</div>
+        <div style="font-size:12px; margin-bottom:8px;">${summary}</div>
+        <div id="sp-hist-chart" tabindex="0" role="img" style="position:relative; outline-offset:2px;"
+             aria-label="Check history: ${escapeHtml(summary)}. Use the left and right arrow keys to step through it.">
+            <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-muted);">
+                <span>Result</span><span><span style="color:${OK};">■</span> OK &nbsp; <span style="color:${FAIL};">■</span> Failed</span>
+            </div>
+            <svg viewBox="0 0 ${n} 1" preserveAspectRatio="none" style="display:block; width:100%; height:14px; margin:2px 0 8px;" aria-hidden="true">${strip}</svg>
+            <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-muted);">
+                <span>Response time (successful checks)</span><span>${yMax}ms</span>
+            </div>
+            <svg viewBox="0 0 ${n} 1" preserveAspectRatio="none" style="display:block; width:100%; height:100px; margin-top:2px; border-bottom:1px solid var(--text-muted);" aria-hidden="true">
+                ${bars}<rect id="sp-hist-cursor" x="0" y="0" width="1" height="1" fill="currentColor" opacity="0" style="color:var(--text-primary);"/>
+            </svg>
+            <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-muted); margin-top:2px;">
+                <span>${escapeHtml(fmtTime(results[0].timestamp))}</span><span>${escapeHtml(fmtTime(results[results.length - 1].timestamp))}</span>
+            </div>
+            <div id="sp-hist-tip" style="display:none; position:absolute; z-index:5; pointer-events:none; max-width:280px; background:var(--bg-secondary); color:var(--text-primary); border:1px solid var(--border); border-radius:6px; padding:8px 10px; font-size:11px; box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
+        </div>
+        <div style="font-size:11px; color:var(--text-muted); margin:6px 0 16px;">
+            Each node runs its own checks; this is ${node}'s view. History is kept in memory and starts again when WolfStack restarts.
+        </div>
+        <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Failed Checks (${failed.length})</div>
+        <div style="background:var(--bg-tertiary); padding:8px 12px; border-radius:8px; max-height:180px; overflow-y:auto; margin-bottom:16px;">
+            ${failRows || '<div style="color:var(--text-muted); padding:6px 0; font-size:12px;">None</div>'}
+            ${failed.length > 200 ? `<div style="color:var(--text-muted); padding:6px 0; font-size:11px;">Showing the newest 200 of ${failed.length}.</div>` : ''}
+        </div>
+        <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Recent Checks</div>
+        <div style="background:var(--bg-tertiary); padding:8px 12px; border-radius:8px; max-height:200px; overflow-y:auto;">
+            ${recentRows}
+        </div>`;
+
+    const chart = el.querySelector('#sp-hist-chart');
+    const tip = el.querySelector('#sp-hist-tip');
+    const cursor = el.querySelector('#sp-hist-cursor');
+    let current = -1;
+    const show = i => {
+        current = Math.max(0, Math.min(n - 1, i));
+        const b = bins[current];
+        const when = b.count === 1 ? fmtTime(b.from) : `${fmtTime(b.from)} – ${fmtTime(b.to)}`;
+        const errs = [...new Set(b.fails.map(f => f.error || 'No error recorded'))];
+        tip.innerHTML = `<div style="font-weight:600; margin-bottom:4px;">${escapeHtml(when)}</div>
+            <div>${b.count} check${b.count === 1 ? '' : 's'} · <span style="color:${b.fails.length ? FAIL : 'inherit'};">${b.fails.length} failed</span></div>
+            <div>${b.avg === null ? 'No successful response' : `Response ${b.avg}ms avg${b.count > 1 ? `, ${b.max}ms max` : ''}`}</div>
+            ${errs.map(e => `<div style="margin-top:4px; word-break:break-word;">${escapeHtml(e)}</div>`).join('')}`;
+        tip.style.display = 'block';
+        cursor.setAttribute('x', current);
+        cursor.setAttribute('opacity', '0.15');
+        const w = chart.clientWidth;
+        const x = (current + 0.5) / n * w;
+        tip.style.top = '24px';
+        tip.style.left = Math.max(0, Math.min(w - tip.offsetWidth, x - tip.offsetWidth / 2)) + 'px';
+    };
+    const hide = () => { tip.style.display = 'none'; cursor.setAttribute('opacity', '0'); };
+    chart.addEventListener('mousemove', e => {
+        const r = chart.getBoundingClientRect();
+        show(Math.floor((e.clientX - r.left) / r.width * n));
+    });
+    chart.addEventListener('mouseleave', hide);
+    chart.addEventListener('blur', hide);
+    chart.addEventListener('keydown', e => {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            show(current < 0 ? n - 1 : current + (e.key === 'ArrowRight' ? 1 : -1));
+        } else if (e.key === 'Escape' && current >= 0) {
+            e.stopPropagation();
+            hide();
+        }
+    });
 }
 
 // ─── Monitor Form ───

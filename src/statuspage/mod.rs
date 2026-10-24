@@ -362,6 +362,13 @@ impl StatusPageState {
         worst
     }
 
+    /// Every check result this node still holds for a monitor, oldest first
+    /// (up to MAX_RESULTS). In memory only, so it starts again after a restart.
+    pub fn result_history(&self, monitor_id: &str) -> Vec<CheckResult> {
+        let results = self.results.read().unwrap();
+        results.get(monitor_id).map(|d| d.iter().cloned().collect()).unwrap_or_default()
+    }
+
     /// Get the latest check result for a monitor
     pub fn latest_result(&self, monitor_id: &str) -> Option<CheckResult> {
         let results = self.results.read().unwrap();
@@ -1167,8 +1174,10 @@ fn run_container_check(runtime: &str, name: &str) -> (bool, Option<String>) {
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if stdout == "true" {
                         (true, None)
-                    } else {
+                    } else if out.status.success() {
                         (false, Some(format!("Container not running (state: {})", stdout)))
+                    } else {
+                        (false, Some(format!("docker inspect failed: {}", command_failure(&out))))
                     }
                 }
                 Err(e) => (false, Some(format!("Docker error: {}", e))),
@@ -1183,8 +1192,10 @@ fn run_container_check(runtime: &str, name: &str) -> (bool, Option<String>) {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     if stdout.contains("RUNNING") {
                         (true, None)
+                    } else if out.status.success() {
+                        (false, Some(format!("Container not running ({})", stdout.trim())))
                     } else {
-                        (false, Some("Container not running".to_string()))
+                        (false, Some(format!("lxc-info failed: {}", command_failure(&out))))
                     }
                 }
                 Err(e) => (false, Some(format!("LXC error: {}", e))),
@@ -1192,6 +1203,16 @@ fn run_container_check(runtime: &str, name: &str) -> (bool, Option<String>) {
         }
         _ => (false, Some(format!("Unknown runtime: {}", runtime))),
     }
+}
+
+/// Exit status plus the first line of stderr, so a probe that failed to RUN
+/// (daemon busy, socket error) reads differently from a container that is
+/// genuinely stopped. Both used to be recorded as "Container not running".
+fn command_failure(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let first = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no error output");
+    let first: String = first.chars().take(200).collect();
+    format!("{} ({})", first, out.status)
 }
 
 /// Check WolfRun service health by counting running instances
