@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.40.0: monitor details show a check-history graph and why each check failed** _(2026-10-24 — [`af4d07e5`](https://github.com/intelligentwolf/WolfStack/commit/af4d07e5db0d4bbea5bdcc4a7ceb69634b54e588))_
 - **v25.39.1: stop trusting the compromised eMudhra CA** _(2026-10-23 — [`1888e5ba`](https://github.com/intelligentwolf/WolfStack/commit/1888e5bacd8378ff86fe7a976d4b337bccda63e4))_
 - **v25.39.0: upgrades no longer drop WolfNet; Upgrade All goes one at a time when WolfNet changes** _(2026-10-23 — [`9223cbb1`](https://github.com/intelligentwolf/WolfStack/commit/9223cbb1169b4c192285b64da2377738e234f20a))_
 - **v25.38.0: 2FA setup was invisible and leaked its secret to a QR service; monitor uptime history can be reset** _(2026-10-22 — [`fd5c0d37`](https://github.com/intelligentwolf/WolfStack/commit/fd5c0d37e21c341cc1798c87e73424dfa6262fcd))_
