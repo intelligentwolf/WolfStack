@@ -39280,6 +39280,25 @@ pub async fn statuspage_monitors_list(req: HttpRequest, state: web::Data<AppStat
     HttpResponse::Ok().json(serde_json::json!({ "monitors": monitors }))
 }
 
+/// GET /api/statuspage/monitors/{id}/results — every check result this node
+/// holds for one monitor, oldest first, for the details-page history graph.
+/// Each node checks independently, so `checked_by` names the node whose view
+/// this is; the history lives in memory and restarts with the service.
+pub async fn statuspage_monitor_results(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    if !state.statuspage.config.read().unwrap().monitors.iter().any(|m| m.id == id) {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Monitor not found" }));
+    }
+    let checked_by = state.cluster.get_node(&state.cluster.self_id)
+        .map(|n| n.hostname)
+        .unwrap_or_default();
+    HttpResponse::Ok().json(serde_json::json!({
+        "results": state.statuspage.result_history(&id),
+        "checked_by": checked_by,
+    }))
+}
+
 /// POST /api/statuspage/monitors — create or update a monitor
 pub async fn statuspage_monitor_save(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::statuspage::Monitor>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -49985,6 +50004,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/statuspage/monitors", web::get().to(statuspage_monitors_list))
         .route("/api/statuspage/monitors", web::post().to(statuspage_monitor_save))
         .route("/api/statuspage/monitors/{id}", web::delete().to(statuspage_monitor_delete))
+        .route("/api/statuspage/monitors/{id}/results", web::get().to(statuspage_monitor_results))
         .route("/api/statuspage/monitors/{id}/reset-history", web::post().to(statuspage_monitor_reset_history))
         .route("/api/statuspage/pages", web::get().to(statuspage_pages_list))
         .route("/api/statuspage/pages", web::post().to(statuspage_page_save))
