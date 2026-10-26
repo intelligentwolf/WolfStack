@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use crate::networking::NetworkInterface;
 
 pub mod proposal;
+pub mod capped_exec;
 pub mod ack;
 pub mod metrics;
 pub mod disk_verdict;
