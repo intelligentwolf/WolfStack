@@ -100,7 +100,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -693,39 +692,11 @@ fn kev_path() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------
-// Subprocess helper (mirrors vulnerability::run_capped)
+// Subprocess helper — see predictive::capped_exec
 // ---------------------------------------------------------------------
 
 fn run_capped(prog: &str, args: &[&str], timeout: Duration) -> Option<String> {
-    use std::io::Read;
-    let mut child = Command::new(prog)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let mut buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut buf);
-                }
-                return Some(buf);
-            }
-            Ok(Some(_)) => return None,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => return None,
-        }
-    }
+    crate::predictive::capped_exec::run_ok(prog, args, timeout)
 }
 
 // ---------------------------------------------------------------------

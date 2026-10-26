@@ -114,44 +114,10 @@ pub fn parse_failed_boot_units(output: &str) -> Vec<String> {
     out
 }
 
-/// Capped exec — same pattern as vulnerability::run_capped (kept local:
-/// analyzers are deliberately self-contained). Returns stdout on exit 0,
-/// None on non-zero/timeout/spawn failure; kills the child on timeout.
+/// Capped exec via the shared `predictive::capped_exec` helper. Returns
+/// stdout on exit 0, None on non-zero/timeout/spawn failure.
 fn run_capped(prog: &str, args: &[&str], timeout: Duration) -> Option<String> {
-    use std::io::Read;
-    use std::time::Instant;
-    let mut child = std::process::Command::new(prog)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let mut buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut buf);
-                }
-                return Some(buf);
-            }
-            Ok(Some(_)) => return None,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
+    crate::predictive::capped_exec::run_ok(prog, args, timeout)
 }
 
 /// Per-container probe budget. `systemctl --failed` inside a healthy
