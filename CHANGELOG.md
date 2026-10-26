@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.40.1: Docker CVE scans and OSV inventories no longer time out on large output** _(2026-10-26 — [`f690a79c`](https://github.com/intelligentwolf/WolfStack/commit/f690a79c58348002da5e43fffc203b752bc4d5cd))_
 - **v25.40.0: monitor details show a check-history graph and why each check failed** _(2026-10-24 — [`af4d07e5`](https://github.com/intelligentwolf/WolfStack/commit/af4d07e5db0d4bbea5bdcc4a7ceb69634b54e588))_
 - **v25.39.1: stop trusting the compromised eMudhra CA** _(2026-10-23 — [`1888e5ba`](https://github.com/intelligentwolf/WolfStack/commit/1888e5bacd8378ff86fe7a976d4b337bccda63e4))_
 - **v25.39.0: upgrades no longer drop WolfNet; Upgrade All goes one at a time when WolfNet changes** _(2026-10-23 — [`9223cbb1`](https://github.com/intelligentwolf/WolfStack/commit/9223cbb1169b4c192285b64da2377738e234f20a))_
