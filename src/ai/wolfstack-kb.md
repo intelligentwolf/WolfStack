@@ -461,7 +461,8 @@ Separate from commercial licences — donations fund development and grant in-ap
 - Plugins run as root — sandboxed only by Unix permissions, so trust matters
 
 ## Clustering
-- Nodes discover each other via HTTP polling every 10 seconds
+- Nodes discover each other via HTTP polling every 10 seconds (GET /api/agent/status, zstd-compressed; gossiped node lists carry no per-node metrics)
+- **Low-traffic mode / cluster polling interval** (for Wi-Fi, metered or slow-link nodes): node settings → "Cluster polling" = every 10s (default), 30s, 1 min or 2 min. Owned by that node (`/etc/wolfstack/self_poll_interval.json`, `POST /api/settings/poll-interval`) and advertised in its status report, so ONE setting slows polling in BOTH directions — the node polls its peers that slowly and every peer polls it that slowly (the slower end of each link wins). Trade-offs: that node's status/metrics/offline detection lag by up to the interval; its online window widens to 2×interval+30s (60s at default); WolfHA waits that long before treating it as down. Peers on older versions ignore the setting and keep polling every 10s. Max is 2 min. Not affected: the 30s WolfNet route sync (`/api/wolfnet/active-ips`, tiny) and dashboard traffic while someone has the UI open
 - Cluster secret for inter-node authentication (default secret used if no custom-cluster-secret file — flagged by the secret audit)
 - Node proxy: /api/nodes/{id}/proxy/{path} forwards API calls to remote nodes
 - Join failures list EVERY URL tried with its error (not just the last fallback)

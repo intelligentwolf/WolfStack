@@ -222,6 +222,23 @@ impl Drop for FirstPollMark {
 static POLL_FAIL_COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// When each peer was last polled (node id → instant), so a peer in
+/// low-traffic mode is skipped on ticks before its interval is up.
+static LAST_POLL_ATTEMPT: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// True when a peer polled `elapsed` ago is due again at `interval_secs`.
+/// Half a tick of slack, because the loop sleeps 10s AFTER each cycle — a
+/// strict comparison would push a 30s interval out to 40s. A peer at the
+/// default cadence is due on every tick, exactly as before low-traffic mode.
+fn poll_due(elapsed: Option<Duration>, interval_secs: u64) -> bool {
+    if interval_secs <= DEFAULT_POLL_INTERVAL_SECS { return true; }
+    match elapsed {
+        None => true,
+        Some(e) => e.as_secs() + DEFAULT_POLL_INTERVAL_SECS / 2 >= interval_secs,
+    }
+}
+
 /// A tier role an operator can assign to a node so it serves ONE part of an
 /// HA hosting stack (NoroNetwork 2026-07-09). A node's roles are the keystone
 /// the DNS / mail / ingress / host tiers dispatch on: config for a subsystem
@@ -409,6 +426,51 @@ pub struct Node {
     /// Backward-compat: missing for older configs and older peers → empty Vec.
     #[serde(default)]
     pub roles: Vec<NodeRole>,
+    /// Low-traffic mode: how often this node's cluster status is exchanged,
+    /// in seconds. Persisted on the OWNING node (`self_poll_interval.json`)
+    /// and carried in its StatusReport, so one setting slows the polling in
+    /// BOTH directions — the owner polls its peers this slowly, and every
+    /// peer polls the owner this slowly. `None` = the default 10s cadence.
+    /// Only values in `POLL_INTERVAL_CHOICES` are ever stored.
+    ///
+    /// Backward-compat: missing for older configs and older peers → `None`;
+    /// an older peer ignores the field and keeps polling every 10s.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// The cluster poll loop's tick. Every peer is polled on every tick unless
+/// either end has asked for low-traffic mode (`Node::poll_interval_secs`).
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 10;
+
+/// Every poll interval an operator can pick. Capped at 120s so a slow-polled
+/// node's online window (`online_window_secs`, 270s at 120s) stays inside the
+/// 300s freshness filters the fan-out endpoints apply (api/mod.rs) — a longer
+/// interval would make a healthy node vanish from those between polls.
+pub const POLL_INTERVAL_CHOICES: [u64; 4] = [DEFAULT_POLL_INTERVAL_SECS, 30, 60, 120];
+
+/// Normalise a poll interval for storage: a non-default choice is kept, the
+/// default and anything outside `POLL_INTERVAL_CHOICES` become `None`. Peer
+/// reports go through this too, so a newer peer advertising a value this
+/// build doesn't know falls back to the default instead of being trusted.
+pub fn normalize_poll_interval(secs: Option<u64>) -> Option<u64> {
+    secs.filter(|s| *s != DEFAULT_POLL_INTERVAL_SECS && POLL_INTERVAL_CHOICES.contains(s))
+}
+
+/// How long after its last successful poll a node still counts as online.
+/// At the default 10s interval this is the long-standing 60s. A slower
+/// interval widens it to two missed polls plus slack, so a low-traffic node
+/// isn't shown offline (or treated as dead by WolfHA) between polls.
+pub fn online_window_secs(poll_interval_secs: u64) -> u64 {
+    (poll_interval_secs * 2 + 30).max(60)
+}
+
+/// The interval at which this node polls a given peer: the slower of the
+/// two ends' low-traffic settings, so either node can ask for less traffic
+/// on the link and it is honoured from both sides.
+pub fn effective_poll_interval(self_interval: Option<u64>, peer_interval: Option<u64>) -> u64 {
+    normalize_poll_interval(self_interval).unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
+        .max(normalize_poll_interval(peer_interval).unwrap_or(DEFAULT_POLL_INTERVAL_SECS))
 }
 
 impl Node {
@@ -853,6 +915,10 @@ impl ClusterState {
             .map(|n| n.roles.clone())
             .filter(|r| !r.is_empty())
             .unwrap_or_else(Self::load_self_roles);
+        // Low-traffic poll interval: in-memory then disk, same as site.
+        let prev_poll_interval = nodes.get(&self.self_id)
+            .and_then(|n| n.poll_interval_secs)
+            .or_else(Self::load_self_poll_interval);
         let prev_manager = nodes.get(&self.self_id).map(|n| n.manager).unwrap_or(true);
         nodes.insert(self.self_id.clone(), Node {
             id: self.self_id.clone(),
@@ -899,6 +965,7 @@ impl ClusterState {
             site: prev_site,
             display_name: prev_display_name,
             roles: prev_roles,
+            poll_interval_secs: prev_poll_interval,
         });
 
         // Self-heal: drop any NON-self entry previously saved under one of our
@@ -963,6 +1030,7 @@ impl ClusterState {
             || old.site != new.site
             || old.display_name != new.display_name
             || old.roles != new.roles
+            || old.poll_interval_secs != new.poll_interval_secs
             || old.tls != new.tls
             || old.has_docker != new.has_docker
             || old.has_lxc != new.has_lxc
@@ -985,6 +1053,7 @@ impl ClusterState {
         // Find self node's hostname and port for dedup
         let self_hostname = nodes.get(&self.self_id).map(|n| n.hostname.clone()).unwrap_or_default();
         let self_port = self.port;
+        let self_interval = nodes.get(&self.self_id).and_then(|n| n.poll_interval_secs);
         nodes.values().filter(|n| {
             // Filter out non-self wolfstack nodes that are actually us (duplicate from gossip)
             if !n.is_self && n.id != self.self_id && n.node_type == "wolfstack"
@@ -995,7 +1064,8 @@ impl ClusterState {
         }).map(|n| {
             let mut node = n.clone();
             if !node.is_self {
-                node.online = now - node.last_seen < 60;
+                let window = online_window_secs(effective_poll_interval(self_interval, node.poll_interval_secs));
+                node.online = now.saturating_sub(node.last_seen) < window;
             }
             node
         }).collect()
@@ -1140,6 +1210,8 @@ impl ClusterState {
             display_name: None,
             // Roles likewise arrive from the peer's own self-report.
             roles: Vec::new(),
+            // So does a low-traffic poll interval; default until then.
+            poll_interval_secs: None,
         });
         drop(nodes);
         self.save_nodes();
@@ -1658,6 +1730,53 @@ impl ClusterState {
             }
     }
 
+    fn self_poll_interval_file() -> String { crate::paths::get().self_poll_interval_config }
+
+    /// Load the persisted low-traffic poll interval. `None` for a missing,
+    /// malformed or out-of-range file — the default 10s cadence.
+    fn load_self_poll_interval() -> Option<u64> {
+        std::fs::read_to_string(Self::self_poll_interval_file()).ok()
+            .and_then(|data| serde_json::from_str::<u64>(&data).ok())
+            .and_then(|secs| normalize_poll_interval(Some(secs)))
+    }
+
+    /// Set this node's low-traffic poll interval in memory and on disk.
+    /// `None` (or the default) removes the file, restoring the 10s cadence.
+    /// Returns the error text when the file could not be written, so the
+    /// caller can tell the operator the setting won't survive a restart.
+    pub fn set_self_poll_interval(&self, secs: Option<u64>) -> Result<(), String> {
+        let secs = normalize_poll_interval(secs);
+        if let Some(node) = self.nodes_write().get_mut(&self.self_id) {
+            node.poll_interval_secs = secs;
+        }
+        let path = Self::self_poll_interval_file();
+        match secs {
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("could not remove {}: {}", path, e)),
+            },
+            Some(s) => {
+                if let Some(dir) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                std::fs::write(&path, s.to_string())
+                    .map_err(|e| format!("could not write {}: {}", path, e))
+            }
+        }
+    }
+
+    /// This node's own low-traffic poll interval (`None` = default).
+    pub fn self_poll_interval(&self) -> Option<u64> {
+        self.nodes_read().get(&self.self_id).and_then(|n| n.poll_interval_secs)
+    }
+
+    /// How long `node` stays online after its last successful poll, given
+    /// both ends' poll intervals — see `online_window_secs`.
+    pub fn online_window_for(&self, node: &Node) -> u64 {
+        online_window_secs(effective_poll_interval(self.self_poll_interval(), node.poll_interval_secs))
+    }
+
     fn self_roles_file() -> String { crate::paths::get().self_roles_config }
 
     /// Load persisted self roles from disk. Empty vec for missing/malformed —
@@ -1823,6 +1942,12 @@ pub struct StatusReport {
     /// older peers → general-purpose node.
     #[serde(default)]
     pub roles: Vec<NodeRole>,
+    /// Sender's low-traffic poll interval — see `Node::poll_interval_secs`.
+    /// `None` from older peers and from nodes on the default cadence —
+    /// and omitted on the wire then, so a default node's report is
+    /// byte-for-byte what it was before low-traffic mode existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
     /// Enterprise license key — propagated to cluster nodes that don't have one
     #[serde(default)]
     pub license_key: Option<String>,
@@ -2256,20 +2381,65 @@ pub async fn sweep_replicate_control_plane(cluster: Arc<ClusterState>, cluster_s
     }
 }
 
+/// Largest status report accepted from a peer once decompressed. Far above
+/// any real report; it bounds what a malformed or hostile zstd stream can
+/// make this node allocate.
+const MAX_STATUS_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a peer's `/api/agent/status` response. Always consumes the body, so
+/// the connection is released whatever the outcome.
+async fn read_status_report(resp: reqwest::Response) -> Result<AgentMessage, String> {
+    let encoding = resp.headers().get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+    decode_status_body(encoding.as_deref(), &body)
+}
+
+/// Decode a status body by its `Content-Encoding`. No header (an older peer,
+/// or one that chose not to compress) is plain JSON; zstd is what the poll
+/// asks for; anything else is refused rather than mis-parsed.
+fn decode_status_body(content_encoding: Option<&str>, body: &[u8]) -> Result<AgentMessage, String> {
+    use std::io::Read;
+    match content_encoding.map(str::trim) {
+        None | Some("") => serde_json::from_slice(body).map_err(|e| e.to_string()),
+        Some(e) if e.eq_ignore_ascii_case("identity") => serde_json::from_slice(body).map_err(|e| e.to_string()),
+        Some(e) if e.eq_ignore_ascii_case("zstd") => {
+            let mut json = Vec::new();
+            zstd::stream::read::Decoder::new(body)
+                .map_err(|e| e.to_string())?
+                .take(MAX_STATUS_BODY_BYTES + 1)
+                .read_to_end(&mut json)
+                .map_err(|e| e.to_string())?;
+            if json.len() as u64 > MAX_STATUS_BODY_BYTES {
+                return Err(format!("status report exceeds {} bytes decompressed", MAX_STATUS_BODY_BYTES));
+            }
+            serde_json::from_slice(&json).map_err(|e| e.to_string())
+        }
+        Some(other) => Err(format!("unsupported Content-Encoding '{}'", other)),
+    }
+}
+
 /// Poll remote nodes for their status
 pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: String, ai_agent: Option<Arc<crate::ai::AiAgent>>) {
     let _first_poll_mark = FirstPollMark;
     // Snapshot previous online state BEFORE polling
+    let self_interval = cluster.self_poll_interval();
     let previous_states: HashMap<String, (bool, String)> = {
         let nodes = cluster.nodes_read();
         let now = now_unix();
         nodes.values()
             .filter(|n| !n.is_self)
-            .map(|n| (n.id.clone(), (now - n.last_seen < 60, n.hostname.clone())))
+            .map(|n| {
+                let window = online_window_secs(effective_poll_interval(self_interval, n.poll_interval_secs));
+                (n.id.clone(), (now.saturating_sub(n.last_seen) < window, n.hostname.clone()))
+            })
             .collect()
     };
 
     let nodes = cluster.get_all_nodes();
+    // Forget poll timestamps of nodes that have since been removed.
+    LAST_POLL_ATTEMPT.lock().unwrap().retain(|id, _| nodes.iter().any(|n| &n.id == id));
     // Our own addresses (every NIC) + the endpoints already polled this cycle,
     // so the loop never contacts itself or the same endpoint twice (storm guard).
     let local_ips = local_ipv4_addrs();
@@ -2301,6 +2471,17 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
         // distinct, non-local endpoint is always polled.
         if local_ips.contains(&node.address) { continue; }
         if !polled_endpoints.insert((node.address.clone(), node.port)) { continue; }
+
+        // Low-traffic mode: skip this peer until its interval is up. Safe for
+        // routing — a peer not polled this cycle keeps its existing WolfNet
+        // routes (it never enters `fresh_hosts` below), and its online state
+        // is judged against the matching wider window (`online_window_secs`).
+        {
+            let interval = effective_poll_interval(self_interval, node.poll_interval_secs);
+            let mut attempts = LAST_POLL_ATTEMPT.lock().unwrap();
+            if !poll_due(attempts.get(&node.id).map(|t| t.elapsed()), interval) { continue; }
+            attempts.insert(node.id.clone(), std::time::Instant::now());
+        }
 
         // ── Poll WolfStack node via agent ──
         // v23.12: HTTPS-first via build_node_urls. CA-signed-cert peers no
@@ -2357,6 +2538,13 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
         for url in &urls {
             match client.get(url)
                 .peer_auth(&cluster_secret)
+                // Every listener wraps actix's Compress middleware, but the
+                // reqwest build has no decompression features, so the poll
+                // never asked and every status report crossed the wire as
+                // plain JSON. Asking for zstd and decoding it ourselves
+                // (`read_status_report`) keeps decompression confined to
+                // this one call instead of switching it on for every client.
+                .header(reqwest::header::ACCEPT_ENCODING, "zstd")
                 .send().await
             {
                 Ok(resp) => {
@@ -2395,9 +2583,9 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         let _ = resp.bytes().await;
                         continue;
                     }
-                    if let Ok(msg) = resp.json::<AgentMessage>().await
+                    if let Ok(msg) = read_status_report(resp).await
                         && let AgentMessage::StatusReport(report) = msg {
-                            let StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, wolfnet_reserved_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, license_key, pubkey: peer_pubkey } = *report;
+                            let StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, wolfnet_reserved_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, poll_interval_secs: peer_poll_interval, license_key, pubkey: peer_pubkey } = *report;
                             let now = now_unix();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -2490,6 +2678,11 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 // too — trust the self-report. Empty = a
                                 // general-purpose node (or an older peer).
                                 roles: peer_roles,
+                                // Owner-authoritative like roles: the peer
+                                // asked for low-traffic mode, so poll it at
+                                // its interval. Normalised so an unknown
+                                // value from a newer build falls back to 10s.
+                                poll_interval_secs: normalize_poll_interval(peer_poll_interval),
                                 // Pin the peer's key on first sight (TOFU over
                                 // the same channel the cluster already trusts).
                                 // A DIFFERENT key later is never adopted
@@ -3167,6 +3360,94 @@ mod role_tests {
         }
         let old: OldNodeShape = serde_json::from_str("{}").unwrap();
         assert!(old.roles.is_empty());
+    }
+
+    #[test]
+    fn status_report_carries_poll_interval_and_tolerates_its_absence() {
+        // Older peer: no field → default cadence.
+        let msg: AgentMessage = serde_json::from_value(status_report_fixture()).unwrap();
+        let AgentMessage::StatusReport(report) = msg else { panic!("not a StatusReport") };
+        assert_eq!(report.poll_interval_secs, None);
+        // Low-traffic peer: the field round-trips.
+        let mut fixture = status_report_fixture();
+        fixture["StatusReport"]["poll_interval_secs"] = serde_json::json!(60);
+        let msg: AgentMessage = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&msg).unwrap(), fixture);
+    }
+}
+
+#[cfg(test)]
+mod low_traffic_tests {
+    use super::*;
+
+    #[test]
+    fn only_known_non_default_intervals_are_stored() {
+        assert_eq!(normalize_poll_interval(None), None);
+        assert_eq!(normalize_poll_interval(Some(DEFAULT_POLL_INTERVAL_SECS)), None);
+        assert_eq!(normalize_poll_interval(Some(30)), Some(30));
+        assert_eq!(normalize_poll_interval(Some(120)), Some(120));
+        // A value from a newer build, or a hand-edited file, is not trusted.
+        assert_eq!(normalize_poll_interval(Some(45)), None);
+        assert_eq!(normalize_poll_interval(Some(0)), None);
+        assert_eq!(normalize_poll_interval(Some(86_400)), None);
+    }
+
+    #[test]
+    fn the_slower_end_sets_the_link_interval() {
+        assert_eq!(effective_poll_interval(None, None), 10);
+        assert_eq!(effective_poll_interval(Some(60), None), 60);
+        assert_eq!(effective_poll_interval(None, Some(120)), 120);
+        assert_eq!(effective_poll_interval(Some(30), Some(120)), 120);
+        assert_eq!(effective_poll_interval(Some(45), None), 10);
+    }
+
+    #[test]
+    fn online_window_is_unchanged_by_default_and_widens_with_the_interval() {
+        // The long-standing 60s at the default cadence.
+        assert_eq!(online_window_secs(DEFAULT_POLL_INTERVAL_SECS), 60);
+        for secs in POLL_INTERVAL_CHOICES {
+            let window = online_window_secs(secs);
+            // Room for one missed poll, so a healthy node never flaps offline.
+            assert!(window > secs * 2, "{}s interval → {}s window", secs, window);
+            // Inside the 300s freshness filters on the fan-out endpoints.
+            assert!(window < 300, "{}s interval → {}s window", secs, window);
+        }
+    }
+
+    #[test]
+    fn poll_due_respects_the_interval_with_half_a_tick_of_slack() {
+        assert!(poll_due(None, 120));
+        assert!(poll_due(Some(Duration::from_secs(0)), 10));
+        assert!(!poll_due(Some(Duration::from_secs(20)), 30));
+        // The loop sleeps 10s after a cycle, so ~30s later must count as due.
+        assert!(poll_due(Some(Duration::from_secs(26)), 30));
+        assert!(!poll_due(Some(Duration::from_secs(100)), 120));
+        assert!(poll_due(Some(Duration::from_secs(116)), 120));
+    }
+
+    fn sample_message() -> AgentMessage {
+        AgentMessage::StatusRequest
+    }
+
+    #[test]
+    fn status_body_decodes_plain_and_zstd() {
+        let json = serde_json::to_vec(&sample_message()).unwrap();
+        assert!(matches!(decode_status_body(None, &json), Ok(AgentMessage::StatusRequest)));
+        assert!(matches!(decode_status_body(Some("identity"), &json), Ok(AgentMessage::StatusRequest)));
+        let packed = zstd::encode_all(&json[..], 3).unwrap();
+        assert!(matches!(decode_status_body(Some("zstd"), &packed), Ok(AgentMessage::StatusRequest)));
+        assert!(matches!(decode_status_body(Some(" ZSTD "), &packed), Ok(AgentMessage::StatusRequest)));
+    }
+
+    #[test]
+    fn status_body_refuses_unasked_encodings_and_bombs() {
+        let json = serde_json::to_vec(&sample_message()).unwrap();
+        assert!(decode_status_body(Some("br"), &json).is_err());
+        assert!(decode_status_body(Some("zstd"), &json).is_err(), "plain JSON is not a zstd frame");
+        // A tiny frame that inflates past the cap is rejected, not buffered.
+        let bomb = zstd::encode_all(&vec![b' '; (MAX_STATUS_BODY_BYTES + 1024) as usize][..], 19).unwrap();
+        assert!(bomb.len() < 1024 * 1024);
+        assert!(decode_status_body(Some("zstd"), &bomb).unwrap_err().contains("exceeds"));
     }
 }
 
