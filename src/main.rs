@@ -2690,7 +2690,18 @@ async fn main() -> std::io::Result<()> {
                 // Cache the agent status report for instant polling responses
                 let self_id = cluster_clone.self_id.clone();
                 let hostname = metrics.hostname.clone();
-                let known_nodes = cluster_clone.get_all_nodes();
+                // Gossip copies of the other nodes WITHOUT their metrics. A
+                // receiver only takes identity fields from these entries
+                // (address, hostname, cluster, display name — agent/mod.rs
+                // gossip merge); every node's metrics come from polling that
+                // node directly. Shipping every node's disks and NICs in every
+                // report made each poll grow with cluster size — the bulk of
+                // a constrained node's polling traffic (RutgerDiehard
+                // 2026-10-28: ~6 GB/day over Wi-Fi on a mostly idle node).
+                let known_nodes: Vec<agent::Node> = cluster_clone.get_all_nodes()
+                    .into_iter()
+                    .map(|mut n| { n.metrics = None; n })
+                    .collect();
                 let deleted_ids = cluster_clone.get_deleted_ids();
                 let msg = agent::AgentMessage::StatusReport(Box::new(agent::StatusReport {
                     node_id: self_id,
@@ -2719,6 +2730,9 @@ async fn main() -> std::io::Result<()> {
                     // Self's assigned tier roles — gossiped so peers know the
                     // DNS / mail / ingress / host tier membership.
                     roles: cluster_clone.get_node(&cluster_clone.self_id).map(|n| n.roles).unwrap_or_default(),
+                    // Self's low-traffic poll interval — peers poll this
+                    // node no faster than this (None = default 10s).
+                    poll_interval_secs: cluster_clone.self_poll_interval(),
                     // Propagate license to cluster nodes
                     license_key: if crate::compat::platform_ready() {
                         std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
@@ -2757,7 +2771,9 @@ async fn main() -> std::io::Result<()> {
         let ai_agent_poll = ai_agent.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // The loop ticks at the default cadence; peers in low-traffic
+                // mode are skipped inside poll_remote_nodes until due.
+                tokio::time::sleep(Duration::from_secs(agent::DEFAULT_POLL_INTERVAL_SECS)).await;
                 let secret = auth::load_cluster_secret();
                 agent::poll_remote_nodes(cluster_poll.clone(), secret, Some(ai_agent_poll.clone())).await;
             }

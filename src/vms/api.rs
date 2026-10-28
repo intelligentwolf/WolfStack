@@ -1455,6 +1455,7 @@ async fn vm_migrate(
                     site: None,
                     display_name: None,
                     roles: Vec::new(),
+                    poll_interval_secs: None,
                 }
             } else {
                 return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));

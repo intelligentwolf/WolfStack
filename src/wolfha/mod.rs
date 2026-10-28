@@ -3516,12 +3516,16 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
                     // get_node() returns the STORED online flag, which can
                     // stay true long after a node dies — only get_all_nodes()
                     // recomputes it from last_seen (agent/mod.rs). Recompute
-                    // here the same way (fresh within 60s = alive); trusting
-                    // the stored flag blocked auto-failover for 30+ minutes
-                    // in the 2026-08-08 live test.
+                    // here the same way (fresh within the node's online window
+                    // = alive); trusting the stored flag blocked auto-failover
+                    // for 30+ minutes in the 2026-08-08 live test. The window
+                    // is 60s at the default poll rate and wider for a node in
+                    // low-traffic mode — its last_seen legitimately ages
+                    // longer between polls, and reading that as "dead" would
+                    // promote over a healthy primary.
                     if let Some(n) = cluster.get_node(&primary.node_id)
                         && n.online
-                        && now_unix().saturating_sub(n.last_seen) < 60
+                        && now_unix().saturating_sub(n.last_seen) < cluster.online_window_for(&n)
                     {
                         alert_once(&format!("asym:{}", c),
                             &format!("WolfHA cannot verify primary of '{}'", c),

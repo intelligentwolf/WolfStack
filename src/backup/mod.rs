@@ -7556,6 +7556,7 @@ const MACHINE_SPECIFIC_CONFIG: &[&str] = &[
     "etc/wolfstack/self_cluster.json",
     "etc/wolfstack/self_site.json",
     "etc/wolfstack/self_display_name.json",
+    "etc/wolfstack/self_poll_interval.json",
     "etc/wolfstack/cert.pem",
     "etc/wolfstack/key.pem",
     "etc/wolfstack/ip-mappings.json",

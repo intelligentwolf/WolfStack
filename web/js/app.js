@@ -17474,6 +17474,15 @@ function openNodeSettings(nodeId) {
                 </div>`}
                 ${isPve ? '' : `
                 <div class="form-group">
+                    <label for="node-settings-poll-interval">Cluster polling</label>
+                    <select class="form-control" id="node-settings-poll-interval" aria-describedby="node-settings-poll-interval-help" data-current="${escapeAttr(String(node.poll_interval_secs || 10))}">
+                        ${[[10, 'Every 10 seconds (default)'], [30, 'Every 30 seconds'], [60, 'Every minute'], [120, 'Every 2 minutes']]
+                .map(([v, label]) => `<option value="${v}"${(node.poll_interval_secs || 10) === v ? ' selected' : ''}>${label}</option>`).join('')}
+                    </select>
+                    <small id="node-settings-poll-interval-help" style="color: var(--text-muted);">Low-traffic mode for nodes on Wi-Fi, metered or slow links. This node and every other node exchange status with it this often, in both directions. Slower polling cuts cluster traffic to and from this node, but its status, metrics and offline detection lag by up to the interval, and WolfHA waits longer before treating it as down.</small>
+                </div>`}
+                ${isPve ? '' : `
+                <div class="form-group">
                     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
                         <input type="checkbox" id="node-settings-manager" ${node.manager === false ? '' : 'checked'}>
                         Manager node — may forward operator actions to other nodes
@@ -17880,6 +17889,11 @@ async function saveNodeSettings() {
         }
     }
 
+    const pollEl = document.getElementById('node-settings-poll-interval');
+    if (pollEl && pollEl.value !== pollEl.getAttribute('data-current')) {
+        updates.poll_interval_secs = parseInt(pollEl.value, 10);
+    }
+
     const managerEl = document.getElementById('node-settings-manager');
     if (managerEl) {
         const node = allNodes.find(n => n.id === nodeId);
@@ -17902,9 +17916,15 @@ async function saveNodeSettings() {
             const data = await resp.json().catch(() => ({}));
             // The backend queues identity edits (display name / cluster move)
             // for offline owners and applies them on reconnect.
-            showToast(data.queued
-                ? 'Saved — will apply when the node reconnects'
-                : 'Node settings updated', 'success');
+            // A failed poll interval gets its own error toast below; don't
+            // pair it with a green "updated" when it was the only change.
+            const onlyPollFailed = data.poll_interval_error
+                && Object.keys(updates).every(k => k === 'poll_interval_secs');
+            if (!onlyPollFailed) {
+                showToast(data.queued
+                    ? 'Saved — will apply when the node reconnects'
+                    : (data.poll_interval_error ? 'Other node settings updated' : 'Node settings updated'), 'success');
+            }
             // Manager policy is enforced by the OTHER nodes; say which ones
             // did not take it (a demoted node cannot re-promote itself —
             // change it from a manager node).
@@ -17912,6 +17932,12 @@ async function saveNodeSettings() {
                 showToast('Manager setting saved here but not applied on: '
                     + data.policy_push_failed.map(f => f.node + ' (' + f.error + ')').join('; ')
                     + '. Change it from a manager node.', 'error');
+            }
+            // The interval belongs to the node it describes; if that node
+            // didn't take it (or couldn't save it), the edit will not stick —
+            // say so, and leave it on screen until dismissed.
+            if (data.poll_interval_error) {
+                showToast('Cluster polling: ' + data.poll_interval_error + '.', 'error', 0);
             }
         } else {
             const err = await resp.json().catch(() => ({}));

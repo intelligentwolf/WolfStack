@@ -1913,6 +1913,26 @@ pub async fn set_roles(req: HttpRequest, state: web::Data<AppState>, body: web::
     HttpResponse::Ok().json(serde_json::json!({ "roles": roles }))
 }
 
+/// POST /api/settings/poll-interval — set THIS node's low-traffic poll
+/// interval. Called by the node where an admin edited it (see
+/// `update_node_settings`). Body: `{"poll_interval_secs": 60}`; 10 restores
+/// the default cadence. Takes effect on the next poll tick and is advertised
+/// to every peer in this node's next status report.
+pub async fn set_poll_interval(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let Some(secs) = body.get("poll_interval_secs").and_then(|v| v.as_u64())
+        .filter(|s| crate::agent::POLL_INTERVAL_CHOICES.contains(s))
+    else {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("poll_interval_secs must be one of {:?}", crate::agent::POLL_INTERVAL_CHOICES)
+        }));
+    };
+    match state.cluster.set_self_poll_interval(Some(secs)) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "poll_interval_secs": secs })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
 /// GET /api/cluster/roles/available — the assignable tier roles (value +
 /// label) for the node-settings role picker.
 pub async fn cluster_roles_available(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
@@ -5714,6 +5734,12 @@ pub struct UpdateNodeSettings {
     /// `cluster_node_policy_receive`).
     #[serde(default)]
     pub manager: Option<bool>,
+    /// Low-traffic poll interval in seconds — see
+    /// `agent::Node::poll_interval_secs`. Must be one of
+    /// `agent::POLL_INTERVAL_CHOICES`; 10 restores the default. `None` (field
+    /// absent) leaves it unchanged.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
 }
 
 pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateNodeSettings>) -> HttpResponse {
@@ -5744,6 +5770,13 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
         && dn.len() > 64 {
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": "display name too long (max 64 chars)"
+            }));
+        }
+
+    if let Some(secs) = body.poll_interval_secs
+        && !crate::agent::POLL_INTERVAL_CHOICES.contains(&secs) {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("poll interval must be one of {:?} seconds", crate::agent::POLL_INTERVAL_CHOICES)
             }));
         }
 
@@ -5984,9 +6017,71 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
                         let _ = crate::agent::push_identity_to_node(&node, &intent, &secret).await;
                     });
                 }
+        // Low-traffic poll interval: owned by the node it describes, like
+        // roles. Set here for self; for a remote, push to the owner so it
+        // slows ITS polling and advertises the interval to every other peer,
+        // and mirror it into this node's view once the owner accepts. Awaited, not spawned: an owner
+        // that didn't take it would re-advertise its old interval on its
+        // next report and silently undo the edit, so the operator must hear.
+        let mut poll_interval_error: Option<String> = None;
+        if let Some(secs) = body.poll_interval_secs {
+            let target = state.cluster.get_node(&id).filter(|n| n.node_type == "wolfstack");
+            match target {
+                Some(node) if node.is_self => {
+                    if let Err(e) = state.cluster.set_self_poll_interval(Some(secs)) {
+                        poll_interval_error = Some(format!(
+                            "applied for now but not saved ({}), so it will return to the default after a restart", e));
+                    }
+                }
+                Some(node) => {
+                    let payload = serde_json::json!({ "poll_interval_secs": secs });
+                    let mut last = String::from("unreachable");
+                    let mut delivered = false;
+                    for url in build_node_urls(&node.address, node.port, "/api/settings/poll-interval") {
+                        match API_HTTP_CLIENT.post(&url)
+                            .timeout(std::time::Duration::from_secs(5))
+                            .peer_auth(&state.cluster_secret)
+                            .json(&payload)
+                            .send().await
+                        {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let text = resp.text().await.unwrap_or_default();
+                                if status.is_success() { delivered = true; break; }
+                                last = serde_json::from_str::<serde_json::Value>(&text).ok()
+                                    .and_then(|v| v["error"].as_str().map(str::to_string))
+                                    .unwrap_or_else(|| format!("HTTP {}", status));
+                                // A 404 is a peer too old to know the endpoint —
+                                // final, like any other refusal.
+                                break;
+                            }
+                            Err(e) => { last = e.to_string(); }
+                        }
+                    }
+                    // Mirror it locally only once the owner took it — so this
+                    // node slows its own polling of that peer at once, and a
+                    // refused edit never shows as applied in this node's view.
+                    if delivered
+                        && let Some(n) = state.cluster.nodes_write().get_mut(&id) {
+                            n.poll_interval_secs = crate::agent::normalize_poll_interval(Some(secs));
+                        }
+                    if !delivered {
+                        tracing::warn!("poll interval push ({}s) to '{}' ({}:{}) failed: {}", secs, node.hostname, node.address, node.port, last);
+                        poll_interval_error = Some(format!(
+                            "'{}' did not accept it ({}). The node must be online and running a WolfStack version with low-traffic mode; until then it keeps its previous interval",
+                            node.display_name.as_deref().unwrap_or(&node.hostname), last));
+                    }
+                }
+                None => {
+                    poll_interval_error = Some("only WolfStack nodes have a poll interval".to_string());
+                }
+            }
+            state.cluster.save_nodes();
+        }
         HttpResponse::Ok().json(serde_json::json!({
             "updated": true, "queued": queued,
             "policy_push_failed": policy_push_failed,
+            "poll_interval_error": poll_interval_error,
         }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({ "error": "Node not found" }))
@@ -13056,6 +13151,7 @@ fn resolve_target_node(
         site: None,
         display_name: None,
         roles: Vec::new(),
+        poll_interval_secs: None,
     })
 }
 
@@ -48791,6 +48887,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
         .route("/api/settings/site", web::post().to(set_site))
         .route("/api/settings/roles", web::post().to(set_roles))
+        .route("/api/settings/poll-interval", web::post().to(set_poll_interval))
         .route("/api/cluster/roles/available", web::get().to(cluster_roles_available))
         .route("/api/cluster/roles/summary", web::get().to(cluster_roles_summary))
         // WolfHost DNS tier — internal cluster-authed apply endpoints, fanned
