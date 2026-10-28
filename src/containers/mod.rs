@@ -1135,10 +1135,16 @@ pub fn has_lxc_cached() -> bool {
         && ts.elapsed().as_secs() < RUNTIME_CACHE_TTL_SECS {
             return *val;
         }
-    let val = Command::new("which").arg("lxc-ls").output()
-        .map(|o| o.status.success()).unwrap_or(false);
+    let val = lxc_installed();
     *cache = Some((val, Instant::now()));
     val
+}
+
+/// Uncached LXC presence check — `lxc-ls` on PATH, the same test the cached
+/// runtime detection uses.
+fn lxc_installed() -> bool {
+    Command::new("which").arg("lxc-ls").output()
+        .map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Check if KVM/QEMU is installed (cached for 120s).
@@ -3299,6 +3305,18 @@ pub fn ensure_lxc_bridge() {
 /// callers can't do anything useful with the error, they just need it
 /// logged. The periodic self-heal tick uses the same wrapper.
 fn ensure_lxc_bridge_checked() -> Result<(), String> {
+    // No LXC, no lxcbr0. Boot and the 60s self-heal tick used to build the
+    // bridge (10.0.3.1/24), its dnsmasq and its iptables rules on every
+    // host, so a node with LXC removed still grew one on each restart
+    // (RutgerDiehard 2026-10-28). Everything below — the /32 route repair
+    // included — exists only for LXC containers, so skip it all. Checked
+    // uncached: "Install LXC" calls this right after the package lands,
+    // and a stale cached "absent" would skip the bridge it just needs.
+    // An existing lxcbr0 is left alone; it may be the operator's.
+    if !lxc_installed() {
+        return Ok(());
+    }
+
     // FAST PATH: if lxcbr0 already has its IP, the bridge is up and lxc-net
     // (or a prior run) already did its job — do NOTHING. This is the steady
     // state on every healthy host, and the 60s self-heal tick lands here.
