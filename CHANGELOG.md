@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.41.0: low-traffic cluster polling for constrained nodes, and no lxcbr0 without LXC** _(2026-10-28 — [`d34a1dbd`](https://github.com/intelligentwolf/WolfStack/commit/d34a1dbd372d846e0ec26ae1fc7d95de67a26dcc))_
 - **v25.40.1: Docker CVE scans and OSV inventories no longer time out on large output** _(2026-10-26 — [`f690a79c`](https://github.com/intelligentwolf/WolfStack/commit/f690a79c58348002da5e43fffc203b752bc4d5cd))_
 - **v25.40.0: monitor details show a check-history graph and why each check failed** _(2026-10-24 — [`af4d07e5`](https://github.com/intelligentwolf/WolfStack/commit/af4d07e5db0d4bbea5bdcc4a7ceb69634b54e588))_
 - **v25.39.1: stop trusting the compromised eMudhra CA** _(2026-10-23 — [`1888e5ba`](https://github.com/intelligentwolf/WolfStack/commit/1888e5bacd8378ff86fe7a976d4b337bccda63e4))_
