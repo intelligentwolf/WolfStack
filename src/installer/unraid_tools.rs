@@ -625,6 +625,15 @@ pub fn wolfnet_enabled() -> bool {
     !wolfnet_disabled_marker().exists()
 }
 
+/// The operator wants WolfNet down: Stop latched this run, or Disable
+/// persisted. WolfStack's own background restarts (the WolfNet watchdog,
+/// config self-heal) must leave the daemon alone while this holds — a
+/// background "restart" clears the stop latch, which used to undo the
+/// operator's Stop within a minute.
+pub fn wolfnet_held_down() -> bool {
+    WOLFNET_STOPPED.load(Ordering::Relaxed) || !wolfnet_enabled()
+}
+
 /// Is any wolfnet daemon alive right now? Checks the owned child first
 /// (authoritative, and reaps it if it has exited), then the procfs scan.
 /// Uncertainty from the scan counts as "not running" HERE because this

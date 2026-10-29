@@ -4601,10 +4601,21 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             tokio::time::sleep(Duration::from_secs(60)).await;
             let mut last_restart_attempt: Option<std::time::Instant> = None;
             let mut restart_failed = false;
+            let mut standing_down = false;
             loop {
                 let status = networking::get_wolfnet_status();
+                // A disabled or masked unit (or an Unraid Stop/Disable) is the
+                // operator saying "keep WolfNet off" — restarting it anyway,
+                // and alerting when a masked unit refuses, was the bug.
+                let turned_off = status.installed && !status.running
+                    && networking::wolfnet_turned_off_by_operator();
+                if turned_off && !standing_down {
+                    info!("WolfNet is stopped and turned off by the operator — the watchdog will leave it down");
+                    restart_failed = false;
+                }
+                standing_down = turned_off;
                 // Only act if WolfNet is installed but not running
-                if status.installed && !status.running {
+                if status.installed && !status.running && !turned_off {
                     let should_attempt = match last_restart_attempt {
                         None => true,
                         Some(t) => t.elapsed().as_secs() >= 3600, // once per hour
