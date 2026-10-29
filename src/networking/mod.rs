@@ -2120,17 +2120,58 @@ pub fn wolfnet_tombstone_list() -> Vec<String> {
 /// restart re-reads the file and the peer comes up with no static
 /// endpoint, ready for roaming.
 fn restart_wolfnet() {
+    // A restart of a stopped unit starts it, so a config edit on a node
+    // whose operator turned WolfNet off must not bring it back. The new
+    // config is on disk and applies whenever they start it.
+    if !wolfnet_pgrep() && wolfnet_turned_off_by_operator() {
+        info!("WolfNet config updated; not starting it — the operator has turned WolfNet off on this node");
+        return;
+    }
     // Via wolfnet_service_action so the systemctl path is resolved robustly
     // (a stripped PATH would otherwise ENOENT — see systemctl_bin).
     let _ = wolfnet_service_action("restart");
 }
 
+fn wolfnet_pgrep() -> bool {
+    Command::new("pgrep").arg("wolfnet")
+        .output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Has the operator deliberately turned WolfNet off on this node? On
+/// systemd that is the unit being disabled or masked (`systemctl
+/// is-enabled` prints the state on stdout and exits non-zero for both);
+/// on Unraid it is the supervisor's Stop latch or Disable marker.
+/// WolfStack's background paths — the WolfNet watchdog, config
+/// self-heal, peer-reachability findings — check this and stand down,
+/// so `systemctl disable --now wolfnet` stays off (RutgerDiehard,
+/// 2026-10-29: the watchdog restarted a disabled WolfNet within the
+/// hour). Operator actions (the Start/Restart buttons) do not consult
+/// it. Any failure to read the state counts as "not turned off", which
+/// keeps the pre-existing auto-recovery behaviour.
+pub fn wolfnet_turned_off_by_operator() -> bool {
+    if crate::installer::unraid_tools::is_unraid() {
+        return crate::installer::unraid_tools::wolfnet_held_down();
+    }
+    let Some(systemctl) = systemctl_bin() else { return false; };
+    Command::new(&systemctl)
+        .args(["is-enabled", "wolfnet"])
+        .output()
+        .map(|o| matches!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            "disabled" | "masked" | "masked-runtime"
+        ))
+        .unwrap_or(false)
+}
+
 fn reload_or_restart_wolfnet() {
     // Check if wolfnet is currently running
-    let was_running = Command::new("pgrep").arg("wolfnet")
-        .output().map(|o| o.status.success()).unwrap_or(false);
+    let was_running = wolfnet_pgrep();
 
     if !was_running {
+        if wolfnet_turned_off_by_operator() {
+            info!("WolfNet config updated; not starting it — the operator has turned WolfNet off on this node");
+            return;
+        }
         // Not running at all — just start it (resolved systemctl path).
         let _ = wolfnet_service_action("start");
         return;
@@ -2143,8 +2184,7 @@ fn reload_or_restart_wolfnet() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Check if it survived (old versions without SIGHUP handler will die)
-    let still_running = Command::new("pgrep").arg("wolfnet")
-        .output().map(|o| o.status.success()).unwrap_or(false);
+    let still_running = wolfnet_pgrep();
 
     if !still_running {
         warn!("WolfNet died after SIGHUP (old version?) — restarting via systemctl");

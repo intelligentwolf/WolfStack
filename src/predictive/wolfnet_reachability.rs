@@ -95,6 +95,13 @@ pub struct WolfnetReachabilityFacts {
     /// when WolfNet "says connected" but data won't flow.
     #[serde(default)]
     pub local_has_public_ip: bool,
+    /// Peer IPs not probed because the operator has turned WolfNet off
+    /// on this node (disabled/masked unit, Unraid Stop/Disable) and it
+    /// is down. Every peer would fail the ping, so no findings are
+    /// raised — but the scopes are still covered, so findings opened
+    /// before WolfNet was turned off auto-clear.
+    #[serde(default)]
+    pub stood_down_peer_ips: Vec<String>,
 }
 
 /// Classify an endpoint string by its host's address scope.
@@ -127,6 +134,19 @@ pub async fn sample_now_async(_timeout: Duration) -> WolfnetReachabilityFacts {
             // think we just looked at zero peers.
             return WolfnetReachabilityFacts::default();
         }
+        if !crate::networking::get_wolfnet_status().running
+            && crate::networking::wolfnet_turned_off_by_operator()
+        {
+            let stood_down_peer_ips = peers.into_iter()
+                .filter(|p| !p.ip.is_empty())
+                .map(|p| p.ip.split('/').next().unwrap_or(&p.ip).to_string())
+                .collect();
+            return WolfnetReachabilityFacts {
+                scanned: true,
+                stood_down_peer_ips,
+                ..Default::default()
+            };
+        }
         let local_has_public_ip = !crate::networking::detect_public_ips().is_empty();
         let mut probes = Vec::with_capacity(peers.len());
         for peer in peers {
@@ -158,7 +178,7 @@ pub async fn sample_now_async(_timeout: Duration) -> WolfnetReachabilityFacts {
                 endpoint_kind,
             });
         }
-        WolfnetReachabilityFacts { probes, scanned: true, local_has_public_ip }
+        WolfnetReachabilityFacts { probes, scanned: true, local_has_public_ip, stood_down_peer_ips: Vec::new() }
     }).await.unwrap_or_default()
 }
 
@@ -195,13 +215,15 @@ pub fn covered_scopes(
     facts: &WolfnetReachabilityFacts,
 ) -> Vec<(String, ProposalScope)> {
     if !facts.scanned { return Vec::new(); }
-    facts.probes.iter().map(|p| (
-        FINDING_TYPE.to_string(),
-        ProposalScope {
-            node_id: ctx.node_id.clone(),
-            resource_id: Some(format!("wolfnet-peer:{}", p.ip)),
-        },
-    )).collect()
+    facts.probes.iter().map(|p| &p.ip)
+        .chain(facts.stood_down_peer_ips.iter())
+        .map(|ip| (
+            FINDING_TYPE.to_string(),
+            ProposalScope {
+                node_id: ctx.node_id.clone(),
+                resource_id: Some(format!("wolfnet-peer:{}", ip)),
+            },
+        )).collect()
 }
 
 /// Build the proposal text. The `local_has_public_ip` flag tunes the
@@ -386,6 +408,7 @@ mod tests {
             probes: vec![probe("test", "10.10.0.5", false)],
             scanned: false,
             local_has_public_ip: false,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("node-a");
         let acks = AckStore::default();
@@ -400,6 +423,7 @@ mod tests {
             probes: vec![probe("alpha", "10.10.0.5", true)],
             scanned: true,
             local_has_public_ip: false,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("node-a");
         let acks = AckStore::default();
@@ -417,6 +441,7 @@ mod tests {
             probes: vec![probe("bravo", "10.10.0.7", false)],
             scanned: true,
             local_has_public_ip: false,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("node-a");
         let acks = AckStore::default();
@@ -441,6 +466,7 @@ mod tests {
             ],
             scanned: true,
             local_has_public_ip: false,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("node-a");
         let acks = AckStore::default();
@@ -472,6 +498,7 @@ mod tests {
             probes: vec![probe_with_endpoint("ninni", "10.100.10.30", "10.10.10.30:9630")],
             scanned: true,
             local_has_public_ip: true,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("klnet-12gb");
         let acks = AckStore::default();
@@ -509,6 +536,7 @@ mod tests {
             probes: vec![probe_with_endpoint("ninni", "10.100.10.30", "10.10.10.30:9630")],
             scanned: true,
             local_has_public_ip: false,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("lan-node");
         let acks = AckStore::default();
@@ -526,6 +554,7 @@ mod tests {
             probes: vec![probe_with_endpoint("ninni", "10.100.10.30", "185.57.4.152:9605")],
             scanned: true,
             local_has_public_ip: true,
+            stood_down_peer_ips: Vec::new(),
         };
         let ctx = Context::for_node("klnet-12gb");
         let acks = AckStore::default();
@@ -553,6 +582,7 @@ mod tests {
             }],
             scanned: true,
             local_has_public_ip: true,
+            stood_down_peer_ips: Vec::new(),
         };
         let out = analyze(
             &Context::for_node("node-a"), &facts,
@@ -572,5 +602,26 @@ mod tests {
             .expect("the removal path needs a command");
         assert!(purge.contains("/etc/wolfnet/config.toml"), "purge alone drops nothing: {}", purge);
         assert!(purge.starts_with("# only if"), "must be labelled conditional: {}", purge);
+    }
+
+    /// WolfNet turned off by the operator: no findings for the peers it
+    /// can't reach, but every peer scope stays covered so findings from
+    /// before it was turned off resolve (RutgerDiehard 2026-10-29).
+    #[test]
+    fn stood_down_peers_emit_nothing_but_stay_covered() {
+        let facts = WolfnetReachabilityFacts {
+            scanned: true,
+            stood_down_peer_ips: vec!["10.10.0.5".into(), "10.10.0.7".into()],
+            ..Default::default()
+        };
+        let ctx = Context::for_node("node-a");
+        let out = analyze(
+            &ctx, &facts,
+            &AckStore::default(), &crate::predictive::proposal::ProposalStore::default(),
+        );
+        assert!(out.is_empty(), "a WolfNet the operator turned off must not raise peer-unreachable findings");
+        let covered: Vec<_> = covered_scopes(&ctx, &facts).into_iter()
+            .map(|(_, scope)| scope.resource_id.unwrap()).collect();
+        assert_eq!(covered, vec!["wolfnet-peer:10.10.0.5", "wolfnet-peer:10.10.0.7"]);
     }
 }
