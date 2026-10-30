@@ -13,6 +13,9 @@
 #        curl -sSL https://raw.githubusercontent.com/intelligentwolf/WolfStack/master/setup.sh | bash
 #        curl -sSL https://raw.githubusercontent.com/intelligentwolf/WolfStack/beta/setup.sh | bash -s -- --beta
 #        bash setup.sh --install-dir /mnt/usb           # build & install from external drive
+#        ... | bash -s -- --minimal   # pick which optional runtimes (Docker/LXC/KVM/PBS) to install;
+#                                     # upgrades remember the choice (/etc/wolfstack/install-components)
+#        ... | bash -s -- --full      # install every optional runtime, overriding a remembered choice
 # Usage (sudoer — Ubuntu/Debian):
 #        curl -sSL https://raw.githubusercontent.com/intelligentwolf/WolfStack/master/setup.sh | sudo bash
 #        sudo bash setup.sh
@@ -37,6 +40,7 @@ AGENT_MODE=false
 SKIP_PBS_BUILD=false
 FORCE_PBS_BUILD=false
 MINIMAL=false
+FULL=false
 # Did the operator state a Docker preference explicitly (--with-docker /
 # --no-docker, or the --minimal picker)? An explicit answer always wins over
 # the Proxmox default below — we only decline to guess, we never overrule.
@@ -49,6 +53,9 @@ while [ $# -gt 0 ]; do
         --skip-pbs-build|--no-pbs-build) SKIP_PBS_BUILD=true ;;
         --build-pbs|--pbs-from-source) FORCE_PBS_BUILD=true ;;
         --minimal|--lite) MINIMAL=true ;;
+        # Every optional runtime, overriding a choice remembered from an
+        # earlier --minimal install (see install-components below).
+        --full) FULL=true ;;
         # Explicit Docker choice. Needed on Proxmox VE, where Docker is NOT
         # installed by default (see the PVE block after host detection) —
         # an operator who wants it there has to say so.
@@ -1354,6 +1361,55 @@ ws_install_pkgs() {
     fi
     return 0
 }
+
+# ─── Remember the optional-runtime choice across upgrades ───────────────────
+# Every in-app upgrade path (Upgrade button, console, WolfFlow, older
+# binaries) runs this script with NO arguments, so without a record the
+# defaults above (everything = true) silently undid a --minimal install on
+# each upgrade — RutgerDiehard's Raspberry Pi got qemu-utils plus ~20 armhf
+# libraries from a v25.42.0 UI upgrade. The final choice is saved at the
+# end of a successful run and re-read here. A node installed before the
+# file existed has no record, so its choice is inferred from what is
+# installed: an upgrade keeps what the node has and never adds a heavy
+# runtime it doesn't. Explicit flags on this run still win.
+WS_COMPONENTS_FILE=/etc/wolfstack/install-components
+_ws_have_qemu() {
+    local f
+    for f in /usr/bin/qemu-system-* /usr/libexec/qemu-kvm; do
+        [ -x "$f" ] && return 0
+    done
+    return 1
+}
+if [ "$IS_UPGRADE" = true ] && [ "$MINIMAL" != true ] && [ "$FULL" != true ]; then
+    _ws_flag_docker="$WANT_DOCKER"
+    if [ -r "$WS_COMPONENTS_FILE" ]; then
+        while IFS='=' read -r _ws_key _ws_val; do
+            case "$_ws_val" in true|false) ;; *) continue ;; esac
+            case "$_ws_key" in
+                docker) WANT_DOCKER="$_ws_val" ;;
+                lxc)    WANT_LXC="$_ws_val" ;;
+                kvm)    WANT_KVM="$_ws_val" ;;
+                pbs)    WANT_PBS="$_ws_val" ;;
+            esac
+        done < "$WS_COMPONENTS_FILE"
+        echo "  ℹ Upgrade: keeping the optional runtimes chosen at install ($WS_COMPONENTS_FILE)."
+    else
+        if command -v docker >/dev/null 2>&1; then WANT_DOCKER=true; else WANT_DOCKER=false; fi
+        if command -v lxc-start >/dev/null 2>&1; then WANT_LXC=true; else WANT_LXC=false; fi
+        if _ws_have_qemu; then WANT_KVM=true; else WANT_KVM=false; fi
+        if command -v proxmox-backup-client >/dev/null 2>&1; then WANT_PBS=true; else WANT_PBS=false; fi
+        echo "  ℹ Upgrade: keeping the optional runtimes already installed and adding none."
+        echo "    Re-run with --full to add all of them."
+    fi
+    [ "$DOCKER_EXPLICIT" = true ] && WANT_DOCKER="$_ws_flag_docker"
+fi
+# --full is an explicit request for everything, so on a Proxmox host it also
+# overrides the "no Docker by default" rule above — unless --no-docker /
+# --with-docker said otherwise for Docker specifically.
+if [ "$FULL" = true ]; then
+    WANT_LXC=true; WANT_KVM=true; WANT_PBS=true
+    [ "$DOCKER_EXPLICIT" = true ] || WANT_DOCKER=true
+fi
 
 # Run the --minimal picker (a no-op unless --minimal was passed), then print
 # exactly which optional runtimes are about to be installed — so a plain
@@ -3613,6 +3669,19 @@ if [ -n "$JOIN_TOKEN" ]; then
     echo "  Retrieve later:  sudo cat $JOIN_TOKEN_FILE"
     echo ""
 fi
+# Record the final runtime choice so the next argument-less upgrade keeps it
+# (read back by the install-components block above). Written only here, at
+# the end of a successful run, so a failed first install can't leave a file
+# behind that makes the retry look like an upgrade.
+mkdir -p /etc/wolfstack
+{
+    echo "# Optional runtimes for this node, written by setup.sh. Upgrades re-read"
+    echo "# this so a --minimal install stays minimal. setup.sh --full adds all."
+    echo "docker=$WANT_DOCKER"
+    echo "lxc=$WANT_LXC"
+    echo "kvm=$WANT_KVM"
+    echo "pbs=$WANT_PBS"
+} > "$WS_COMPONENTS_FILE"
 echo "**** UPGRADE COMPLETE ****"
 echo ""
 echo "Please Refresh your browser if upgrading..."
