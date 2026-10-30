@@ -3390,7 +3390,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "macOS (Docker-OSX)".into(),
             icon: "🍎".into(),
             category: "Desktop OS".into(),
-            description: "macOS in a Docker container (dockur/macos), driven from your browser on port 8106. Downloads and installs itself on first start — in Recovery, erase the largest 'Apple Inc. VirtIO Block Media' disk in Disk Utility, then Reinstall macOS onto it. Needs KVM (/dev/kvm), an AVX2 CPU, 4 GB+ RAM and 64 GB+ disk. On AMD hosts keep RAM at 8G or less for the install. Apple's licence only permits macOS on Apple hardware.".into(),
+            description: "macOS in a Docker container (dockur/macos), driven from your browser on port 8106. Downloads and installs itself on first start — in Recovery, erase the largest 'Apple Inc. VirtIO Block Media' disk in Disk Utility, then Reinstall macOS onto it. Needs KVM (/dev/kvm), an AVX2 CPU, 4 GB+ RAM and 32 GB+ free disk (64G default virtual disk). On AMD hosts keep RAM at 8G or less for the install. Apple's licence only permits macOS on Apple hardware.".into(),
             website: Some("https://github.com/dockur/macos".into()),
             docker: Some(DockerTarget {
                 image: "dockurr/macos:latest".into(),
