@@ -14515,6 +14515,57 @@ pub struct DockerCreateOptions<'a> {
     pub volumes: &'a [String],
 }
 
+/// Host resources a container needs beyond the ordinary create flags —
+/// for images that run a KVM guest inside the container (dockurr/macos
+/// needs `/dev/kvm`, `/dev/net/tun` and `NET_ADMIN`). `stop_timeout_secs`
+/// gives such a guest time to shut down cleanly before Docker SIGKILLs
+/// it; Docker's own default is 10 s, too short for an OS to flush its
+/// disk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DockerHostAccess {
+    pub devices: &'static [&'static str],
+    pub cap_add: &'static [&'static str],
+    pub stop_timeout_secs: Option<u32>,
+}
+
+impl DockerHostAccess {
+    /// Err when any device in `devices` doesn't exist on this host. Run
+    /// before create so a host without KVM gets a plain-English error
+    /// instead of Docker's "error gathering device information".
+    pub fn check_devices(&self) -> Result<(), String> {
+        let missing: Vec<&str> = self.devices.iter().copied()
+            .filter(|d| !std::path::Path::new(d).exists())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut msg = format!("This host is missing {}, which this container needs.", missing.join(", "));
+        if missing.contains(&"/dev/kvm") {
+            msg.push_str(" /dev/kvm means hardware virtualisation (KVM) is off: enable VT-x/AMD-V \
+                          in the BIOS, or nested virtualisation if this host is itself a VM.");
+        }
+        Err(msg)
+    }
+
+    /// The `docker create` flags for this access, one argv entry each.
+    pub fn create_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        for d in self.devices {
+            args.push("--device".to_string());
+            args.push(d.to_string());
+        }
+        for c in self.cap_add {
+            args.push("--cap-add".to_string());
+            args.push(c.to_string());
+        }
+        if let Some(secs) = self.stop_timeout_secs {
+            args.push("--stop-timeout".to_string());
+            args.push(secs.to_string());
+        }
+        args
+    }
+}
+
 /// Create a Docker container from an image.
 /// If wolfnet_ip is provided, connect to the WolfNet overlay on start.
 pub fn docker_create(options: DockerCreateOptions<'_>) -> Result<String, String> {
@@ -14527,6 +14578,18 @@ pub fn docker_create(options: DockerCreateOptions<'_>) -> Result<String, String>
 /// to actually do anything. Passing an empty slice is equivalent to
 /// calling `docker_create`.
 pub fn docker_create_with_cmd(options: DockerCreateOptions<'_>, cmd: &[String]) -> Result<String, String> {
+    docker_create_with_host_access(options, cmd, &DockerHostAccess::default())
+}
+
+/// Like `docker_create_with_cmd` but also grants the host devices,
+/// capabilities and stop timeout in `access`. Refuses up front when a
+/// required device is missing on this host.
+pub fn docker_create_with_host_access(
+    options: DockerCreateOptions<'_>,
+    cmd: &[String],
+    access: &DockerHostAccess,
+) -> Result<String, String> {
+    access.check_devices()?;
     let DockerCreateOptions {
         name, image, ports, env, wolfnet_ip, memory, cpus, storage: _storage, volumes,
     } = options;
@@ -14605,6 +14668,8 @@ pub fn docker_create_with_cmd(options: DockerCreateOptions<'_>, cmd: &[String]) 
             args.push(e.to_string());
         }
     }
+
+    args.extend(access.create_args());
 
     args.push(image.to_string());
 

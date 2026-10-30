@@ -469,6 +469,10 @@ fn install_docker(
 ) -> Result<String, String> {
     let docker = app.docker.as_ref()
         .ok_or("This app doesn't support Docker installation")?;
+    let host_access = docker_host_access(&app.id).unwrap_or_default();
+    // Fail before pulling sidecars or a multi-GB image onto a host that
+    // can't run the container anyway.
+    host_access.check_devices()?;
 
     // Auto-allocate a WolfNet IP for this container
     let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
@@ -568,11 +572,11 @@ fn install_docker(
 
     // Create the container (not started)
 
-    crate::containers::docker_create_with_cmd(crate::containers::DockerCreateOptions {
+    crate::containers::docker_create_with_host_access(crate::containers::DockerCreateOptions {
         name: container_name, image: &docker.image, ports: &docker.ports, env: &env,
         wolfnet_ip: wolfnet_ip.as_deref(), memory: None, cpus: None, storage: None,
         volumes: &docker.volumes,
-    }, &cmd)?;
+    }, &cmd, &host_access)?;
 
     let mut msg = format!("{} configured as Docker container '{}' (stopped)", app.name, container_name);
     if let Some(ref ip) = wolfnet_ip {
@@ -607,6 +611,25 @@ fn install_docker(
 /// `${user_input_id}` substitution, same rules as env / cmd.
 pub fn handcrafted_compose_template(_app_id: &str) -> Option<&'static str> {
     None
+}
+
+/// Host devices / capabilities an app's main container needs, for images
+/// that boot a KVM guest inside Docker. Kept as a lookup by app id for the
+/// same reason as the compose templates above — a DockerTarget field would
+/// have to be added to every catalogue literal. Honoured by all three
+/// Docker paths (direct install, install script, compose); Kubernetes
+/// deploys refuse these apps because a pod gets no `/dev/kvm`.
+pub fn docker_host_access(app_id: &str) -> Option<crate::containers::DockerHostAccess> {
+    match app_id {
+        // dockur/macos README: devices /dev/kvm + /dev/net/tun, cap_add
+        // NET_ADMIN, stop_grace_period 2m (`--stop-timeout 120` on the CLI).
+        "macos" => Some(crate::containers::DockerHostAccess {
+            devices: &["/dev/kvm", "/dev/net/tun"],
+            cap_add: &["NET_ADMIN"],
+            stop_timeout_secs: Some(120),
+        }),
+        _ => None,
+    }
 }
 
 /// Resolve the compose template for an app. Preference order:
@@ -658,6 +681,9 @@ fn synthesise_compose_template(app_id: &str, d: &DockerTarget) -> String {
 
     // Main service.
     out.push_str(&render_compose_service(main_name, &d.image, &d.ports, &d.env, &d.volumes, &d.cmd));
+    if let Some(access) = docker_host_access(app_id) {
+        out.push_str(&render_compose_host_access(&access));
+    }
 
     // Sidecars. `cmd` is honoured so Mongo replSet flags, Mastodon
     // sidekiq, Authentik worker, etc. render correctly.
@@ -734,6 +760,28 @@ fn render_compose_service(
     s
 }
 
+/// The `devices` / `cap_add` / `stop_grace_period` keys for a service
+/// already opened by `render_compose_service` (same 4-space indent).
+fn render_compose_host_access(access: &crate::containers::DockerHostAccess) -> String {
+    let mut s = String::new();
+    if !access.devices.is_empty() {
+        s.push_str("    devices:\n");
+        for d in access.devices {
+            s.push_str(&format!("      - \"{}\"\n", yaml_double_quoted(d)));
+        }
+    }
+    if !access.cap_add.is_empty() {
+        s.push_str("    cap_add:\n");
+        for c in access.cap_add {
+            s.push_str(&format!("      - \"{}\"\n", yaml_double_quoted(c)));
+        }
+    }
+    if let Some(secs) = access.stop_timeout_secs {
+        s.push_str(&format!("    stop_grace_period: {}s\n", secs));
+    }
+    s
+}
+
 /// Escape a string so it can be safely embedded inside a YAML
 /// double-quoted scalar. Follows the YAML 1.2 spec for double-quoted
 /// escape sequences: `\\`, `\"`, `\n`, `\r`, `\t`, plus `\xNN` for
@@ -776,6 +824,9 @@ fn install_compose(
 ) -> Result<String, String> {
     app.docker.as_ref()
         .ok_or("This app doesn't support Docker installation")?;
+    if let Some(access) = docker_host_access(&app.id) {
+        access.check_devices()?;
+    }
     let template = resolve_compose_template(&app.id)
         .ok_or("This app doesn't provide a Docker Compose template")?;
 
@@ -2268,6 +2319,10 @@ pub fn prepare_install(options: PrepareInstallOptions<'_>) -> Result<(String, St
         "docker" => {
             let docker = app.docker.as_ref()
                 .ok_or("This app doesn't support Docker installation")?;
+            let host_access = docker_host_access(&app.id).unwrap_or_default();
+            // Checked here, not in the script: prepare runs on the target
+            // node, and the operator gets the error before a terminal opens.
+            host_access.check_devices()?;
 
             let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
@@ -2548,7 +2603,18 @@ pub fn prepare_install(options: PrepareInstallOptions<'_>) -> Result<(String, St
             if let Some(ref ip) = wolfnet_ip {
                 create_args.push_str(&format!(" --label wolfnet.ip={}", ip));
             }
+            for a in host_access.create_args() {
+                create_args.push_str(&format!(" {}", shell_escape(&a)));
+            }
             create_args.push_str(&format!(" {}", shell_escape(&docker.image)));
+            // Main-container cmd (after image), same as the sidecars and
+            // the direct-install path — without it an image whose
+            // ENTRYPOINT needs a subcommand (cloudflared `tunnel run`)
+            // starts and exits.
+            let main_cmd = substitute_inputs(&docker.cmd, user_inputs);
+            for a in &main_cmd {
+                create_args.push_str(&format!(" {}", shell_escape(a)));
+            }
             script.push_str(&format!("{}\n\n", create_args));
 
             if let Some(ref ip) = wolfnet_ip {
@@ -3309,6 +3375,43 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                 UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
                 UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
                 UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        // Source: github.com/dockur/macos readme.md — image dockurr/macos,
+        // web viewer on 8006, env VERSION / RAM_SIZE / CPU_CORES /
+        // DISK_SIZE (defaults 15 / 4G / 2 / 64G), data under /storage.
+        // Device + capability needs live in docker_host_access("macos").
+        // Host port 8106, not upstream's 8006: 8006 is the Proxmox web UI.
+        // VNC 5900 is left unpublished — it collides with QEMU VM consoles
+        // and the browser viewer covers it.
+        AppManifest {
+            id: "macos".into(),
+            name: "macOS (Docker-OSX)".into(),
+            icon: "🍎".into(),
+            category: "Desktop OS".into(),
+            description: "macOS in a Docker container (dockur/macos), driven from your browser on port 8106. Downloads and installs itself on first start — in Recovery, erase the largest 'Apple Inc. VirtIO Block Media' disk in Disk Utility, then Reinstall macOS onto it. Needs KVM (/dev/kvm), an AVX2 CPU, 4 GB+ RAM and 64 GB+ disk. On AMD hosts keep RAM at 8G or less for the install. Apple's licence only permits macOS on Apple hardware.".into(),
+            website: Some("https://github.com/dockur/macos".into()),
+            docker: Some(DockerTarget {
+                image: "dockurr/macos:latest".into(),
+                ports: vec!["8106:8006".into()],
+                env: vec![
+                    "VERSION=${VERSION}".into(),
+                    "RAM_SIZE=${RAM_SIZE}".into(),
+                    "CPU_CORES=${CPU_CORES}".into(),
+                    "DISK_SIZE=${DISK_SIZE}".into(),
+                ],
+                volumes: vec!["macos_storage:/storage".into()],
+                sidecars: vec![],
+                seed_files: vec![],
+                cmd: vec![],
+            }),
+            lxc: None, bare_metal: None, vm: None,
+            user_inputs: vec![
+                UserInput { id: "VERSION".into(), label: "macOS version (15 Sequoia, 14 Sonoma, 13 Ventura, 12 Monterey, 11 Big Sur)".into(), input_type: "select".into(), default: Some("15".into()), required: true, placeholder: None, options: vec!["15".into(), "14".into(), "13".into(), "12".into(), "11".into()] },
+                UserInput { id: "RAM_SIZE".into(), label: "Memory (e.g. 4G)".into(), input_type: "text".into(), default: Some("4G".into()), required: true, placeholder: Some("4G".into()), options: vec![] },
+                UserInput { id: "CPU_CORES".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: true, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "DISK_SIZE".into(), label: "Disk size (e.g. 64G)".into(), input_type: "text".into(), default: Some("64G".into()), required: true, placeholder: Some("64G".into()), options: vec![] },
             ],
         },
 
@@ -9980,6 +10083,41 @@ mod tests {
             let inlined = handcrafted_compose_template(&app.id).is_some() || app.docker.is_some();
             assert_eq!(inlined, canonical, "inlined divergence for app '{}'", app.id);
         }
+    }
+
+    /// Host access only applies to Docker installs, so it must hang off
+    /// a catalogue app that has a Docker target — renaming the macOS
+    /// entry's id without updating docker_host_access fails here.
+    #[test]
+    fn host_access_belongs_to_docker_apps() {
+        for app in catalogue() {
+            if docker_host_access(&app.id).is_some() {
+                assert!(app.docker.is_some(), "host access for non-Docker app '{}'", app.id);
+            }
+        }
+        assert!(get_app("macos").and_then(|a| a.docker).is_some());
+    }
+
+    /// macOS boots a KVM guest: without the devices, NET_ADMIN and the
+    /// long stop timeout from the dockur/macos README the container
+    /// either can't start or gets SIGKILLed mid-disk-write on stop.
+    #[test]
+    fn macos_host_access_reaches_docker_and_compose() {
+        let access = docker_host_access("macos").unwrap();
+        assert_eq!(
+            access.create_args(),
+            vec!["--device", "/dev/kvm", "--device", "/dev/net/tun",
+                 "--cap-add", "NET_ADMIN", "--stop-timeout", "120"],
+        );
+
+        let yaml = resolve_compose_template("macos").unwrap();
+        assert!(yaml.contains("    devices:\n      - \"/dev/kvm\"\n      - \"/dev/net/tun\"\n"), "{}", yaml);
+        assert!(yaml.contains("    cap_add:\n      - \"NET_ADMIN\"\n"), "{}", yaml);
+        assert!(yaml.contains("    stop_grace_period: 120s\n"), "{}", yaml);
+
+        // Apps without host access render no such keys.
+        let plain = resolve_compose_template("cloudflared").unwrap();
+        assert!(!plain.contains("devices:") && !plain.contains("cap_add:"));
     }
 
     #[test]
