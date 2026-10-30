@@ -33119,6 +33119,12 @@ pub async fn k8s_deploy_app(req: HttpRequest, state: web::Data<AppState>, path: 
         Some(ref d) => d,
         None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "App does not support Docker/Kubernetes deployment" })),
     };
+    if let Some(access) = appstore::docker_host_access(&app.id) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("{} needs host devices ({}) that a Kubernetes pod doesn't get — install it with Docker instead",
+                app.name, access.devices.join(", "))
+        }));
+    }
     // Substitute user inputs in env vars
     let env: Vec<String> = docker.env.iter().map(|e| {
         let mut val = e.clone();
