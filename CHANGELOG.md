@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.42.0: macOS in the App Store, and Docker apps can now be given KVM** _(2026-10-30 — [`5cff7781`](https://github.com/intelligentwolf/WolfStack/commit/5cff7781dc8ad8311fd22999b62f22e1c5457a77))_
 - **v25.41.1: a disabled or masked WolfNet now stays off** _(2026-10-29 — [`6c131208`](https://github.com/intelligentwolf/WolfStack/commit/6c1312080c8c59d935c70c1e145bd333a81e926d))_
 - **v25.41.0: low-traffic cluster polling for constrained nodes, and no lxcbr0 without LXC** _(2026-10-28 — [`d34a1dbd`](https://github.com/intelligentwolf/WolfStack/commit/d34a1dbd372d846e0ec26ae1fc7d95de67a26dcc))_
 - **v25.40.1: Docker CVE scans and OSV inventories no longer time out on large output** _(2026-10-26 — [`f690a79c`](https://github.com/intelligentwolf/WolfStack/commit/f690a79c58348002da5e43fffc203b752bc4d5cd))_
