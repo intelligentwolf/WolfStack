@@ -1160,6 +1160,32 @@ mod tests {
         e.storage.storage_type = StorageType::Local;
         assert!(!is_pbs_file_level_entry(&e));
     }
+
+    /// Retention prune must address the group the file-level snapshot was
+    /// actually written to (build_pxar_pairs: LXC/Docker → `ct/<name>`,
+    /// Config → `host/wolfstack-config-<host>`). Parsing the `pbsfl-` filename
+    /// gave `host/ct-<name>`, so these snapshots were never pruned.
+    #[test]
+    fn file_level_entry_prunes_the_real_group() {
+        let mk = |tt: BackupTargetType, name: &str, file: &str, host: &str| BackupEntry {
+            id: "x".into(),
+            target: BackupTarget { target_type: tt, name: name.into(), ..Default::default() },
+            storage: BackupStorage { storage_type: StorageType::Pbs, ..BackupStorage::default() },
+            filename: file.into(),
+            size_bytes: 0, created_at: String::new(), status: BackupStatus::Completed,
+            error: String::new(), schedule_id: String::new(), comments: String::new(),
+            node_hostname: host.into(), docker_config: String::new(), mounts: Vec::new(),
+        };
+        let lxc = mk(BackupTargetType::Lxc, "grid-lb", "pbsfl-ct-grid-lb-20261103-030000.pxar", "wolfstack-3");
+        assert_eq!(pbs_group_for_entry(&lxc), "ct/grid-lb");
+        assert_ne!(pbs_group_for_filename(&lxc.filename), "ct/grid-lb", "filename parse is the bug this guards");
+        let cfg = mk(BackupTargetType::Config, "",
+            "pbsfl-host-wolfstack-config-wolfstack-4-20261103-030000.pxar", "wolfstack-4");
+        assert_eq!(pbs_group_for_entry(&cfg), format!("host/{}", config_pxar_backup_id("wolfstack-4")));
+        // Tarball-in-pxar entries keep the filename-derived group.
+        let tar = mk(BackupTargetType::Lxc, "legolas", "lxc-legolas-20261103-040000.tar.gz", "wolfstack-3");
+        assert_eq!(pbs_group_for_entry(&tar), "ct/legolas");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -5706,14 +5732,14 @@ fn make_pbs_file_level_entry(
 ///   • Docker      → a staging dir under the restore area (operator then has
 ///                   the files; container re-creation from a flat fs isn't
 ///                   automatic — surfaced in the returned message)
-fn restore_pbs_file_level_entry(entry: &BackupEntry, target_override: &str) -> Result<String, String> {
-    ensure_pbs_client_installed()?;
-    let storage = &entry.storage;
-    let repo = pbs_repo_string(storage);
-
-    // Re-derive the snapshot type/id from the entry's target — robust against
-    // any filename-parsing fragility. These mirror exactly what
-    // build_pxar_pairs produced at backup time.
+/// PBS (backup-type, backup-id) of a file-level (pxar) entry.
+///
+/// Re-derived from the entry's target rather than parsed out of its
+/// `pbsfl-<type>-<id>-<ts>.pxar` filename — robust against ids that contain
+/// hyphens or digits. Source: build_pxar_pairs() above, which chooses the
+/// type/id at backup time; this must mirror it exactly. Shared by restore
+/// AND retention prune so the two can never address different groups.
+fn pbs_file_level_type_and_id(entry: &BackupEntry) -> (String, String) {
     let backup_type = match entry.target.target_type {
         BackupTargetType::SystemPath | BackupTargetType::Config => "host",
         _ => "ct",
@@ -5728,6 +5754,32 @@ fn restore_pbs_file_level_entry(entry: &BackupEntry, target_override: &str) -> R
         BackupTargetType::Config => config_pxar_backup_id(&entry.node_hostname),
         _ => entry.target.name.clone(),
     };
+    (backup_type, backup_id)
+}
+
+/// PBS group (`<backup-type>/<backup-id>`) an entry's snapshots live in.
+///
+/// File-level entries can't go through `pbs_group_for_filename`: their
+/// `pbsfl-ct-<name>-…` filename doesn't start with a known archive prefix,
+/// so it mapped to `host/ct-<name>` — a group that never exists. Retention
+/// prune therefore never touched the real `ct/<name>` group and file-level
+/// snapshots accumulated forever on the datastore (found 2026-11-03 while
+/// sizing new targets for a hosted PBS with no server-side prune job).
+fn pbs_group_for_entry(entry: &BackupEntry) -> String {
+    if is_pbs_file_level_entry(entry) {
+        let (t, id) = pbs_file_level_type_and_id(entry);
+        format!("{}/{}", t, id)
+    } else {
+        pbs_group_for_filename(&entry.filename)
+    }
+}
+
+fn restore_pbs_file_level_entry(entry: &BackupEntry, target_override: &str) -> Result<String, String> {
+    ensure_pbs_client_installed()?;
+    let storage = &entry.storage;
+    let repo = pbs_repo_string(storage);
+
+    let (backup_type, backup_id) = pbs_file_level_type_and_id(entry);
 
     // Find the newest snapshot matching type/id.
     let mut list_cmd = Command::new("proxmox-backup-client");
@@ -8648,7 +8700,7 @@ fn prune_pbs_groups_for_schedule(config: &BackupConfig, schedule_id: &str, reten
         {
             continue;
         }
-        let group = pbs_group_for_filename(&e.filename);
+        let group = pbs_group_for_entry(e);
         let repo = pbs_repo_string(&e.storage);
         if groups.iter().any(|(r, g, _)| r == &repo && g == &group) {
             continue;
@@ -8689,7 +8741,7 @@ fn pbs_group_keep_count(
         .filter(|e| {
             e.storage.storage_type == StorageType::Pbs
                 && e.status == BackupStatus::Completed
-                && pbs_group_for_filename(&e.filename) == group
+                && pbs_group_for_entry(e) == group
                 && pbs_repo_string(&e.storage) == repo
         })
         // An entry whose schedule has since been deleted contributes nothing.
