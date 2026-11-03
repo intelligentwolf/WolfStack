@@ -748,13 +748,7 @@ impl ClusterState {
         // - Any non-self WolfStack node whose hostname matches ours (previous restarts of this server)
         // - Any non-self node whose ID matches our self_id (shouldn't happen, but safety)
         let ghost_ids: Vec<String> = nodes.values()
-            .filter(|n| {
-                if n.is_self || n.id == self.self_id {
-                    return false;
-                }
-                // Ghost: same hostname + same port + wolfstack type
-                n.hostname == hostname && n.port == self.port && n.node_type == "wolfstack"
-            })
+            .filter(|n| is_self_alias(n, &self.self_id, &hostname, self.port))
             .map(|n| n.id.clone())
             .collect();
 
@@ -1055,12 +1049,9 @@ impl ClusterState {
         let self_port = self.port;
         let self_interval = nodes.get(&self.self_id).and_then(|n| n.poll_interval_secs);
         nodes.values().filter(|n| {
-            // Filter out non-self wolfstack nodes that are actually us (duplicate from gossip)
-            if !n.is_self && n.id != self.self_id && n.node_type == "wolfstack"
-                && n.hostname == self_hostname && n.port == self_port {
-                return false;
-            }
-            true
+            // Filter out non-self wolfstack records that are actually us
+            // (a duplicate from gossip, or us under another address).
+            !is_self_alias(n, &self.self_id, &self_hostname, self_port)
         }).map(|n| {
             let mut node = n.clone();
             if !node.is_self {
@@ -1229,6 +1220,19 @@ impl ClusterState {
             self.add_tombstone(id);
         }
         removed
+    }
+
+    /// Drop a record that turned out to be this node under another address.
+    ///
+    /// Deliberately NOT `remove_server`: that tombstones the id, tombstones
+    /// gossip, and the id here is the one the MASTER uses for us — so the
+    /// tombstone would make the master delete this node from the cluster.
+    pub fn forget_self_alias(&self, id: &str) {
+        let removed = self.nodes_write().remove(id).is_some();
+        if removed {
+            self.save_nodes();
+            tracing::info!("cluster: dropped record {} — it is this node under another address", id);
+        }
     }
 
     /// Add a node ID to the tombstone set (prevents gossip re-adding)
@@ -2260,6 +2264,24 @@ fn parse_local_ipv4(json: &[u8]) -> std::collections::HashSet<String> {
     set
 }
 
+/// True when a NON-self registry record is really this node under another
+/// name: it carries our global self_id (learned by polling it), or it is a
+/// WolfStack record with our hostname and port. Such a record makes the poll
+/// loop call ourselves.
+///
+/// The self_id arm is the one that catches a node the master added by a DNS
+/// name (RutgerDiehard 2026-11-03: `printer.private.internal`). That name is
+/// neither one of our IPs nor our short hostname `printer`, so the older
+/// hostname+port test never matched, and the record stayed in the registry
+/// with the node polling itself and rejecting its own signatures.
+pub(crate) fn is_self_alias(n: &Node, self_id: &str, self_hostname: &str, self_port: u16) -> bool {
+    if n.is_self || n.id == self_id || n.node_type != "wolfstack" {
+        return false;
+    }
+    n.self_id.as_deref() == Some(self_id)
+        || (n.hostname == self_hostname && n.port == self_port)
+}
+
 /// How strongly does a gossiped node entry identify as *us*?
 ///
 /// Returns `(is_self, is_self_strong)`.
@@ -2586,6 +2608,15 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                     if let Ok(msg) = read_status_report(resp).await
                         && let AgentMessage::StatusReport(report) = msg {
                             let StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, wolfnet_reserved_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, poll_interval_secs: peer_poll_interval, license_key, pubkey: peer_pubkey } = *report;
+                            // The "peer" answered with OUR self_id: this record is
+                            // us under another address (our own DNS name, say).
+                            // Drop it before anything below pins our own key on it
+                            // or merges its gossip as a foreign node's.
+                            if !peer_self_id.is_empty() && peer_self_id == cluster.self_id {
+                                cluster.forget_self_alias(&node.id);
+                                poll_ok = true;
+                                break;
+                            }
                             let now = now_unix();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -2949,7 +2980,16 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                         || (n.address == known.address && n.port == known.port && n.pve_node_name == known.pve_node_name)
                                         || (n.hostname == known.hostname && n.port == known.port && n.node_type == known.node_type)
                                     });
-                                    if !already_known {
+                                    // Seed only a record that carries its global self_id —
+                                    // the same rule merge_member_refs applies. Until the
+                                    // gossiping node has polled the peer, its record has
+                                    // no self_id, and the address may be a DNS name that
+                                    // none of our self-checks can recognise — so a node
+                                    // the master added by name seeded ITSELF as a peer
+                                    // here (RutgerDiehard 2026-11-03). One poll cycle
+                                    // later the record carries the self_id and either
+                                    // seeds correctly or is recognised as us above.
+                                    if !already_known && known_sid.is_some() {
                                         // Only auto-add nodes on private/local networks
                                         // Public-IP nodes must be added manually to prevent
                                         // machines from accidentally switching hosts
@@ -3816,6 +3856,46 @@ mod lock_poison_tests {
             test_node("peer-2"),
         );
         assert_eq!(state.nodes_read().len(), 2);
+    }
+
+    fn alias_node(id: &str, hostname: &str, self_id: Option<&str>) -> Node {
+        let mut n = test_node(id);
+        n.hostname = hostname.to_string();
+        n.address = hostname.to_string();
+        n.node_type = "wolfstack".to_string();
+        n.self_id = self_id.map(str::to_string);
+        n
+    }
+
+    /// RutgerDiehard 2026-11-03: the master added `printer` by its DNS name,
+    /// so `printer`'s registry held a record for itself under
+    /// `printer.private.internal`. Neither the hostname nor any IP matched,
+    /// so only the self_id identifies it.
+    #[test]
+    fn a_record_carrying_our_self_id_is_us_under_another_name() {
+        let n = alias_node("node-5441031c", "printer.private.internal", Some("ws-test"));
+        assert!(is_self_alias(&n, "ws-test", "printer", 8553));
+        // A genuine peer is never an alias.
+        let peer = alias_node("node-a", "other.private.internal", Some("ws-other"));
+        assert!(!is_self_alias(&peer, "ws-test", "printer", 8553));
+        // Not yet polled (no self_id), different name: cannot be told apart here —
+        // which is why gossip must not seed such a record in the first place.
+        let unpolled = alias_node("node-b", "printer.private.internal", None);
+        assert!(!is_self_alias(&unpolled, "ws-test", "printer", 8553));
+        // The older hostname+port arm still holds.
+        let same_host = alias_node("node-c", "printer", None);
+        assert!(is_self_alias(&same_host, "ws-test", "printer", 8553));
+    }
+
+    #[test]
+    fn get_all_nodes_hides_a_self_alias_but_keeps_peers() {
+        let state = bare_state();
+        state.nodes_write().insert("node-5441031c".into(),
+            alias_node("node-5441031c", "printer.private.internal", Some("ws-test")));
+        state.nodes_write().insert("node-a".into(),
+            alias_node("node-a", "other.private.internal", Some("ws-other")));
+        let ids: Vec<String> = state.get_all_nodes().into_iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec!["node-a".to_string()]);
     }
 
     /// Same contract for the tombstone set: a poisoned set must not stop
