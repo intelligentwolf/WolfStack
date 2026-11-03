@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.42.2: PBS file-level backups are pruned instead of piling up forever** _(2026-11-03 — [`b326b8d1`](https://github.com/intelligentwolf/WolfStack/commit/b326b8d16622d2d2dea0cf3c7d167a16f85c2474))_
+- **v25.42.1: a --minimal install stays minimal through upgrades** _(2026-10-30 — [`106da3ae`](https://github.com/intelligentwolf/WolfStack/commit/106da3ae3ac8c9a20a28910b98147419e57767f1))_
 - **v25.42.0: macOS in the App Store, and Docker apps can now be given KVM** _(2026-10-30 — [`5cff7781`](https://github.com/intelligentwolf/WolfStack/commit/5cff7781dc8ad8311fd22999b62f22e1c5457a77))_
 - **v25.41.1: a disabled or masked WolfNet now stays off** _(2026-10-29 — [`6c131208`](https://github.com/intelligentwolf/WolfStack/commit/6c1312080c8c59d935c70c1e145bd333a81e926d))_
 - **v25.41.0: low-traffic cluster polling for constrained nodes, and no lxcbr0 without LXC** _(2026-10-28 — [`d34a1dbd`](https://github.com/intelligentwolf/WolfStack/commit/d34a1dbd372d846e0ec26ae1fc7d95de67a26dcc))_
