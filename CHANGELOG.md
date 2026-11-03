@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.42.3: a node added by DNS name no longer polls itself** _(2026-11-03 — [`355eceb1`](https://github.com/intelligentwolf/WolfStack/commit/355eceb1923ac6912a5963fe6a2bf550c401bb8c))_
 - **v25.42.2: PBS file-level backups are pruned instead of piling up forever** _(2026-11-03 — [`b326b8d1`](https://github.com/intelligentwolf/WolfStack/commit/b326b8d16622d2d2dea0cf3c7d167a16f85c2474))_
 - **v25.42.1: a --minimal install stays minimal through upgrades** _(2026-10-30 — [`106da3ae`](https://github.com/intelligentwolf/WolfStack/commit/106da3ae3ac8c9a20a28910b98147419e57767f1))_
 - **v25.42.0: macOS in the App Store, and Docker apps can now be given KVM** _(2026-10-30 — [`5cff7781`](https://github.com/intelligentwolf/WolfStack/commit/5cff7781dc8ad8311fd22999b62f22e1c5457a77))_
