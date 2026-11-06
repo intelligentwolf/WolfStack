@@ -1087,31 +1087,21 @@ done
 # preserves the OLD join-token, cluster secret, and nodes.json, which on a
 # fresh box looks like an upgrade but on a moved-disk-to-new-host can mean
 # the new node ends up trying to join its old cluster with stale state.
+#
+# custom-cluster-secret on its own is NOT evidence of a prior install: older
+# copies of this script wrote it in pre-flight, BEFORE the confirmation
+# prompt, so a run that aborted at the prompt (e.g. no tty without --yes)
+# left only that file behind — and the retry was then treated as an upgrade
+# that installed NO optional runtimes (no Docker, LXC or KVM) while the
+# summary still said "Docker already installed" (codewolf, 2026-11-06).
 IS_UPGRADE=false
-if [ -d /etc/wolfstack ] && [ "$(ls -A /etc/wolfstack 2>/dev/null)" ]; then
+if [ -d /etc/wolfstack ] \
+    && [ "$(ls -A /etc/wolfstack 2>/dev/null | grep -vx 'custom-cluster-secret')" ]; then
     IS_UPGRADE=true
     echo "  ℹ /etc/wolfstack already exists with content — treating this as an upgrade. Existing config, cluster secret, and join token will be preserved."
     if [ -f /etc/wolfstack/custom-cluster-secret ]; then
         echo "    • Custom cluster secret is set on this node. If joining a NEW cluster, delete /etc/wolfstack/custom-cluster-secret and /etc/wolfstack/nodes.json before adding this node from the master."
     fi
-fi
-
-# Fresh install only: generate a unique per-install cluster secret so a new
-# node never runs on the built-in default (that default is a constant in the
-# source — a node still on it would accept inter-node calls from anyone who
-# knows the constant). Guarded on both IS_UPGRADE=false AND absence of the
-# file, so an upgrade or an already-configured node is NEVER touched — this
-# cannot change the secret on an existing cluster. A fresh node with its own
-# secret still joins a cluster normally: the join handshake rekeys it to the
-# fleet secret. Format matches auth::generate_cluster_secret() (wsk_ + 64 hex).
-if [ "$IS_UPGRADE" = false ] && [ ! -s /etc/wolfstack/custom-cluster-secret ]; then
-    mkdir -p /etc/wolfstack
-    _ws_secret="wsk_$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    if printf '%s' "$_ws_secret" > /etc/wolfstack/custom-cluster-secret 2>/dev/null; then
-        chmod 600 /etc/wolfstack/custom-cluster-secret 2>/dev/null || true
-        echo "  ✓ Generated a unique cluster secret for this install (not the built-in default)."
-    fi
-    unset _ws_secret
 fi
 
 # Detect whether this upgrade is crossing the v23.11 boundary (when
@@ -1211,6 +1201,26 @@ if [ "$ASSUME_YES" != true ]; then
     fi
 fi
 echo ""
+
+# Fresh install only: generate a unique per-install cluster secret so a new
+# node never runs on the built-in default (that default is a constant in the
+# source — a node still on it would accept inter-node calls from anyone who
+# knows the constant). Guarded on both IS_UPGRADE=false AND absence of the
+# file, so an upgrade or an already-configured node is NEVER touched — this
+# cannot change the secret on an existing cluster. A fresh node with its own
+# secret still joins a cluster normally: the join handshake rekeys it to the
+# fleet secret. Format matches auth::generate_cluster_secret() (wsk_ + 64 hex).
+# Runs AFTER the confirmation prompt: nothing may be written to the host
+# before the operator says yes, and an aborted run must leave no state.
+if [ "$IS_UPGRADE" = false ] && [ ! -s /etc/wolfstack/custom-cluster-secret ]; then
+    mkdir -p /etc/wolfstack
+    _ws_secret="wsk_$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    if printf '%s' "$_ws_secret" > /etc/wolfstack/custom-cluster-secret 2>/dev/null; then
+        chmod 600 /etc/wolfstack/custom-cluster-secret 2>/dev/null || true
+        echo "  ✓ Generated a unique cluster secret for this install (not the built-in default)."
+    fi
+    unset _ws_secret
+fi
 
 # ─── Update system packages first ─────────────────────────────────────────
 # Ensures package index is in sync and avoids dependency mismatches
@@ -2248,8 +2258,13 @@ except Exception:
         fi
         echo ""
     fi
-else
+elif command -v docker >/dev/null 2>&1; then
     echo "✓ Docker already installed"
+else
+    # WANT_DOCKER=false here means either the runtime choice excluded Docker
+    # or the package-index refresh above failed — don't claim it's installed.
+    echo "ℹ Docker NOT installed (not selected for this run, or the package index refresh failed)."
+    echo "    Re-run with --with-docker or --full to add it."
 fi
 
 # ─── Install WolfNet (cluster network layer) ────────────────────────────────
