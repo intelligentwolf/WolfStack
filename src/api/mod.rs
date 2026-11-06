@@ -2126,9 +2126,20 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
 /// "host header is incorrect for passkeys" failure.
 fn passkey_rp_origin(req: &HttpRequest, state: &web::Data<AppState>) -> Result<(String, String), String> {
     let fwd_host  = req.headers().get("X-Forwarded-Host").and_then(|v| v.to_str().ok());
-    let host      = req.headers().get("Host").and_then(|v| v.to_str().ok());
     let fwd_proto = req.headers().get("X-Forwarded-Proto").and_then(|v| v.to_str().ok());
-    derive_passkey_rp_origin(host, fwd_host, fwd_proto, state.tls_enabled)
+    derive_passkey_rp_origin(request_host(req), fwd_host, fwd_proto, state.tls_enabled)
+}
+
+/// The host the client addressed: the `Host` header (HTTP/1.1), else the URI
+/// authority. Over HTTP/2 browsers send the host only as the `:authority`
+/// pseudo-header, which actix-http stores in the request URI and never turns
+/// into a `Host` header (actix-http 3.11.2 h2/dispatcher.rs:123
+/// `head.uri = parts.uri`; actix-web 4.12.1 info.rs:137-138 uses the same
+/// Host-then-authority order). Reading only `Host` made passkey ceremonies
+/// fail with "Missing Host header" on a direct HTTP/2 TLS connection.
+fn request_host(req: &HttpRequest) -> Option<&str> {
+    req.headers().get("Host").and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
 }
 
 /// Pure function that derives (rp_id, origin) from raw header values.
@@ -51453,7 +51464,37 @@ mod external_url_tests {
 
 #[cfg(test)]
 mod passkey_origin_tests {
-    use super::derive_passkey_rp_origin;
+    use super::{derive_passkey_rp_origin, request_host};
+
+    // HTTP/2 direct (RutgerDiehard 2026-11-06): no Host header, the host
+    // arrives only as :authority, which actix stores in the request URI.
+    #[test]
+    fn http2_authority_without_host_header() {
+        let req = actix_web::test::TestRequest::default()
+            .uri("https://wolfstack.lan:8553/api/auth/passkey/register/start")
+            .to_http_request();
+        assert!(req.headers().get("Host").is_none());
+        assert_eq!(request_host(&req), Some("wolfstack.lan:8553"));
+        let r = derive_passkey_rp_origin(request_host(&req), None, None, true).unwrap();
+        assert_eq!(r.0, "wolfstack.lan");
+        assert_eq!(r.1, "https://wolfstack.lan:8553");
+    }
+    // HTTP/1.1: the Host header still wins over a URI authority.
+    #[test]
+    fn host_header_preferred_over_uri_authority() {
+        let req = actix_web::test::TestRequest::default()
+            .uri("https://other.example:9/x")
+            .insert_header(("Host", "wolfstack.lan:8553"))
+            .to_http_request();
+        assert_eq!(request_host(&req), Some("wolfstack.lan:8553"));
+    }
+    // Neither present (HTTP/1.0 origin-form request) → still refused.
+    #[test]
+    fn no_host_and_no_authority_is_refused() {
+        let req = actix_web::test::TestRequest::default().uri("/x").to_http_request();
+        assert_eq!(request_host(&req), None);
+        assert!(derive_passkey_rp_origin(request_host(&req), None, None, true).is_err());
+    }
 
     // Direct local access (no reverse proxy)
     #[test]
