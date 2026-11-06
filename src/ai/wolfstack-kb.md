@@ -280,7 +280,7 @@ Node-ROLES keystone for HA shared hosting. Each node carries `roles: Vec<NodeRol
 - Manual unblock: `/api/security/auth-unblock` (propagates); lockout list at `/api/security/auth-lockouts`
 
 ### Passkey login behind a reverse proxy (v22.6.9+)
-- `passkey_rp_origin()` reads `X-Forwarded-Proto` and `X-Forwarded-Host` first, falls back to `Host` + local TLS state. Missing headers behind a TLS-terminating proxy → "host header is incorrect for passkeys"
+- `passkey_rp_origin()` reads `X-Forwarded-Proto` and `X-Forwarded-Host` first, falls back to `Host` (or the HTTP/2 `:authority` when there is no Host header) + local TLS state. Missing headers behind a TLS-terminating proxy → "host header is incorrect for passkeys"
 - Multi-hop proxy chains: takes the first comma-separated value (original client-facing host/scheme)
 - Bogus `X-Forwarded-Proto` values fall back to local TLS state; IPv6 hosts handled correctly
 
