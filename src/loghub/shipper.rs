@@ -15,8 +15,8 @@
 //!   - **LXC** — `lxc-attach … journalctl -o json` per running container (same
 //!     entry point as [`crate::containers::lxc_logs`]), with its own cursor.
 //!
-//! Cursors live in memory: on disable or restart we re-baseline from "now"
-//! (`--since now`) so we never replay a huge backlog, and on any journalctl
+//! Cursors live in memory: on disable or restart we re-baseline at the newest
+//! journal entry (`-n 1`, not forwarded) so we never replay a huge backlog, and on any journalctl
 //! failure (e.g. a vacuumed/rotated cursor) we reset rather than wedge.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -74,7 +74,7 @@ pub fn ship_loop(loghub: Arc<LogHubState>, cluster: Arc<ClusterState>, secret: S
         let cfg = { loghub.config.read().unwrap().clone() };
 
         if !cfg.enabled {
-            // Reset all cursors/spool so re-enabling starts clean from "now"
+            // Reset all cursors/spool so re-enabling re-baselines at the newest entry
             // instead of replaying whatever accumulated while we were off.
             journ_cursor = None;
             docker_ns.clear();
@@ -112,7 +112,7 @@ fn denylisted(unit: &str, cfg: &LogHubConfig) -> bool {
 /// Run a journalctl invocation in JSON mode and return parsed entries plus the
 /// new cursor. `program`/`pre_args` let the same code drive the host journal
 /// (`journalctl …`) and a container's journal (`lxc-attach … -- journalctl …`).
-/// On any failure the cursor resets to `None` (re-baseline from "now") rather
+/// On any failure the cursor resets to `None` (re-baseline at the newest entry) rather
 /// than wedging on a stale cursor.
 fn journalctl_json(
     program: &str,
@@ -123,11 +123,15 @@ fn journalctl_json(
     args.push("-o".into());
     args.push("json".into());
     args.push("--no-pager".into());
+    // Baseline: with no cursor, read only the newest entry to learn its cursor.
+    // `--since now` cannot baseline — "now" is evaluated per call, so it matches
+    // nothing even on a busy journal, no cursor is ever recorded, and every
+    // later round repeats the same empty query, so nothing ever ships.
     match cursor {
         Some(c) => args.push(format!("--after-cursor={c}")),
         None => {
-            args.push("--since".into());
-            args.push("now".into());
+            args.push("-n".into());
+            args.push("1".into());
         }
     }
 
@@ -157,6 +161,12 @@ fn journalctl_json(
                 break;
             }
         }
+    }
+    if cursor.is_none() {
+        // A baseline round only establishes the cursor. The entry it read was
+        // written before shipping started, so it is not forwarded — the same
+        // "start from now, never replay a backlog" rule the module states.
+        return (Vec::new(), newcur);
     }
     (vals, newcur)
 }
