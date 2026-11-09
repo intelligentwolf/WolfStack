@@ -389,12 +389,15 @@ fn resolve_hub(loghub: &Arc<LogHubState>, cluster: &Arc<ClusterState>) -> HubTar
     if hub_id == loghub.node_id {
         return HubTarget::SelfLocal;
     }
-    for n in cluster.get_all_nodes() {
-        if n.id == hub_id {
-            return HubTarget::Remote { address: n.address, port: n.port };
-        }
+    // Cluster.nodes is keyed by a locally-assigned `node-{uuid}`, so the same
+    // hub has a different key on every peer; `hub_node_id` is the hub's own
+    // self_id. `get_node` matches the local key first, then falls back to the
+    // peer's self_id — a key-only match never found the hub from any other node.
+    match cluster.get_node(&hub_id) {
+        Some(n) if n.is_self => HubTarget::SelfLocal,
+        Some(n) => HubTarget::Remote { address: n.address, port: n.port },
+        None => HubTarget::None,
     }
-    HubTarget::None
 }
 
 fn requeue(spool: &mut VecDeque<LogEvent>, events: Vec<LogEvent>, loghub: &Arc<LogHubState>) {

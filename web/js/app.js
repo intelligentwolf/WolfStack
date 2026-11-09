@@ -41091,7 +41091,9 @@ async function fleetLogsLoadSettings() {
     } catch (_) {}
     const nodeOpts = (Array.isArray(allNodes) ? allNodes : [])
         .filter(n => (n.node_type || 'wolfstack') === 'wolfstack')
-        .map(n => `<option value="${escapeHtml(n.id)}"${n.id === cfg.hub_node_id ? ' selected' : ''}>${escapeHtml(n.hostname || n.id)}${n.id === selfId ? ' (this node)' : ''}</option>`)
+        // The server stores the hub as its own self_id (canonical across nodes);
+        // a peer's option value is this node's local key, so match either form.
+        .map(n => `<option value="${escapeHtml(n.id)}"${(n.id === cfg.hub_node_id || (n.self_id && n.self_id === cfg.hub_node_id)) ? ' selected' : ''}>${escapeHtml(n.hostname || n.id)}${n.id === selfId ? ' (this node)' : ''}</option>`)
         .join('');
     const gb = ((cfg.max_bytes || 0) / (1024 * 1024 * 1024)) || 10;
     const chk = (id, on, label, hint) => `<label style="display:flex;align-items:center;gap:8px;margin:6px 0;color:var(--text-primary,#fff);">

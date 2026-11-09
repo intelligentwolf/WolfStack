@@ -48509,7 +48509,11 @@ fn logs_hub_route(state: &web::Data<AppState>) -> HubRoute {
     if hub_id == state.loghub.node_id {
         return HubRoute::Local;
     }
-    match state.cluster.get_all_nodes().into_iter().find(|n| n.id == hub_id) {
+    // `hub_node_id` is the hub's own self_id; peers key it by a local
+    // `node-{uuid}`, so resolve through get_node (local key, then self_id) —
+    // the same lookup the shipper's resolve_hub uses.
+    match state.cluster.get_node(&hub_id) {
+        Some(n) if n.is_self => HubRoute::Local,
         Some(n) => HubRoute::Remote(Box::new(n)),
         None => HubRoute::NoHub,
     }
@@ -48683,7 +48687,42 @@ async fn logs_config_put(
         return fleet_logs_locked();
     }
 
-    let new_cfg = body.into_inner();
+    let mut new_cfg = body.into_inner();
+    // The hub picker offers this node's LOCAL key for each peer (`node-{uuid}`),
+    // which no other node recognises. Store the hub's own self_id instead, so
+    // every node — including the hub itself — resolves the same value. Only the
+    // operator's node translates; an internal push already carries the
+    // canonical id, and on a peer that id may not be a local key at all.
+    // Refuse rather than save an id no other node can resolve: that fails
+    // silently (peers spool, the would-be hub never ingests).
+    if !is_internal
+        && let Some(hub) = new_cfg.hub_node_id.clone()
+        && hub != state.loghub.node_id
+    {
+        match state.cluster.get_node(&hub) {
+            Some(n) if n.is_self => {
+                new_cfg.hub_node_id = Some(state.loghub.node_id.clone());
+            }
+            Some(n) => match n.self_id.clone() {
+                Some(sid) => new_cfg.hub_node_id = Some(sid),
+                None => {
+                    return HttpResponse::Conflict().json(serde_json::json!({
+                        "error": format!(
+                            "{} has not reported its node identity yet, so other nodes \
+                             could not find it as the log hub. Wait for it to come \
+                             online in the cluster, then save again.",
+                            if n.hostname.is_empty() { n.id.clone() } else { n.hostname.clone() }
+                        )
+                    }));
+                }
+            },
+            None => {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": "The selected hub node is not a member of this cluster."
+                }));
+            }
+        }
+    }
     if let Err(e) = new_cfg.save() {
         return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
     }
