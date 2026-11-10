@@ -38181,14 +38181,39 @@ function excludeMapFor(prefix) { return prefix === 'sched-' ? _scheduleExcludeMa
 // Render the editable item list inside the Schedule modal. selectedKeys is a Set
 // of "type:name" to pre-tick; backupAll ticks + disables everything (the schedule
 // will auto-include whatever is present at run time).
-function renderScheduleTargets(selectedKeys, backupAll) {
+//
+// savedTargets is the schedule's stored target list when editing one that
+// picks specific items. Any of them this node no longer has (moved to another
+// host, deleted, renamed) gets its own ticked row at the top, so it can be
+// unticked. Without a row the item was kept on every save and could never be
+// taken out of the schedule (RutgerDiehard 2026-11-10: an LXC moved to another
+// host stayed in the schedule for good).
+function renderScheduleTargets(selectedKeys, backupAll, savedTargets = []) {
     const container = document.getElementById('schedule-target-list');
     if (!container) return;
     const targets = Array.isArray(window._backupTargets) ? window._backupTargets : [];
-    if (!targets.length) {
+    const liveKeys = new Set(targets.map(t => `${t.type}:${t.name}`));
+    const missing = savedTargets.filter(t => t && t.type && !liveKeys.has(`${t.type}:${t.name}`));
+    if (!targets.length && !missing.length) {
         container.innerHTML = renderEmptyState({ title: 'No containers, VMs, or configs found to backup.' });
         return;
     }
+    // The stored target object is the checkbox value verbatim, so a kept item
+    // keeps its mount exclusions and stop/keep-running choices.
+    const missingBlock = missing.length ? `
+        <div data-missing-targets style="border:1px solid var(--border); border-left:3px solid var(--warning, #f59e0b); border-radius:var(--radius-sm); padding:6px 8px; display:flex; flex-direction:column; gap:4px;">
+            <div style="font-size:11px; color:var(--text-secondary);">
+                <strong style="color:var(--text-primary);">Not on this node</strong>
+                <span style="margin-left:6px;">Moved, renamed or deleted. Untick to remove from this schedule.</span>
+            </div>
+            ${missing.map(t => `<div style="background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); padding:6px 10px; font-size:12px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                    <input type="checkbox" class="schedule-target-cb" data-missing-target value="${JSON.stringify(t).replace(/"/g, '&quot;')}" data-target-key="${escapeHtml(`${t.type}:${t.name}`)}" checked ${backupAll ? 'disabled' : ''}>
+                    <span style="flex:1;"><span style="font-weight:500;">${escapeHtml(t.name || t.type)}</span>
+                    <span style="color:var(--text-muted); font-size:10px; margin-left:6px;">${escapeHtml(String(t.type).toUpperCase())}</span></span>
+                </label>
+            </div>`).join('')}
+        </div>` : '';
     const cardFor = (t) => {
         const key = `${t.type}:${t.name}`;
         const val = JSON.stringify(t).replace(/"/g, '&quot;');
@@ -38225,7 +38250,7 @@ function renderScheduleTargets(selectedKeys, backupAll) {
             </label>
             ${s.targets.map(cardFor).join('')}
         </div>`).join('');
-    container.innerHTML = stackBlocks + singles.map(cardFor).join('');
+    container.innerHTML = missingBlock + stackBlocks + singles.map(cardFor).join('');
 }
 
 // Read the schedule modal's picker into a target array (with mount exclusions).
@@ -39013,20 +39038,11 @@ function editSchedule(id) {
     } else {
         setScheduleModalMode('items');
         const wantKeys = new Set(schedTargets.map(t => `${t.type}:${t.name}`));
-        renderScheduleTargets(wantKeys, !!s.backup_all);
+        // Under "back up everything" the stored targets are only mount
+        // overrides for the live set, not a selection, so none of them is a
+        // missing item to show.
+        renderScheduleTargets(wantKeys, !!s.backup_all, s.backup_all ? [] : schedTargets);
         if (allCb) { allCb.disabled = false; allCb.checked = !!s.backup_all; }
-        // Any scheduled item not present in the current list (container offline /
-        // on another node / deleted) has no checkbox — warn that it's KEPT as-is
-        // so the operator isn't surprised, and so createSchedule preserves it
-        // rather than silently dropping it.
-        if (!s.backup_all) {
-            const rendered = new Set(Array.from(document.querySelectorAll('#schedule-target-list .schedule-target-cb'))
-                .map(cb => cb.getAttribute('data-target-key')));
-            const orphans = schedTargets.filter(t => t && !rendered.has(`${t.type}:${t.name}`));
-            if (orphans.length) {
-                showToast(`${orphans.length} scheduled item(s) aren't in the current list (offline or on another node) and will be kept as-is: ${orphans.map(t => t.name || t.type).join(', ')}`, 'info', 8000);
-            }
-        }
     }
     const sumEl = document.getElementById('schedule-selected-summary');
     if (sumEl) sumEl.textContent = '';
@@ -39751,9 +39767,10 @@ async function createSchedule() {
         backup_all = !!(allCb && allCb.checked);
         finalTargets = backup_all ? [] : getScheduleTargets();
         if (!backup_all && editing) {
-            // Preserve any scheduled targets the picker couldn't show (container
-            // offline / on another node / deleted) — the operator never saw a
-            // checkbox for them, so dropping them would be a silent data loss.
+            // Safety net: keep any scheduled target that has no checkbox at
+            // all. Items this node no longer has DO get one (the "Not on this
+            // node" rows in renderScheduleTargets) and are dropped when unticked;
+            // this only catches a target the picker failed to render.
             const rendered = new Set(Array.from(document.querySelectorAll('#schedule-target-list .schedule-target-cb'))
                 .map(cb => cb.getAttribute('data-target-key')));
             const orphans = (editing.targets || []).filter(t => t && !rendered.has(`${t.type}:${t.name}`));
