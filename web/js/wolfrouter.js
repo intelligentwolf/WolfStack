@@ -4799,12 +4799,15 @@
         if (!wrTrMap) {
             wrTrMap = L.map(el, { worldCopyJump: true, zoomControl: true })
                 .setView([20, 0], 2);
-            // Same dark CartoDB tiles the home-page world map uses, so the
+            // Same OpenStreetMap tiles + theme darkening as the home-page
+            // world map (app.js OSM_TILE_URL / refreshMapTheme), so the
             // traceroute view feels like part of the same UI.
-            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
-                attribution: '© OpenStreetMap, © CARTO',
-                maxZoom: 18,
+            wrTrMap.attributionControl.setPrefix(false);
+            L.tileLayer(OSM_TILE_URL, {
+                attribution: OSM_ATTRIBUTION,
+                maxZoom: 19,
             }).addTo(wrTrMap);
+            refreshMapTheme();
             wrTrLayer = L.layerGroup().addTo(wrTrMap);
         }
         // Fix sizing in case the tab was display:none when the map was created.
