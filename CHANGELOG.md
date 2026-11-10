@@ -8,6 +8,9 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.42.9: "Run this backup now" answers at once and cannot overlap itself** _(2026-11-10 — [`ca4daece`](https://github.com/intelligentwolf/WolfStack/commit/ca4daecea151a7a7e45bdbdb96f0078445522d7f))_
+- **v25.42.8: an item that left the node can be removed from a backup schedule** _(2026-11-10 — [`11e6db0a`](https://github.com/intelligentwolf/WolfStack/commit/11e6db0a8f5e6b6080908a729a5b70208aac33ae))_
+- **v25.42.7: on-access scanning can read root-only files, and the maps load again** _(2026-11-10 — [`fc3846a0`](https://github.com/intelligentwolf/WolfStack/commit/fc3846a006341c1e88fdafe91e0d8f622bc56f4f))_
 - **v25.42.6: Fleet Logs reach the hub from every node** _(2026-11-09 — [`ace18709`](https://github.com/intelligentwolf/WolfStack/commit/ace18709613a588778a2318c5c61d98d09dce692))_
 - **v25.42.5: Fleet Logs ship again** _(2026-11-09 — [`234e2178`](https://github.com/intelligentwolf/WolfStack/commit/234e2178d36a7cb5095d0294efbd0e45812c37c2))_
 - **v25.42.4: passkeys work over direct HTTP/2** _(2026-11-06 — [`878753da`](https://github.com/intelligentwolf/WolfStack/commit/878753daaaec2cdf0e82b3663dea8bbeff73e7e9))_
