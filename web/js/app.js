@@ -38783,6 +38783,11 @@ function renderSchedules(schedules) {
         const enabled = s.enabled
             ? '<span class="badge" style="background:#22c55e; color:#fff;">Active</span>'
             : '<span class="badge" style="background:#6b7280; color:#fff;">Disabled</span>';
+        // A run in progress is shown in the row and holds the Run button, so a
+        // click is never met with silence (RutgerDiehard 2026-11-10).
+        const runningBadge = s.running
+            ? ' <span class="badge" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">Running…</span>'
+            : '';
         const bd = 'background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);';
         // "Weekly" alone never told the operator WHICH day it runs (JJ 2026-08-19).
         const runDay = formatScheduleRunDay(s);
@@ -38795,18 +38800,44 @@ function renderSchedules(schedules) {
             <td>${escapeHtml(targets)}</td>
             <td>${escapeHtml(storageLabel)}</td>
             <td>${retention}</td>
-            <td>${enabled}</td>
+            <td>${enabled}${runningBadge}</td>
             <td style="text-align:right; white-space:nowrap;">
-                <button class="btn btn-sm" onclick="runSchedule('${sid}', this)" style="${bd}" title="Run this backup now"><span class="ws-icon-clean-wrap" data-icon="play"></span></button>
+                <button class="btn btn-sm" onclick="runSchedule('${sid}', this)" style="${bd}${s.running ? ' opacity:0.5; cursor:not-allowed;' : ''}" ${s.running ? 'disabled' : ''} title="${s.running ? 'This backup is running now' : 'Run this backup now'}" aria-label="${s.running ? 'This backup is running now' : 'Run this backup now'}"><span class="ws-icon-clean-wrap" data-icon="play"></span></button>
                 <button class="btn btn-sm" onclick="editSchedule('${sid}')" style="${bd}" title="Edit schedule"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
                 <button class="btn btn-sm" onclick="toggleSchedule('${sid}', ${s.enabled ? 'false' : 'true'})" style="${bd}" title="${s.enabled ? 'Disable' : 'Enable'} schedule">${s.enabled ? '⏸' : '▶'}</button>
                 <button class="btn btn-sm" onclick="deleteSchedule('${sid}')" style="${bd}" title="Delete schedule"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
             </td>
         </tr>`;
     }).join('');
+    watchRunningSchedules(schedules);
 }
 
 let _backupSchedules = [];
+
+// While any schedule is running, re-read the schedules every 15s so the
+// "Running…" badge clears and the finished backups appear without a manual
+// refresh. One timer at most; it stops as soon as nothing is running or the
+// schedules table is no longer on the page.
+let _scheduleRunWatchTimer = null;
+function watchRunningSchedules(schedules) {
+    if (_scheduleRunWatchTimer) { clearTimeout(_scheduleRunWatchTimer); _scheduleRunWatchTimer = null; }
+    if (!schedules.some(s => s.running)) return;
+    _scheduleRunWatchTimer = setTimeout(async () => {
+        _scheduleRunWatchTimer = null;
+        if (!document.getElementById('schedules-table')) return;
+        try {
+            const res = await fetch(apiUrl('/api/backups/schedules'));
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const fresh = await res.json();
+            const finished = !fresh.some(s => s.running);
+            renderSchedules(fresh);
+            if (finished && typeof loadBackups === 'function') loadBackups();
+        } catch (e) {
+            // Keep watching through a blip; the next tick tries again.
+            watchRunningSchedules(schedules);
+        }
+    }, 15000);
+}
 
 // Run a scheduled backup on demand (Gary 2026-06-25).
 async function runSchedule(id, btn) {
@@ -38814,10 +38845,12 @@ async function runSchedule(id, btn) {
     try {
         const res = await fetch(apiUrl(`/api/backups/schedules/${id}/run`), { method: 'POST' });
         const data = await res.json();
+        // 202: the run has started in the background. Reload so the row shows
+        // "Running…" (which is also what keeps the button held).
         if (res.ok) { showToast(data.message || 'Backup started', 'success'); if (typeof loadBackups === 'function') loadBackups(); }
         else showToast(data.error || 'Failed to run backup', 'error');
     } catch (e) { showToast('Failed to run backup: ' + e.message, 'error'); }
-    finally { if (btn) btn.disabled = false; }
+    finally { if (btn && btn.isConnected) btn.disabled = false; }
 }
 
 // Enable/disable a schedule.

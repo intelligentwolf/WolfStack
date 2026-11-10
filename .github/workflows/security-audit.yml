@@ -1,0 +1,39 @@
+# Dependency vulnerability check.
+#
+# WHY: nothing looked at the crates in Cargo.lock against the RustSec
+# advisory database, so a published vulnerability in a dependency would be
+# built into a release and shipped without anyone being told. This runs
+# `cargo audit` weekly and whenever the dependency set changes.
+#
+# It is deliberately NOT part of release.yml: an advisory published against
+# a transitive crate must not block an unrelated urgent fix from shipping.
+# A red run here is the prompt to update or replace the crate.
+name: Security Audit
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+  push:
+    branches: [master, beta]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/security-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Org policy requires full-SHA pins; same pin as web-lint.yml.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Cargo.lock
+        run: cargo audit
