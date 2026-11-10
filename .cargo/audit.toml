@@ -1,0 +1,27 @@
+# cargo-audit configuration, read by .github/workflows/security-audit.yml.
+#
+# Every entry below is an advisory with NO fixed version reachable from our
+# dependency set today. Each one says why it is tolerated and what removes it.
+# Do not add an entry for anything that has an upgrade path — upgrade instead.
+
+[advisories]
+ignore = [
+    # h2 0.3.x: a peer can send unbounded empty DATA frames (CPU exhaustion).
+    # Fixed only in h2 0.4.16+, and actix-http (latest 3.21.0) still depends
+    # on h2 0.3. The only way to drop it is to turn HTTP/2 off on the admin
+    # server (actix-web `http2` feature). Remove this entry when actix-http
+    # moves to h2 0.4.
+    "RUSTSEC-2026-0258",
+
+    # rsa 0.9 "Marvin" timing side channel in private-key decryption. It
+    # arrives through sqlx-mysql, which uses RSA only to ENCRYPT a password
+    # with the server's public key (caching_sha2/sha256 auth); no private-key
+    # operation is performed. No fixed 0.9 release exists. Remove when sqlx
+    # moves to rsa 0.10.
+    "RUSTSEC-2023-0071",
+
+    # rkyv 0.7: listed in Cargo.lock as an optional dependency of
+    # rust_decimal, behind a feature we do not enable. `cargo tree -i rkyv`
+    # prints nothing: it is not compiled into the binary.
+    "RUSTSEC-2026-0235",
+]

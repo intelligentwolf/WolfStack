@@ -11,6 +11,13 @@
 //! - Handles SSL certificates via Certbot
 //! - Communicates with other WolfStack nodes over WolfNet or direct IP
 
+// The auth helpers return `Result<_, HttpResponse>` so a handler can hand the
+// refusal straight back (`if let Err(e) = require_auth(..) { return e; }`).
+// actix-web 4.19 grew HttpResponse past clippy's 128-byte threshold; boxing it
+// would change that one-line pattern at every call site in the API for an
+// error path that runs once per rejected request.
+#![allow(clippy::result_large_err)]
+
 use crate::node_identity::PeerAuth;
 mod api;
 mod stack_transfer;

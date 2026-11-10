@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "25.42.9"
+version = "25.42.10"
 edition = "2024"
 authors = ["IntelligentWolf Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -17,7 +17,7 @@ repository = "https://github.com/intelligentwolf/WolfStack"
 # Web framework
 actix-web = { version = "4", features = ["openssl"] }
 actix-tls = { version = "3.5", features = ["openssl"] }
-actix-files = "0.6"
+actix-files = "0.7"
 # Fleet Logs (loghub) — compress closed log segments. Already present
 # transitively (0.13.3 in Cargo.lock); promoted to a direct dependency.
 zstd = "0.13"
@@ -91,7 +91,7 @@ lettre = { version = "0.11", features = ["tokio1-rustls-tls", "smtp-transport", 
 # No call site inspects status_code() (verified 2026-08-18), so erroring on
 # non-2xx is strictly a fix. It is also what makes S3 connection-test error
 # classification exact (S3Error::HttpFailWithBody carries the real status).
-rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
+rust-s3 = { version = "0.38", default-features = false, features = ["tokio-rustls-tls-ring", "fail-on-err"] }
 lz4_flex = "0.11"
 
 # Database editors

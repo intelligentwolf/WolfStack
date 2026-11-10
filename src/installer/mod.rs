@@ -1124,8 +1124,8 @@ fn cert_dns_names(cert_path: &str) -> Vec<String> {
     }
     if names.is_empty() {
         for e in cert.subject_name().entries_by_nid(openssl::nid::Nid::COMMONNAME) {
-            if let Ok(s) = e.data().as_utf8() {
-                names.push(s.to_string());
+            if let Ok(s) = e.data().to_string() {
+                names.push(s);
             }
         }
     }

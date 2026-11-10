@@ -8285,7 +8285,7 @@ pub async fn local_ca_status(req: HttpRequest, state: web::Data<AppState>) -> Ht
             && let Ok(pem) = crate::local_ca::ca_cert_pem()
                 && let Ok(cert) = openssl::x509::X509::from_pem(&pem) {
                     let cn = cert.subject_name().entries_by_nid(Nid::COMMONNAME).next()
-                        .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()))
+                        .and_then(|e| e.data().to_string().ok())
                         .unwrap_or_default();
                     info["subject"] = serde_json::json!(cn);
                     info["not_after"] = serde_json::json!(cert.not_after().to_string());
