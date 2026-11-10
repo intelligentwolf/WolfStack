@@ -113,6 +113,27 @@
             color: var(--text-muted) !important;
         }
 
+        /* OpenStreetMap has no dark tile style, so dark themes invert the
+           tile pane only (markers, lines and labels keep their colours). */
+        .map-dark .leaflet-tile-pane {
+            filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9);
+        }
+
+        /* The OSM credit must stay visible (tile usage policy). Leaflet's
+           default is a white box with blue links, which glares on dark
+           themes — use the theme's own surface/text pairing instead. */
+        .leaflet-container .leaflet-control-attribution {
+            font-size: 10px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            opacity: 0.9;
+        }
+
+        .leaflet-container .leaflet-control-attribution a {
+            color: var(--text-primary);
+            text-decoration: underline;
+        }
+
         /* Bookmark Styles */
         .bookmark-item {
             display: flex;

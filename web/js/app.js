@@ -5218,7 +5218,6 @@ function dashTeardownMap() {
     _mapInitRetryCount = 0;
     if (worldMap) { try { worldMap.remove(); } catch (_) {} }
     worldMap = null;
-    worldMapTiles = null;
     mapMarkers = {};
     mapNodePositions = {};
     mapClusterLines = [];
@@ -7174,8 +7173,9 @@ function drawSparkline(canvasId, data, stroke, fill) {
 }
 
 // ─── Map Logic ───
-// Themes whose surface is light (see applyTheme's logo swap) — these want the
-// light Carto basemap; every other theme is dark-surface and wants dark tiles.
+// Themes whose surface is light (see applyTheme's logo swap) — these show the
+// OpenStreetMap tiles as served; every other theme is dark-surface and gets
+// them darkened (refreshMapTheme).
 const LIGHT_SURFACE_THEMES = ['light', 'arctic', 'fruit'];
 
 // The active theme id. applyTheme() stores it as `data-theme` on <html> and
@@ -7185,7 +7185,6 @@ function currentThemeId() {
 }
 
 let worldMap = null;
-let worldMapTiles = null;   // Leaflet tile layer, kept so we can swap light/dark
 let mapMarkers = {};
 let geoCache = {};
 let fetchingGeo = {};
@@ -7241,32 +7240,34 @@ function initMap() {
     }
     _mapInitRetryCount = 0;
 
+    // Attribution stays ON: the OSM tile usage policy requires a visible
+    // "© OpenStreetMap contributors" credit on every map using its tiles.
     worldMap = L.map('world-map', {
-        attributionControl: false,
         zoomControl: false
     }).setView([20, 0], 2);
+    worldMap.attributionControl.setPrefix(false);
 
-    worldMapTiles = L.tileLayer(mapTileUrlForTheme(), {
-        maxZoom: 19
+    L.tileLayer(OSM_TILE_URL, {
+        maxZoom: 19,
+        attribution: OSM_ATTRIBUTION
     }).addTo(worldMap);
+    refreshMapTheme();
 }
 
-// Carto basemap that matches the active theme's surface — light tiles on the
-// light-surface themes (see LIGHT_SURFACE_THEMES), dark tiles otherwise — so
-// the Infrastructure map doesn't sit as a dark slab on a light UI
-// (RutgerDiehard, 2026-08-10).
-function mapTileUrlForTheme() {
-    const style = LIGHT_SURFACE_THEMES.includes(currentThemeId()) ? 'light_all' : 'dark_all';
-    return `https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png`;
-}
+// Basemap tiles. CARTO's free basemaps.cartocdn.com started returning an
+// "API KEY REQUIRED" image for every tile (Nov 2026), so both Leaflet maps
+// use the OpenStreetMap standard tiles, which need no key. OSM has no dark
+// style; dark themes get the `.map-dark` CSS filter (index.html) instead,
+// so the map still matches the theme surface (RutgerDiehard, 2026-08-10).
+const OSM_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors';
 
-// Repaint the basemap for the current theme. Cheap no-op when the map isn't
-// built or the URL is unchanged; called from applyTheme() on every switch.
+// Darken or lighten every Leaflet basemap on the page (world map, WolfRouter
+// traceroute) for the current theme. Called when a map is built and from
+// applyTheme() on every switch.
 function refreshMapTheme() {
-    if (!worldMapTiles) return;
-    const url = mapTileUrlForTheme();
-    if (worldMapTiles._url === url) return;
-    worldMapTiles.setUrl(url);
+    const dark = !LIGHT_SURFACE_THEMES.includes(currentThemeId());
+    document.querySelectorAll('.leaflet-container').forEach(el => el.classList.toggle('map-dark', dark));
 }
 
 function updateMap(nodes) {
@@ -50663,8 +50664,8 @@ function applyTheme(themeId) {
     const logoSrc = LIGHT_SURFACE_THEMES.includes(themeId) ? 'images/wolfstack-logo-dark.png' : 'images/wolfstack-logo.png';
     document.querySelectorAll('img[alt="WolfStack"]').forEach(img => { img.src = logoSrc; });
 
-    // Repaint the Infrastructure basemap to match the new surface (dark tiles
-    // on a light theme looked like a dark slab — RutgerDiehard).
+    // Re-shade the Leaflet basemaps for the new surface (a dark map on a
+    // light theme looked like a dark slab — RutgerDiehard).
     refreshMapTheme();
 
     // Update theme picker cards (highlight active)

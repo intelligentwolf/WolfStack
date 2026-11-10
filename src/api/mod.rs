@@ -21880,6 +21880,11 @@ pub async fn antivirus_config_set(
     }
     {
         let mut g = state.antivirus.config.write().unwrap();
+        // On-access scanning is per-node state owned by POST
+        // /api/antivirus/on-access. The settings form doesn't carry it, so a
+        // plain replace reset it to false on every save while clamonacc kept
+        // running — and the findings tailer then never resumed after restart.
+        cfg.enable_on_access = g.enable_on_access;
         *g = cfg.clone();
     }
     if let Err(e) = cfg.save() {
@@ -22086,12 +22091,17 @@ pub async fn fleet_antivirus_push_config(
     if cfg.schedule_hours != 0 {
         cfg.schedule_hours = cfg.schedule_hours.clamp(1, 168);
     }
-    // Apply locally.
-    {
+    // Apply locally. `enable_on_access` is per-node (see antivirus_config_set)
+    // — keep ours here; each peer keeps its own in its PUT handler. The copy
+    // sent to peers is left as received and ignored by them.
+    let local_cfg = {
         let mut g = state.antivirus.config.write().unwrap();
-        *g = cfg.clone();
-    }
-    if let Err(e) = cfg.save() {
+        let mut local = cfg.clone();
+        local.enable_on_access = g.enable_on_access;
+        *g = local.clone();
+        local
+    };
+    if let Err(e) = local_cfg.save() {
         return HttpResponse::InternalServerError().json(serde_json::json!({
             "error": format!("local save: {}", e),
         }));
