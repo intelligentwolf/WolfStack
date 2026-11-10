@@ -24443,7 +24443,19 @@ pub async fn backup_schedules_list(
     // so `backup_schedule_create` restores any sentinel from the stored
     // schedule before saving — without that pairing an edit would persist the
     // bullets and the 02:00 run would fail to authenticate.
-    HttpResponse::Ok().json(crate::secrets::to_redacted_json(&backup::list_schedules()))
+    let mut schedules = crate::secrets::to_redacted_json(&backup::list_schedules());
+    // `running` is live state, not stored: it lets the table show a run in
+    // progress and hold the "Run now" button until it has finished.
+    if let Some(rows) = schedules.as_array_mut() {
+        for row in rows {
+            let running = row.get("id").and_then(|v| v.as_str())
+                .map(backup::schedule_run_in_progress).unwrap_or(false);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("running".into(), serde_json::Value::Bool(running));
+            }
+        }
+    }
+    HttpResponse::Ok().json(schedules)
 }
 
 /// POST /api/backups/test-storage — try to set up the destination (mount
@@ -24633,9 +24645,15 @@ pub async fn backup_schedule_run(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let id = path.into_inner();
-    match web::block(move || backup::run_schedule_now(&id)).await {
-        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
-        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    // Starts the run and answers at once (202); the run itself can take hours.
+    match web::block(move || backup::start_schedule_run(&id)).await {
+        Ok(Ok(name)) => HttpResponse::Accepted().json(serde_json::json!({
+            "message": format!("Backup '{}' started. It runs in the background and its backups are listed when it finishes.", name),
+        })),
+        Ok(Err(backup::StartScheduleRunError::AlreadyRunning(e))) =>
+            HttpResponse::Conflict().json(serde_json::json!({ "error": e })),
+        Ok(Err(backup::StartScheduleRunError::NotFound(e))) =>
+            HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
     }
 }

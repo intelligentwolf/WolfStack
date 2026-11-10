@@ -9105,22 +9105,60 @@ fn execute_schedule_run(schedule: &BackupSchedule) -> (Vec<BackupEntry>, Schedul
     (entries, summary)
 }
 
-/// On-demand schedule run returning the full summary (WolfFlow step).
-pub fn run_schedule_now_summary(id: &str) -> Result<ScheduleRunSummary, String> {
-    let mut config = load_config();
-    let idx = config.schedules.iter().position(|s| s.id == id)
-        .ok_or_else(|| format!("Schedule not found: {}", id))?;
+/// Ids of schedules with a run in progress on this node.
+static RUNNING_SCHEDULES: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-    let schedule = config.schedules[idx].clone();
-    let (new_entries, summary) = execute_schedule_run(&schedule);
-    // Only count the run as "ran" (which gates the nightly auto-run) if at least
-    // one backup actually completed — a fully-failed on-demand run must not
-    // suppress tonight's scheduled run.
-    let any_ok = new_entries.iter().any(|e| e.status == BackupStatus::Completed);
-    config.entries.extend(new_entries);
-    if any_ok {
-        config.schedules[idx].last_run = Utc::now().to_rfc3339();
+/// Held for the length of one schedule run; releases the schedule on drop,
+/// including when the run panics.
+pub struct ScheduleRunGuard(String);
+
+impl Drop for ScheduleRunGuard {
+    fn drop(&mut self) {
+        RUNNING_SCHEDULES.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
     }
+}
+
+/// Claim a schedule for one run. `None` when a run of it is already in
+/// progress — two runs of one schedule stop and start the same containers
+/// against each other and write the same archives twice (RutgerDiehard
+/// 2026-11-10: repeated "Run now" clicks each started a full run).
+fn begin_schedule_run(id: &str) -> Option<ScheduleRunGuard> {
+    RUNNING_SCHEDULES.lock().unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string())
+        .then(|| ScheduleRunGuard(id.to_string()))
+}
+
+/// Is a run of this schedule in progress on this node?
+pub fn schedule_run_in_progress(id: &str) -> bool {
+    RUNNING_SCHEDULES.lock().unwrap_or_else(|e| e.into_inner()).contains(id)
+}
+
+/// Run a schedule and record the outcome. The caller holds the schedule's
+/// `ScheduleRunGuard`.
+///
+/// The config is re-read AFTER the run, not carried across it: a run can take
+/// hours, and saving the copy loaded before it started put back every schedule
+/// and entry as it was then — reverting any schedule edited or created in the
+/// meantime.
+///
+/// `ran_at` is stamped as `last_run` (which gates the next automatic run).
+/// With `require_success` it is only stamped when at least one backup
+/// completed, so a fully-failed on-demand run doesn't suppress tonight's
+/// scheduled one.
+fn run_schedule_and_record(
+    schedule: &BackupSchedule,
+    ran_at: chrono::DateTime<Utc>,
+    require_success: bool,
+) -> Result<ScheduleRunSummary, String> {
+    let (new_entries, summary) = execute_schedule_run(schedule);
+    let any_ok = new_entries.iter().any(|e| e.status == BackupStatus::Completed);
+    let mut config = load_config();
+    config.entries.extend(new_entries);
+    if (any_ok || !require_success)
+        && let Some(s) = config.schedules.iter_mut().find(|s| s.id == schedule.id) {
+            s.last_run = ran_at.to_rfc3339();
+        }
     if schedule.retention > 0 {
         prune_schedule_backups(&mut config, &schedule.id, schedule.retention as usize);
     }
@@ -9128,10 +9166,80 @@ pub fn run_schedule_now_summary(id: &str) -> Result<ScheduleRunSummary, String> 
     Ok(summary)
 }
 
-/// On-demand schedule run — message-string façade kept for the existing
-/// `POST /api/backups/schedules/{id}/run` handler (behaviour unchanged).
+fn find_schedule(id: &str) -> Result<BackupSchedule, String> {
+    load_config().schedules.into_iter().find(|s| s.id == id)
+        .ok_or_else(|| format!("Schedule not found: {}", id))
+}
+
+fn already_running_error(schedule: &BackupSchedule) -> String {
+    format!("Schedule '{}' is already running on this node. Wait for it to finish before running it again.", schedule.name)
+}
+
+/// On-demand schedule run that blocks until it finishes and returns the full
+/// summary (WolfFlow step, MCP tool).
+pub fn run_schedule_now_summary(id: &str) -> Result<ScheduleRunSummary, String> {
+    let schedule = find_schedule(id)?;
+    let _guard = begin_schedule_run(id).ok_or_else(|| already_running_error(&schedule))?;
+    run_schedule_and_record(&schedule, Utc::now(), true)
+}
+
+/// Blocking on-demand run — message-string façade over
+/// `run_schedule_now_summary`.
 pub fn run_schedule_now(id: &str) -> Result<String, String> {
     run_schedule_now_summary(id).map(|s| s.message)
+}
+
+/// Why `start_schedule_run` did not start a run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartScheduleRunError {
+    NotFound(String),
+    AlreadyRunning(String),
+}
+
+/// Start an on-demand run on a background thread and return the schedule's
+/// name at once. For the dashboard's "Run this backup now": the request used
+/// to stay open for the whole backup, so the browser showed nothing for
+/// minutes or hours, a proxied request to another node timed out with no
+/// message, and each further click started another full run.
+pub fn start_schedule_run(id: &str) -> Result<String, StartScheduleRunError> {
+    let schedule = find_schedule(id).map_err(StartScheduleRunError::NotFound)?;
+    let guard = begin_schedule_run(id)
+        .ok_or_else(|| StartScheduleRunError::AlreadyRunning(already_running_error(&schedule)))?;
+    let name = schedule.name.clone();
+    std::thread::spawn(move || {
+        let _guard = guard;
+        match run_schedule_and_record(&schedule, Utc::now(), true) {
+            Ok(summary) => info!("backup: on-demand run finished — {}", summary.message),
+            Err(e) => error!("backup: on-demand run of '{}' could not be recorded: {}", schedule.name, e),
+        }
+    });
+    Ok(name)
+}
+
+#[cfg(test)]
+mod schedule_run_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_schedule_cannot_be_claimed_twice_until_the_first_run_ends() {
+        let id = "guard-test-claimed-twice";
+        let first = begin_schedule_run(id).expect("a schedule that is not running can be claimed");
+        assert!(schedule_run_in_progress(id));
+        assert!(begin_schedule_run(id).is_none(), "a second run must be refused while the first is going");
+        // Other schedules are unaffected.
+        assert!(begin_schedule_run("guard-test-other").is_some());
+        drop(first);
+        assert!(!schedule_run_in_progress(id));
+        assert!(begin_schedule_run(id).is_some(), "the schedule is free again once the run has ended");
+    }
+
+    #[test]
+    fn a_panicking_run_still_releases_its_schedule() {
+        let id = "guard-test-panic";
+        let guard = begin_schedule_run(id).unwrap();
+        let _ = std::thread::spawn(move || { let _g = guard; panic!("run failed"); }).join();
+        assert!(!schedule_run_in_progress(id), "a crashed run must not leave the schedule locked for good");
+    }
 }
 
 // ─── Available Targets ───
@@ -9406,41 +9514,20 @@ fn schedule_is_due(schedule: &BackupSchedule, now: chrono::DateTime<Utc>) -> boo
 /// Check all schedules and run any that are due
 /// Called from background task loop in main.rs
 pub fn check_schedules() {
-    let mut config = load_config();
     let now = Utc::now();
-    let mut changed = false;
-    // (schedule_id, retention) for schedules that ran this pass — pruned AFTER the
-    // loop, since prune_schedule_backups needs &mut config and we can't borrow that
-    // while config.schedules.iter_mut() is still live.
-    let mut to_prune: Vec<(String, usize)> = Vec::new();
-
-    for schedule in config.schedules.iter_mut() {
-        // Enabled + time-of-day + pinned day + not-already-run-this-period.
-        if !schedule_is_due(schedule, now) {
-            continue;
+    // Enabled + time-of-day + pinned day + not-already-run-this-period.
+    let due: Vec<BackupSchedule> = load_config().schedules.into_iter()
+        .filter(|s| schedule_is_due(s, now))
+        .collect();
+    for schedule in due {
+        // An on-demand run of this schedule is in progress, so it is being
+        // backed up right now; starting a second run over it is the overlap
+        // the guard exists to prevent. This period's automatic run is skipped.
+        let Some(_guard) = begin_schedule_run(&schedule.id) else { continue };
+        // Hooks + backups share one code path with the on-demand runner.
+        if let Err(e) = run_schedule_and_record(&schedule, now, false) {
+            error!("backup: scheduled run of '{}' could not be recorded: {}", schedule.name, e);
         }
-
-        // Time to run this schedule! Hooks + backups share one code path with
-        // the on-demand runner (execute_schedule_run) — entries come back
-        // already tagged with the schedule id.
-        let (new_entries, _summary) = execute_schedule_run(&*schedule);
-        config.entries.extend(new_entries);
-
-        schedule.last_run = now.to_rfc3339();
-        changed = true;
-
-        // Queue retention pruning for after the loop (shared helper, see above).
-        if schedule.retention > 0 {
-            to_prune.push((schedule.id.clone(), schedule.retention as usize));
-        }
-    }
-
-    for (schedule_id, retention) in to_prune {
-        prune_schedule_backups(&mut config, &schedule_id, retention);
-    }
-
-    if changed {
-        let _ = save_config(&config);
     }
 }
 

@@ -4924,7 +4924,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                     // lost" banner from a cached pre-fix heartbeat). no-cache
                     // means revalidate-always: unchanged files are still cheap
                     // 304s via ETag; changed files arrive immediately.
-                    .wrap(actix_web::middleware::DefaultHeaders::new().add(("Cache-Control", "no-cache")))
+                    .wrap(admin_default_headers())
                     .configure(api::configure)
                     .configure(wolfhost::configure_admin);
                 if agent_mode {
@@ -4989,7 +4989,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                             .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
                             // Same stale-UI guard as the primary listeners — see
                             // the comment there (Gary KO4BSR 2026-06-10).
-                            .wrap(actix_web::middleware::DefaultHeaders::new().add(("Cache-Control", "no-cache")))
+                            .wrap(admin_default_headers())
                             .configure(api::configure)
                             .configure(wolfhost::configure_admin);
                         if agent_mode {
@@ -5108,7 +5108,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                     // lost" banner from a cached pre-fix heartbeat). no-cache
                     // means revalidate-always: unchanged files are still cheap
                     // 304s via ETag; changed files arrive immediately.
-                    .wrap(actix_web::middleware::DefaultHeaders::new().add(("Cache-Control", "no-cache")))
+                    .wrap(admin_default_headers())
                     .configure(api::configure)
                     .configure(wolfhost::configure_admin);
                 if agent_mode {
@@ -5399,6 +5399,54 @@ fn mtls_on_connect(conn: &dyn std::any::Any, ext: &mut actix_web::dev::Extension
     >() {
         let present = tls.ssl().peer_certificate().is_some();
         ext.insert(crate::mtls::ClientCertPresented(present));
+    }
+}
+
+/// Response headers every admin-server response gets unless the handler set
+/// its own (DefaultHeaders never overwrites an explicit one).
+///
+/// - `Cache-Control: no-cache` — see the note where this is wrapped.
+/// - `X-Frame-Options: SAMEORIGIN` — the dashboard can open a root shell, so
+///   another site must not be able to frame it and trick a click
+///   (clickjacking). SAMEORIGIN, not DENY: the UI frames its own /vnc.html.
+/// - `X-Content-Type-Options: nosniff` — a response is only ever treated as
+///   the type it declares, so an uploaded or proxied file can't be run as
+///   script.
+///
+/// Deliberately absent: `Strict-Transport-Security`. Most installs serve a
+/// self-signed certificate, and HSTS turns the browser's certificate warning
+/// into a hard block with no way through — it would lock operators out of
+/// their own dashboard. The status-page listeners don't use this: those pages
+/// are public and may be embedded by their owners.
+fn admin_default_headers() -> actix_web::middleware::DefaultHeaders {
+    actix_web::middleware::DefaultHeaders::new()
+        .add(("Cache-Control", "no-cache"))
+        .add(("X-Frame-Options", "SAMEORIGIN"))
+        .add(("X-Content-Type-Options", "nosniff"))
+}
+
+#[cfg(test)]
+mod admin_default_headers_tests {
+    use actix_web::{test, web, App, HttpResponse};
+
+    #[actix_web::test]
+    async fn admin_responses_carry_the_security_headers() {
+        let app = test::init_service(
+            App::new()
+                .wrap(super::admin_default_headers())
+                .route("/", web::get().to(|| async { HttpResponse::Ok().body("ok") }))
+                .route("/own", web::get().to(|| async {
+                    HttpResponse::Ok().insert_header(("Cache-Control", "max-age=60")).body("ok")
+                })),
+        ).await;
+        let r = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        assert_eq!(r.headers().get("X-Frame-Options").unwrap(), "SAMEORIGIN");
+        assert_eq!(r.headers().get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert_eq!(r.headers().get("Cache-Control").unwrap(), "no-cache");
+        assert!(r.headers().get("Strict-Transport-Security").is_none());
+        // A handler's own header wins.
+        let r = test::call_service(&app, test::TestRequest::get().uri("/own").to_request()).await;
+        assert_eq!(r.headers().get("Cache-Control").unwrap(), "max-age=60");
     }
 }
 
