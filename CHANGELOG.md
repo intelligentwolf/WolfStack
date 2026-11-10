@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.42.10: update the HTTP stack and other dependencies with known vulnerabilities** _(2026-11-10 — [`f272ad43`](https://github.com/intelligentwolf/WolfStack/commit/f272ad43065914518b45f78f0af95c1d8b7756c5))_
 - **v25.42.9: "Run this backup now" answers at once and cannot overlap itself** _(2026-11-10 — [`ca4daece`](https://github.com/intelligentwolf/WolfStack/commit/ca4daecea151a7a7e45bdbdb96f0078445522d7f))_
 - **v25.42.8: an item that left the node can be removed from a backup schedule** _(2026-11-10 — [`11e6db0a`](https://github.com/intelligentwolf/WolfStack/commit/11e6db0a8f5e6b6080908a729a5b70208aac33ae))_
 - **v25.42.7: on-access scanning can read root-only files, and the maps load again** _(2026-11-10 — [`fc3846a0`](https://github.com/intelligentwolf/WolfStack/commit/fc3846a006341c1e88fdafe91e0d8f622bc56f4f))_
