@@ -368,7 +368,7 @@
                 <button type="button" class="login-btn" id="passkey-btn" onclick="passkeyLogin()" style="background:rgba(99,102,241,0.12); border:1px solid rgba(99,102,241,0.4);">
                     🔑 Sign in with passkey
                 </button>
-                <div id="passkey-error" class="error-msg" style="margin-top:10px; display:none;"></div>
+                <div id="passkey-error" class="error-msg" role="alert" aria-live="assertive" style="margin-top:10px; display:none;"></div>
             </div>
 
             <div id="forgot-link" style="display:none; text-align:center; margin-top:16px;">
@@ -785,8 +785,16 @@
             btn.disabled = true;
             const orig = btn.innerHTML;
             btn.innerHTML = 'Waiting for passkey…';
+            // A typed username lets the server list that account's
+            // credentials, which security keys need for passkeys that were
+            // registered as non-discoverable (older WolfStack versions).
+            const userEl = document.getElementById('username');
+            const typedUser = userEl ? userEl.value.trim() : '';
             try {
-                const startResp = await fetch('/api/auth/passkey/login/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                const startResp = await fetch('/api/auth/passkey/login/start', {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify(typedUser ? { username: typedUser } : {}),
+                });
                 if (!startResp.ok) {
                     const data = await startResp.json().catch(() => ({}));
                     throw new Error(data.error || ('Server returned ' + startResp.status));
@@ -834,7 +842,14 @@
                 try { sessionStorage.setItem('wolfstack_fresh_login', '1'); } catch (_) {}
                 window.location.href = '/';
             } catch (err) {
-                errEl.textContent = (err && err.message) || 'Passkey login failed';
+                let msg = (err && err.message) || 'Passkey login failed';
+                // NotAllowedError covers both "cancelled" and "this key has
+                // no passkey for this site" — the latter is what an older,
+                // non-discoverable passkey hits without a username.
+                if (err && err.name === 'NotAllowedError' && !typedUser) {
+                    msg += ' — if you added this passkey before passkeys became discoverable, type your username above and try again.';
+                }
+                errEl.textContent = msg;
                 errEl.style.display = '';
                 btn.disabled = false;
                 btn.innerHTML = orig;

@@ -3942,12 +3942,18 @@ pub fn install_provider(name: &str) -> Result<String, String> {
 // ─── System Logs ───
 
 /// Read system logs from journalctl
-pub fn read_system_logs(lines: usize, search: Option<&str>, unit: Option<&str>) -> Vec<String> {
+/// `boot` is an already-validated `journalctl -b` selector (see
+/// `boot_history::validate_boot_selector`): `None` = all boots, newest lines.
+pub fn read_system_logs(lines: usize, search: Option<&str>, unit: Option<&str>, boot: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--no-pager".to_string(),
         "-n".to_string(), lines.to_string(),
         "--output".to_string(), "short-iso".to_string(),
     ];
+    if let Some(b) = boot {
+        args.push("-b".to_string());
+        args.push(b.to_string());
+    }
     if let Some(u) = unit
         && !u.is_empty() {
             args.push("-u".to_string());
@@ -3964,6 +3970,14 @@ pub fn read_system_logs(lines: usize, search: Option<&str>, unit: Option<&str>) 
             let text = String::from_utf8_lossy(&o.stdout);
             text.lines().map(|l| l.to_string()).collect()
         }
+        // A specific boot was asked for: the syslog files cannot answer that,
+        // and showing the current log under a "previous boot" label would be
+        // actively misleading — report the journalctl error instead.
+        Ok(o) if boot.is_some() => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            vec![if err.is_empty() { "No journal entries for that boot.".to_string() } else { err }]
+        }
+        Err(e) if boot.is_some() => vec![format!("journalctl is not available: {}", e)],
         // journalctl absent (Unraid/Slackware, Alpine — no systemd) or
         // erroring: fall back to the classic syslog files (klasSponsor
         // 2026-07-04: System Logs view was empty on Unraid because only

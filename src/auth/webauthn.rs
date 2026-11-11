@@ -11,10 +11,17 @@
 //!   client must echo back; `finish_registration` consumes the response
 //!   and persists the credential.
 //! - Authentication: anonymous client logs in using a passkey.
-//!   `start_authentication` issues a discoverable-credential challenge;
-//!   `finish_authentication` verifies the assertion, identifies which
-//!   stored credential signed it, and returns the username for session
-//!   creation upstream.
+//!   `start_authentication` issues a discoverable-credential challenge
+//!   when no username is given, or a challenge listing that user's
+//!   credentials when one is; `finish_authentication` verifies the
+//!   assertion, identifies which stored credential signed it, and returns
+//!   the username for session creation upstream.
+//!
+//! Registration asks for a *discoverable* (resident) credential so the
+//! username-less login works. Credentials registered before that change
+//! were requested as non-discoverable — a security key holding one has
+//! nothing to offer an empty allow-list — so those still log in through
+//! the username-scoped path.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -178,8 +185,17 @@ fn registrations() -> &'static RwLock<HashMap<String, StoredState<PasskeyRegistr
     R.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn authentications() -> &'static RwLock<HashMap<String, StoredState<DiscoverableAuthentication>>> {
-    static A: OnceLock<RwLock<HashMap<String, StoredState<DiscoverableAuthentication>>>> = OnceLock::new();
+/// Which kind of authentication challenge a ceremony was issued as —
+/// decides which webauthn-rs finish call verifies the assertion.
+enum AuthCeremony {
+    /// Empty allow-list; the authenticator picks a resident credential.
+    Discoverable(DiscoverableAuthentication),
+    /// Allow-list of one user's credentials (works for non-resident ones).
+    Scoped(PasskeyAuthentication),
+}
+
+fn authentications() -> &'static RwLock<HashMap<String, StoredState<AuthCeremony>>> {
+    static A: OnceLock<RwLock<HashMap<String, StoredState<AuthCeremony>>>> = OnceLock::new();
     A.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -238,15 +254,9 @@ pub fn start_registration(
 
     // Exclude credentials this user already has, so the browser refuses
     // to re-register the same authenticator twice.
-    let exclude: Vec<CredentialID> = config
-        .credentials
-        .iter()
-        .filter(|c| c.username == username && !c.passkey_data.is_empty())
-        .filter_map(|c| {
-            serde_json::from_str::<Passkey>(&c.passkey_data)
-                .ok()
-                .map(|p| p.cred_id().clone())
-        })
+    let exclude: Vec<CredentialID> = usable_passkeys(config, username)
+        .into_iter()
+        .map(|(_, p)| p.cred_id().clone())
         .collect();
 
     // Stable per-user UUID derived from the username — webauthn-rs uses it
@@ -272,8 +282,9 @@ pub fn start_registration(
         );
     }
 
-    let json = serde_json::to_value(&ccr)
+    let mut json = serde_json::to_value(&ccr)
         .map_err(|e| format!("serialise CreationChallengeResponse: {}", e))?;
+    require_discoverable(&mut json)?;
     Ok((json, ceremony_id))
 }
 
@@ -354,17 +365,47 @@ pub fn finish_registration(
 // ─── Authentication ceremony (discoverable) ───
 // ═══════════════════════════════════════════════
 
-/// Begin the authentication ceremony in *discoverable* mode — the browser
-/// will let the user pick from any registered credential without us having
-/// to know the username up front.
+/// Begin the authentication ceremony.
+///
+/// With no `username` (or one that has no usable passkeys) this is the
+/// *discoverable* challenge — the browser lets the user pick any resident
+/// credential without us knowing who they are. With a username that has
+/// passkeys, the challenge lists that user's credential IDs, which is the
+/// only way an authenticator can use a non-resident credential (every
+/// passkey registered before registration required resident keys).
+///
+/// Listing credential IDs for a typed username does reveal that the
+/// account has passkeys; that is inherent to non-discoverable WebAuthn
+/// and the endpoint sits behind the login rate limiter.
 pub fn start_authentication(
+    config: &WebAuthnConfig,
     rp_id: &str,
     origin: &str,
+    username: Option<&str>,
 ) -> Result<(serde_json::Value, String), String> {
     let webauthn = build_webauthn(rp_id, origin)?;
-    let (rcr, auth_state) = webauthn
-        .start_discoverable_authentication()
-        .map_err(|e| format!("start_discoverable_authentication: {}", e))?;
+
+    let user_passkeys: Vec<Passkey> = match username {
+        Some(u) => usable_passkeys(config, u).into_iter().map(|(_, pk)| pk).collect(),
+        None => Vec::new(),
+    };
+
+    let (rcr, auth_state) = if user_passkeys.is_empty() {
+        let (rcr, st) = webauthn
+            .start_discoverable_authentication()
+            .map_err(|e| format!("start_discoverable_authentication: {}", e))?;
+        (rcr, AuthCeremony::Discoverable(st))
+    } else {
+        let (rcr, st) = webauthn
+            .start_passkey_authentication(&user_passkeys)
+            .map_err(|e| format!("start_passkey_authentication: {}", e))?;
+        (rcr, AuthCeremony::Scoped(st))
+    };
+    let ceremony_username = if user_passkeys.is_empty() {
+        String::new()
+    } else {
+        username.unwrap_or_default().to_string()
+    };
 
     let ceremony_id = uuid::Uuid::new_v4().to_string();
     {
@@ -375,7 +416,7 @@ pub fn start_authentication(
             StoredState {
                 data: auth_state,
                 created: Instant::now(),
-                username: String::new(),
+                username: ceremony_username,
             },
         );
     }
@@ -397,43 +438,48 @@ pub fn finish_authentication(
 ) -> Result<String, String> {
     let webauthn = build_webauthn(rp_id, origin)?;
 
-    let auth_state = {
+    let (auth_state, ceremony_username) = {
         let mut map = authentications().write().unwrap();
         purge_expired(&mut map);
         let entry = map.remove(ceremony_id)
             .ok_or_else(|| "No matching authentication ceremony — it may have expired".to_string())?;
-        entry.data
+        (entry.data, entry.username)
     };
 
     let auth_response: PublicKeyCredential = serde_json::from_value(response.clone())
         .map_err(|e| format!("Invalid authentication response payload: {}", e))?;
 
-    // Identify which credential the assertion came from so we can look up
-    // the matching Passkey and the user it belongs to.
-    let (_user_uuid, cred_id) = webauthn
-        .identify_discoverable_authentication(&auth_response)
-        .map_err(|e| format!("identify_discoverable_authentication: {}", e))?;
+    let unknown = || "Unknown credential — passkey not registered on this server".to_string();
 
-    let cred_id_b64 = base64_url(cred_id);
-
-    // Find the matching stored credential.
-    let mut idx = None;
-    let mut passkey: Option<Passkey> = None;
-    for (i, c) in config.credentials.iter().enumerate() {
-        if c.credential_id == cred_id_b64 && !c.passkey_data.is_empty()
-            && let Ok(pk) = serde_json::from_str::<Passkey>(&c.passkey_data) {
-                idx = Some(i);
-                passkey = Some(pk);
-                break;
-            }
-    }
-    let idx = idx.ok_or_else(|| "Unknown credential — passkey not registered on this server".to_string())?;
-    let passkey = passkey.unwrap();
-
-    let discoverable: DiscoverableKey = (&passkey).into();
-    let result = webauthn
-        .finish_discoverable_authentication(&auth_response, auth_state, &[discoverable])
-        .map_err(|e| format!("finish_discoverable_authentication: {}", e))?;
+    let (idx, passkey, result) = match auth_state {
+        AuthCeremony::Discoverable(st) => {
+            // Identify which credential the assertion came from so we can
+            // look up the matching Passkey and the user it belongs to.
+            let (_user_uuid, cred_id) = webauthn
+                .identify_discoverable_authentication(&auth_response)
+                .map_err(|e| format!("identify_discoverable_authentication: {}", e))?;
+            let (idx, passkey) = find_passkey(config, &base64_url(cred_id), None)
+                .ok_or_else(unknown)?;
+            let discoverable: DiscoverableKey = (&passkey).into();
+            let result = webauthn
+                .finish_discoverable_authentication(&auth_response, st, &[discoverable])
+                .map_err(|e| format!("finish_discoverable_authentication: {}", e))?;
+            (idx, passkey, result)
+        }
+        AuthCeremony::Scoped(st) => {
+            // webauthn-rs-core `authenticate_credential` already rejects a
+            // credential ID outside the challenge's allow-list
+            // (CredentialNotFound); the username filter makes our own
+            // lookup state the same restriction.
+            let cred_id_b64 = base64_url(auth_response.get_credential_id());
+            let (idx, passkey) = find_passkey(config, &cred_id_b64, Some(&ceremony_username))
+                .ok_or_else(unknown)?;
+            let result = webauthn
+                .finish_passkey_authentication(&auth_response, &st)
+                .map_err(|e| format!("finish_passkey_authentication: {}", e))?;
+            (idx, passkey, result)
+        }
+    };
 
     // Update counter / state if webauthn-rs says so. The mutable Passkey
     // copy needs to be re-serialised back into storage.
@@ -461,6 +507,55 @@ pub fn finish_authentication(
 // ═══════════════════════════════════════════════
 // ─── Helpers ───
 // ═══════════════════════════════════════════════
+
+/// webauthn-rs 0.5 `start_passkey_registration` hard-codes
+/// `require_resident_key(false)`, which sends `residentKey: "discouraged"`
+/// (webauthn-rs-core core.rs `generate_challenge_register`). A security key
+/// then stores no credential on-device, so the discoverable login (empty
+/// allow-list) has nothing to offer. Ask for a resident credential instead.
+/// This only changes the options sent to the browser: `register_credential`
+/// ignores the state's `require_resident_key`, so verification is unchanged.
+///
+/// Edited on the serialised JSON because the prelude does not re-export
+/// `ResidentKeyRequirement`. Key names are webauthn-rs-proto's camelCase
+/// serde names (attest.rs `CreationChallengeResponse.public_key`,
+/// `PublicKeyCredentialCreationOptions.authenticator_selection`, options.rs
+/// `AuthenticatorSelectionCriteria`) and match the WebAuthn spec.
+fn require_discoverable(ccr: &mut serde_json::Value) -> Result<(), String> {
+    let sel = ccr
+        .get_mut("publicKey")
+        .and_then(|pk| pk.get_mut("authenticatorSelection"))
+        .and_then(|s| s.as_object_mut())
+        .ok_or_else(|| "registration challenge has no authenticatorSelection".to_string())?;
+    sel.insert("residentKey".into(), serde_json::Value::from("required"));
+    sel.insert("requireResidentKey".into(), serde_json::Value::from(true));
+    Ok(())
+}
+
+/// Every stored credential of `username` that carries webauthn-rs state.
+fn usable_passkeys(config: &WebAuthnConfig, username: &str) -> Vec<(usize, Passkey)> {
+    config
+        .credentials
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.username == username && !c.passkey_data.is_empty())
+        .filter_map(|(i, c)| serde_json::from_str::<Passkey>(&c.passkey_data).ok().map(|pk| (i, pk)))
+        .collect()
+}
+
+/// Find the stored credential with this base64url ID, optionally
+/// restricted to one user.
+fn find_passkey(config: &WebAuthnConfig, cred_id_b64: &str, username: Option<&str>) -> Option<(usize, Passkey)> {
+    config.credentials.iter().enumerate().find_map(|(i, c)| {
+        if c.credential_id != cred_id_b64 || c.passkey_data.is_empty() {
+            return None;
+        }
+        if username.is_some_and(|u| u != c.username) {
+            return None;
+        }
+        serde_json::from_str::<Passkey>(&c.passkey_data).ok().map(|pk| (i, pk))
+    })
+}
 
 /// Deterministic UUID v5 derived from the username. WebAuthn requires a
 /// stable user.id across registrations; using a derived UUID means we
@@ -582,6 +677,38 @@ mod tests {
     fn test_build_webauthn_accepts_hostname() {
         let r = build_webauthn("wolfstack.example.com", "https://wolfstack.example.com:8553");
         assert!(r.is_ok(), "expected Ok, got {:?}", r);
+    }
+
+    #[test]
+    fn test_registration_requests_discoverable_credential() {
+        let config = WebAuthnConfig::default();
+        let (json, _id) = start_registration(
+            &config, "wolfstack.example.com", "https://wolfstack.example.com:8553", "alice", "alice",
+        ).expect("start_registration");
+        let sel = &json["publicKey"]["authenticatorSelection"];
+        assert_eq!(sel["residentKey"], "required", "got {}", sel);
+        assert_eq!(sel["requireResidentKey"], true, "got {}", sel);
+    }
+
+    #[test]
+    fn test_authentication_without_passkeys_is_discoverable() {
+        // Legacy credentials carry no passkey_data, so a typed username
+        // with nothing usable must still get the discoverable challenge.
+        let config = test_config_with_credentials();
+        let (json, _id) = start_authentication(
+            &config, "wolfstack.example.com", "https://wolfstack.example.com:8553", Some("alice"),
+        ).expect("start_authentication");
+        let allow = &json["publicKey"]["allowCredentials"];
+        assert!(allow.as_array().is_none_or(|a| a.is_empty()), "got {}", allow);
+    }
+
+    #[test]
+    fn test_find_passkey_respects_username() {
+        let config = test_config_with_credentials();
+        // No passkey_data on fixtures → never usable, whatever the filter.
+        assert!(find_passkey(&config, "cred-aaa", None).is_none());
+        assert!(find_passkey(&config, "cred-aaa", Some("alice")).is_none());
+        assert!(usable_passkeys(&config, "alice").is_empty());
     }
 
     #[test]

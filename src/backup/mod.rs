@@ -198,6 +198,15 @@ pub struct BackupStorage {
     /// PBS namespace (optional, for organizing backups)
     #[serde(default)]
     pub pbs_namespace: String,
+    /// Upload cap for `proxmox-backup-client backup`, in MB/s (base-10, the
+    /// client's `--rate`/`--burst` unit). 0 = unlimited — what every existing
+    /// config has, so absent field → byte-identical behaviour. A non-zero cap
+    /// also runs the client at `nice -n 19`. It limits network and CPU only:
+    /// an incremental run that uploads little still READS every file at full
+    /// speed, and on NVMe (`none` scheduler) no I/O priority applies either.
+    /// Blank on a backup inherits the destination's, then the primary's.
+    #[serde(default)]
+    pub pbs_rate_limit_mbps: u32,
     /// Which saved PBS destination this backup goes to. Empty means the
     /// primary connection (`/etc/wolfstack/pbs/config.json`) — which is
     /// every pre-existing config, so absent field → empty → byte-identical
@@ -324,6 +333,7 @@ impl Default for BackupStorage {
             pbs_password: String::new(),
             pbs_fingerprint: String::new(),
             pbs_namespace: String::new(),
+            pbs_rate_limit_mbps: 0,
             pbs_target_id: String::new(),
             pbs_file_level: false,
             pbs_file_level_set: false,
@@ -667,6 +677,59 @@ mod tests {
             pbs_datastore: "s3-cold".into(),
             ..PbsTarget::default()
         }
+    }
+
+    // ── Upload cap (gentle backups, 2026-11-03) ──
+    // Source: `proxmox-backup-client help backup` (client 4.2.1): `--rate` and
+    // `--burst` take "bytes/s with optional unit (B, KB (base 10), MB, …)".
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn uncapped_backup_command_is_unchanged() {
+        let storage = BackupStorage { storage_type: StorageType::Pbs, ..BackupStorage::default() };
+        let mut cmd = pbs_backup_command(&storage);
+        pbs_apply_rate_limit(&mut cmd, &storage);
+        assert_eq!(cmd.get_program(), "proxmox-backup-client");
+        assert_eq!(args_of(&cmd), vec!["backup"], "no cap → no nice, no --rate");
+    }
+
+    #[test]
+    fn capped_backup_command_is_niced_and_rate_limited() {
+        let storage = BackupStorage {
+            storage_type: StorageType::Pbs, pbs_rate_limit_mbps: 5, ..BackupStorage::default()
+        };
+        let mut cmd = pbs_backup_command(&storage);
+        cmd.arg("root.pxar:/x");
+        pbs_apply_rate_limit(&mut cmd, &storage);
+        assert_eq!(cmd.get_program(), "nice");
+        assert_eq!(args_of(&cmd), vec![
+            "-n", "19", "proxmox-backup-client", "backup", "root.pxar:/x",
+            "--rate", "5MB", "--burst", "5MB",
+        ]);
+    }
+
+    #[test]
+    fn rate_limit_inherits_destination_but_backup_value_wins() {
+        let target = PbsTarget { pbs_rate_limit_mbps: 7, ..pbs_target_fixture() };
+        let mut inherit = BackupStorage { storage_type: StorageType::Pbs, ..BackupStorage::default() };
+        apply_pbs_target(&mut inherit, &target);
+        assert_eq!(inherit.pbs_rate_limit_mbps, 7);
+        let mut own = BackupStorage {
+            storage_type: StorageType::Pbs, pbs_rate_limit_mbps: 3, ..BackupStorage::default()
+        };
+        apply_pbs_target(&mut own, &target);
+        assert_eq!(own.pbs_rate_limit_mbps, 3);
+    }
+
+    #[test]
+    fn rate_limit_absent_from_old_json_means_unlimited() {
+        let s: BackupStorage = serde_json::from_str(r#"{"type":"pbs"}"#).unwrap();
+        assert_eq!(s.pbs_rate_limit_mbps, 0);
+        let t: PbsTarget = serde_json::from_str(r#"{"id":"a","name":"b"}"#).unwrap();
+        assert_eq!(t.pbs_rate_limit_mbps, 0);
     }
 
     #[test]
@@ -4998,9 +5061,8 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
             })?;
     }
 
-    let mut cmd = Command::new("proxmox-backup-client");
-    cmd.arg("backup")
-       .arg(format!("backup.pxar:{}", isolate.display()))
+    let mut cmd = pbs_backup_command(storage);
+    cmd.arg(format!("backup.pxar:{}", isolate.display()))
        .arg("--repository").arg(&repo)
        .arg("--backup-id").arg(&backup_id)
        .arg("--backup-type").arg(backup_type);
@@ -5016,6 +5078,11 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
                  else { &storage.pbs_password };
     if !pbs_pw.is_empty() {
         cmd.env("PBS_PASSWORD", pbs_pw);
+    }
+    pbs_apply_rate_limit(&mut cmd, storage);
+    if storage.pbs_rate_limit_mbps > 0 && let Some(log_tx) = log {
+        let _ = log_tx.send(format!("  PBS: upload capped at {} MB/s, low CPU priority",
+            storage.pbs_rate_limit_mbps));
     }
 
     // Stream stderr for progress when log channel is available
@@ -5222,6 +5289,33 @@ fn ensure_pbs_client_installed() -> Result<(), String> {
 /// every PBS invocation repeats, so file-level backup + restore can't
 /// drift from the tarball path. `pbs_pw` chooses token-secret over
 /// password, exactly as `store_pbs_with_notes_and_log` does.
+/// `proxmox-backup-client backup …` for `storage`, wrapped in `nice -n 19`
+/// when the destination has an upload cap (an operator who asked for a gentle
+/// backup wants the chunking/compression CPU kept out of the way too). The
+/// cap itself is appended by `pbs_apply_rate_limit` once every positional
+/// archive is in place — the same "archives first, options after" order the
+/// existing call sites use.
+fn pbs_backup_command(storage: &BackupStorage) -> Command {
+    let mut cmd = if storage.pbs_rate_limit_mbps > 0 {
+        let mut c = Command::new("nice");
+        c.arg("-n").arg("19").arg("proxmox-backup-client");
+        c
+    } else {
+        Command::new("proxmox-backup-client")
+    };
+    cmd.arg("backup");
+    cmd
+}
+
+/// Append `--rate`/`--burst` (token-bucket upload cap, `proxmox-backup-client
+/// help backup`: "bytes/s with optional unit (B, KB (base 10), MB, …)").
+/// Burst equals the rate so a run can never spike above the cap.
+fn pbs_apply_rate_limit(cmd: &mut Command, storage: &BackupStorage) {
+    if storage.pbs_rate_limit_mbps == 0 { return; }
+    let rate = format!("{}MB", storage.pbs_rate_limit_mbps);
+    cmd.arg("--rate").arg(&rate).arg("--burst").arg(&rate);
+}
+
 fn pbs_apply_common(cmd: &mut Command, storage: &BackupStorage) {
     if !storage.pbs_fingerprint.is_empty() {
         cmd.env("PBS_FINGERPRINT", format_pbs_fingerprint(&storage.pbs_fingerprint));
@@ -5583,8 +5677,7 @@ fn backup_pbs_file_level(
         .collect();
     let cleanup = |dirs: &[PathBuf]| { for d in dirs { let _ = fs::remove_dir_all(d); } };
 
-    let mut cmd = Command::new("proxmox-backup-client");
-    cmd.arg("backup");
+    let mut cmd = pbs_backup_command(storage);
     let mut archive_count = 0;
     for p in &pairs {
         if p.archive.is_empty() { continue; } // sentinel cleanup-only pair
@@ -5605,10 +5698,15 @@ fn backup_pbs_file_level(
        .arg("--backup-id").arg(&backup_id)
        .arg("--backup-type").arg(&backup_type);
     pbs_apply_common(&mut cmd, storage);
+    pbs_apply_rate_limit(&mut cmd, storage);
 
     if let Some(log_tx) = log {
         let _ = log_tx.send(format!("  PBS file-level: {} archive(s) → {}/{}",
             archive_count, backup_type, backup_id));
+        if storage.pbs_rate_limit_mbps > 0 {
+            let _ = log_tx.send(format!("  PBS file-level: upload capped at {} MB/s, low CPU priority",
+                storage.pbs_rate_limit_mbps));
+        }
         if !pxar_excludes.is_empty() {
             // Show the operator's raw entry alongside the pxar glob it became
             // (e.g. `/mnt/docker/plex → /plex`) so the transformed pattern is
@@ -10304,6 +10402,7 @@ pub fn merge_pbs_secrets(storage: &mut BackupStorage) {
     if storage.pbs_password.is_empty()    { storage.pbs_password    = saved.pbs_password; }
     if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
     if storage.pbs_namespace.is_empty()   { storage.pbs_namespace   = saved.pbs_namespace; }
+    if storage.pbs_rate_limit_mbps == 0   { storage.pbs_rate_limit_mbps = saved.pbs_rate_limit_mbps; }
     storage.pbs_file_level =
         resolve_pbs_file_level(storage.pbs_file_level_set, storage.pbs_file_level, saved.pbs_file_level);
 }
@@ -10376,6 +10475,10 @@ pub struct PbsTarget {
     pub pbs_fingerprint: String,
     #[serde(default)]
     pub pbs_namespace: String,
+    /// Upload cap in MB/s for backups sent here; 0 inherits the primary
+    /// connection's. See `BackupStorage::pbs_rate_limit_mbps`.
+    #[serde(default)]
+    pub pbs_rate_limit_mbps: u32,
     /// Store content as native pxar for backups sent here.
     #[serde(default)]
     pub pbs_file_level: bool,
@@ -11015,6 +11118,7 @@ fn apply_pbs_target(storage: &mut BackupStorage, target: &PbsTarget) {
     if storage.pbs_password.is_empty()    { storage.pbs_password    = target.pbs_password.clone(); }
     if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = target.pbs_fingerprint.clone(); }
     if storage.pbs_namespace.is_empty()   { storage.pbs_namespace   = target.pbs_namespace.clone(); }
+    if storage.pbs_rate_limit_mbps == 0   { storage.pbs_rate_limit_mbps = target.pbs_rate_limit_mbps; }
     // The destination's file-level choice counts as an explicit one for
     // any backup that didn't make its own — otherwise a target set to
     // pxar would be overridden by an off-by-default primary connection.
