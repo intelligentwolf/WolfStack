@@ -445,6 +445,13 @@
              finding the operator needs to see immediately. -->
         <div id="secret-audit-banner" role="alert" aria-live="assertive" style="display:none; margin:12px 16px 0; padding:14px 18px; border-radius:8px;"></div>
 
+        <!-- Node outage banner (klas 2026-11-05): on a server's pages, says
+             WHEN it went offline (and, once it is back, how long it was down
+             and whether it restarted). Filled by renderNodeOutageBanner().
+             role="status": it is state the operator is browsing, not a
+             failure of something they just did. -->
+        <div id="node-outage-banner" role="status" aria-live="polite" style="display:none; margin:12px 16px 0; padding:14px 18px; border-radius:8px;"></div>
+
         <!-- Page Content -->
         <div class="page-content">
             <!-- ═══ Datacenter Overview ═══ -->
@@ -4350,6 +4357,13 @@
                                 <input type="text" id="pbs-namespace" class="form-control" placeholder="">
                             </div>
                             <div class="form-group">
+                                <label for="pbs-rate-limit" style="font-size:12px; color:var(--text-secondary);">Upload limit, MB/s <span
+                                        style="color:var(--text-muted);">(blank = unlimited)</span></label>
+                                <input type="number" id="pbs-rate-limit" class="form-control" min="1" max="10000" step="1"
+                                    inputmode="numeric" placeholder="" aria-describedby="pbs-rate-limit-help">
+                                <span id="pbs-rate-limit-help" data-default-help="Caps upload speed and runs the backup at low CPU priority. Disk reads are not limited." style="display:block; font-size:11px; color:var(--text-muted); margin-top:2px;">Caps upload speed and runs the backup at low CPU priority. Disk reads are not limited.</span>
+                            </div>
+                            <div class="form-group">
                                 <label style="font-size:12px; color:var(--text-secondary);">Fingerprint <span
                                         style="color:var(--text-muted);">(optional, for self-signed
                                         certs)</span></label>
@@ -4415,6 +4429,13 @@
                             <div class="form-group">
                                 <label style="font-size:12px; color:var(--text-secondary);">Namespace <span style="color:var(--text-muted);">(optional)</span></label>
                                 <input type="text" id="pbs-target-namespace" class="form-control" placeholder="">
+                            </div>
+                            <div class="form-group">
+                                <label for="pbs-target-rate-limit" style="font-size:12px; color:var(--text-secondary);">Upload limit, MB/s <span
+                                        style="color:var(--text-muted);">(blank = same as above)</span></label>
+                                <input type="number" id="pbs-target-rate-limit" class="form-control" min="1" max="10000" step="1"
+                                    inputmode="numeric" placeholder="" aria-describedby="pbs-target-rate-limit-help">
+                                <span id="pbs-target-rate-limit-help" data-default-help="Caps upload speed and runs the backup at low CPU priority. Disk reads are not limited." style="display:block; font-size:11px; color:var(--text-muted); margin-top:2px;">Caps upload speed and runs the backup at low CPU priority. Disk reads are not limited.</span>
                             </div>
                             <div class="form-group">
                                 <label style="font-size:12px; color:var(--text-secondary);">Username <span style="color:var(--text-muted);">(blank = inherit)</span></label>
@@ -4815,6 +4836,13 @@
                                     style="color:var(--text-muted);">(optional)</span></label>
                             <input type="text" id="cb-pbs-namespace" class="form-control" placeholder="">
                         </div>
+                            <div class="form-group">
+                                <label for="cb-pbs-rate-limit" style="font-size:12px; color:var(--text-secondary);">Upload limit, MB/s <span
+                                        style="color:var(--text-muted);">(blank = unlimited)</span></label>
+                                <input type="number" id="cb-pbs-rate-limit" class="form-control" min="1" max="10000" step="1"
+                                    inputmode="numeric" placeholder="" aria-describedby="cb-pbs-rate-limit-help">
+                                <span id="cb-pbs-rate-limit-help" data-default-help="Caps upload speed and runs the backup at low CPU priority. Disk reads are not limited." style="display:block; font-size:11px; color:var(--text-muted); margin-top:2px;">Caps upload speed and runs the backup at low CPU priority. Disk reads are not limited.</span>
+                            </div>
                         <div class="form-group">
                             <label style="font-size:12px; color:var(--text-secondary);">Fingerprint <span
                                     style="color:var(--text-muted);">(optional, for self-signed certs)</span></label>
@@ -5317,6 +5345,18 @@
 
         <!-- ═══ System Logs ═══ -->
         <div id="page-syslogs" class="page-view" style="display:none;">
+            <!-- Boot history: which boots are on record, whether each ended with
+                 a logged shutdown, journal persistence and kernel crash dumps.
+                 Filled by loadSyslogBoots(). -->
+            <div class="card" id="syslog-boots-card" style="margin-bottom:16px;">
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                    <h3>Boot History</h3>
+                    <span style="color:var(--text-muted); font-size:12px;">Pick a boot to read the log from before it ended.</span>
+                </div>
+                <div class="card-body" id="syslog-boots-body" style="font-size:13px;">
+                    <span style="color:var(--text-muted);">Loading boot history…</span>
+                </div>
+            </div>
             <div class="card">
                 <div class="card-header"
                     style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
@@ -5324,6 +5364,11 @@
                     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
                         <input type="text" class="form-control" id="syslog-search" placeholder="Search logs..."
                             style="width:200px; font-size:13px;" onkeydown="if(event.key==='Enter') loadSystemLogs()">
+                        <label for="syslog-boot" class="sr-only">Boot</label>
+                        <select class="form-control" id="syslog-boot" style="width:260px; font-size:13px;"
+                            onchange="loadSystemLogs()" title="Which boot to read. Earlier boots need a persistent journal.">
+                            <option value="">All boots (newest lines)</option>
+                        </select>
                         <select class="form-control" id="syslog-unit" style="width:180px; font-size:13px;"
                             onchange="loadSystemLogs()">
                             <option value="">All Units</option>

@@ -2744,6 +2744,9 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 persist_after_cycle = true;
                             }
                             cluster.update_remote(updated_node);
+                            // Real last-contact time for the outage banner
+                            // (last_seen is bumped on the first FAILED poll too).
+                            crate::node_outages::note_contact(&node.id, now);
 
                             // Reset fail count on success
                             POLL_FAIL_COUNTS.lock().unwrap().remove(&node.id);
@@ -3186,6 +3189,26 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
     // Replace atomically
     crate::containers::replace_wolfnet_routes(final_routes);
 
+
+    // Outage history for the "offline since" banner. Runs on every node,
+    // independent of email/alert configuration (klas 2026-11-05).
+    {
+        let current = cluster.get_all_nodes();
+        let observed: Vec<crate::node_outages::PeerObservation<'_>> = current.iter()
+            .filter(|n| !n.is_self && n.node_type == "wolfstack")
+            .map(|n| {
+                let interval = effective_poll_interval(self_interval, n.poll_interval_secs);
+                crate::node_outages::PeerObservation {
+                    node_id: &n.id,
+                    hostname: &n.hostname,
+                    online: n.online,
+                    uptime_secs: n.metrics.as_ref().map(|m| m.uptime_secs),
+                    settle_secs: online_window_secs(interval) + interval,
+                }
+            })
+            .collect();
+        crate::node_outages::observe(&observed, now_unix());
+    }
 
     // After polling, detect state changes and send emails
     // Only the node with the lowest ID sends emails to avoid duplicates

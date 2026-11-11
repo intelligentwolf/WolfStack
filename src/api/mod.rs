@@ -2257,9 +2257,18 @@ pub async fn passkey_available(req: HttpRequest, state: web::Data<AppState>) -> 
     HttpResponse::Ok().json(serde_json::json!({ "available": hostname_ok }))
 }
 
-/// POST /api/auth/passkey/login/start — issue a discoverable-credential challenge.
+#[derive(Deserialize, Default)]
+pub struct PasskeyLoginStartRequest {
+    /// Optional. When set and the user has passkeys, the challenge lists
+    /// their credential IDs so non-discoverable passkeys can sign in.
+    #[serde(default)]
+    pub username: String,
+}
+
+/// POST /api/auth/passkey/login/start — issue a discoverable-credential
+/// challenge, or a username-scoped one when `username` is given.
 /// Anonymous endpoint — does NOT require a session.
-pub async fn passkey_login_start(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+pub async fn passkey_login_start(req: HttpRequest, state: web::Data<AppState>, body: Option<web::Json<PasskeyLoginStartRequest>>) -> HttpResponse {
     // If passkey login is unconfigured (no credentials registered) return 404
     // so the frontend can hide the "Sign in with passkey" button quickly.
     let config = crate::auth::webauthn::WebAuthnConfig::load();
@@ -2278,7 +2287,10 @@ pub async fn passkey_login_start(req: HttpRequest, state: web::Data<AppState>) -
     let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
         Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
-    match crate::auth::webauthn::start_authentication(&rp_id, &origin) {
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    let username = body.username.trim();
+    let username = (!username.is_empty()).then_some(username);
+    match crate::auth::webauthn::start_authentication(&config, &rp_id, &origin, username) {
         Ok((challenge, ceremony_id)) => HttpResponse::Ok().json(serde_json::json!({
             "challenge": challenge,
             "ceremony_id": ceremony_id,
@@ -3914,11 +3926,33 @@ pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResp
     // — the helper handles that.
     let filtered: Vec<crate::agent::Node> = filter_nodes_for_caller(&caller, nodes)
         .into_iter().map(crate::agent::Node::redacted_for_api).collect();
+    // Outage data for the "offline since" banner — only for nodes the caller
+    // can see.
+    let visible: std::collections::HashSet<&str> = filtered.iter().map(|n| n.id.as_str()).collect();
+    let mut open = crate::node_outages::open_outages();
+    open.retain(|id, _| visible.contains(id.as_str()));
+    let mut last = crate::node_outages::last_closed_outages();
+    last.retain(|id, _| visible.contains(id.as_str()));
     HttpResponse::Ok().json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "nodes": filtered,
         "tls_enabled": state.tls_enabled,
+        "outages": { "open": open, "last": last },
     }))
+}
+
+/// GET /api/nodes/{id}/outages — this node's record of when that peer went
+/// offline and came back, newest first.
+pub async fn get_node_outages(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let id = path.into_inner();
+    let Some(node) = state.cluster.get_node(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Node not found" }));
+    };
+    if filter_nodes_for_caller(&caller, vec![node]).is_empty() {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "You don't have access to this cluster" }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "outages": crate::node_outages::history_for(&id) }))
 }
 
 /// Filter a nodes list down to what the caller (by username) is
@@ -8925,11 +8959,22 @@ pub async fn node_proxy(
                         .streaming(byte_stream);
                 }
 
+                // Carry the remote's Content-Disposition through. Without it a
+                // file-manager download from a remote node was saved as
+                // "download" — the browser falls back to the last URL segment
+                // of /api/nodes/{id}/proxy/files/download.
+                // (as raw bytes: reqwest and actix-web use different `http` crates)
+                let resp_cd = resp.headers()
+                    .get("content-disposition")
+                    .and_then(|v| actix_web::http::header::HeaderValue::from_bytes(v.as_bytes()).ok());
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        return HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::OK))
-                            .content_type(resp_ct)
-                            .body(bytes.to_vec());
+                        let mut out = HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::OK));
+                        out.content_type(resp_ct);
+                        if let Some(cd) = resp_cd {
+                            out.insert_header((actix_web::http::header::CONTENT_DISPOSITION, cd));
+                        }
+                        return out.body(bytes.to_vec());
                     }
                     Err(e) => {
                         last_error = format!("Read error from {}: {}", url, e);
@@ -24892,6 +24937,7 @@ pub async fn pbs_config_get(
         "pbs_token_name": config.pbs_token_name,
         "pbs_fingerprint": config.pbs_fingerprint,
         "pbs_namespace": config.pbs_namespace,
+        "pbs_rate_limit_mbps": config.pbs_rate_limit_mbps,
         "pbs_file_level": config.pbs_file_level,
         "has_token_secret": !config.pbs_token_secret.is_empty(),
         "has_password": !config.pbs_password.is_empty(),
@@ -24913,6 +24959,9 @@ pub struct PbsConfigRequest {
     pub pbs_fingerprint: String,
     #[serde(default)]
     pub pbs_namespace: String,
+    /// Upload cap in MB/s; 0 = unlimited.
+    #[serde(default)]
+    pub pbs_rate_limit_mbps: u32,
     /// Store content as native pxar (file-level) so PBS per-file restore works.
     #[serde(default)]
     pub pbs_file_level: bool,
@@ -24941,6 +24990,7 @@ fn pbs_target_public(t: &backup::PbsTarget) -> serde_json::Value {
         "pbs_token_name": t.pbs_token_name,
         "pbs_fingerprint": t.pbs_fingerprint,
         "pbs_namespace": t.pbs_namespace,
+        "pbs_rate_limit_mbps": t.pbs_rate_limit_mbps,
         "pbs_file_level": t.pbs_file_level,
         "pbs_file_level_set": t.pbs_file_level_set,
         "has_token_secret": !t.pbs_token_secret.is_empty(),
@@ -24987,6 +25037,9 @@ pub struct PbsTargetRequest {
     pub pbs_fingerprint: String,
     #[serde(default)]
     pub pbs_namespace: String,
+    /// Upload cap in MB/s; 0 inherits the primary connection's.
+    #[serde(default)]
+    pub pbs_rate_limit_mbps: u32,
     #[serde(default)]
     pub pbs_file_level: bool,
     #[serde(default)]
@@ -25012,6 +25065,7 @@ fn pbs_target_from_request(body: &PbsTargetRequest, existing: Option<&backup::Pb
         } else { body.pbs_password.clone() },
         pbs_fingerprint: body.pbs_fingerprint.trim().to_string(),
         pbs_namespace: body.pbs_namespace.trim().to_string(),
+        pbs_rate_limit_mbps: body.pbs_rate_limit_mbps,
         pbs_file_level: body.pbs_file_level,
         pbs_file_level_set: body.pbs_file_level_set,
     }
@@ -25141,6 +25195,7 @@ pub async fn pbs_config_get_full(
         "pbs_password": config.pbs_password,
         "pbs_fingerprint": config.pbs_fingerprint,
         "pbs_namespace": config.pbs_namespace,
+        "pbs_rate_limit_mbps": config.pbs_rate_limit_mbps,
         "pbs_file_level": config.pbs_file_level,
     }))
 }
@@ -25174,6 +25229,7 @@ pub async fn pbs_config_save(
         // the UI, whether the operator pasted it with or without colons.
         pbs_fingerprint: backup::format_pbs_fingerprint(&body.pbs_fingerprint),
         pbs_namespace: body.pbs_namespace.clone(),
+        pbs_rate_limit_mbps: body.pbs_rate_limit_mbps,
         pbs_file_level: body.pbs_file_level,
         ..backup::BackupStorage::default()
     };
@@ -26856,6 +26912,8 @@ pub struct SystemLogsQuery {
     pub lines: Option<usize>,
     pub search: Option<String>,
     pub unit: Option<String>,
+    /// journalctl boot selector: a boot id or relative index (0, -1, …).
+    pub boot: Option<String>,
 }
 
 /// GET /api/system/logs — read system journal logs
@@ -26865,14 +26923,75 @@ pub async fn system_logs(
     query: web::Query<SystemLogsQuery>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    let lines = query.lines.unwrap_or(200).min(5000);
-    let search = query.search.as_deref();
-    let unit = query.unit.as_deref();
-    let logs = storage::read_system_logs(lines, search, unit);
+    let q = query.into_inner();
+    let lines = q.lines.unwrap_or(200).min(5000);
+    let boot = match q.boot.as_deref().filter(|b| !b.trim().is_empty()) {
+        None => None,
+        Some(b) => match crate::boot_history::validate_boot_selector(b) {
+            Some(v) => Some(v),
+            None => return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Invalid boot: expected a boot id or a number from -999 to 0"
+            })),
+        },
+    };
+    // journalctl can take seconds on a large journal — keep it off the
+    // async worker.
+    let logs = match web::block(move || storage::read_system_logs(
+        lines, q.search.as_deref(), q.unit.as_deref(), boot.as_deref(),
+    )).await {
+        Ok(l) => l,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    };
     HttpResponse::Ok().json(serde_json::json!({
         "lines": logs,
         "count": logs.len(),
     }))
+}
+
+/// GET /api/system/boots — recorded boots with first/last log time and
+/// whether each ended with a logged shutdown, plus journal persistence state.
+pub async fn system_boots(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match web::block(crate::boot_history::list_boots).await {
+        Ok(report) => HttpResponse::Ok().json(report),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/system/journal/persistent — make journald keep logs on disk so
+/// the previous boot's log survives a crash.
+pub async fn system_journal_persistent(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(e) => return e };
+    tracing::info!("journal: {} enabled persistent journald storage", caller);
+    match web::block(crate::boot_history::enable_persistent_journal).await {
+        Ok(Ok(status)) => HttpResponse::Ok().json(serde_json::json!({ "status": status })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /api/system/pstore — kernel crash dumps preserved across a reset.
+pub async fn system_pstore(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match web::block(crate::boot_history::list_pstore).await {
+        Ok(files) => HttpResponse::Ok().json(serde_json::json!({ "files": files })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PstoreFileQuery { pub path: String }
+
+/// GET /api/system/pstore/file?path= — one pstore dump as text (bounded;
+/// only paths inside the pstore directories are served).
+pub async fn system_pstore_file(req: HttpRequest, state: web::Data<AppState>, query: web::Query<PstoreFileQuery>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let path = query.into_inner().path;
+    match web::block(move || crate::boot_history::read_pstore_file(&path)).await {
+        Ok(Ok((text, truncated))) => HttpResponse::Ok().json(serde_json::json!({ "text": text, "truncated": truncated })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
 }
 
 /// POST /api/storage/mounts/{id}/sync — sync a global mount to all cluster nodes
@@ -28199,6 +28318,30 @@ pub async fn files_upload(
     }))
 }
 
+/// `Content-Disposition: attachment` naming the saved file. Mirrors
+/// actix-files' own default (actix-files named.rs: `Filename`, plus a UTF-8
+/// `FilenameExt` when the name is not ASCII) so non-ASCII names survive, and
+/// the typed header escapes quotes/backslashes that a hand-built
+/// `filename="…"` string would not.
+fn attachment_disposition(filename: String) -> actix_web::http::header::ContentDisposition {
+    use actix_web::http::header::{Charset, ContentDisposition, DispositionParam, DispositionType, ExtendedValue};
+    let ext = (!filename.is_ascii()).then(|| DispositionParam::FilenameExt(ExtendedValue {
+        charset: Charset::Ext(String::from("UTF-8")),
+        language_tag: None,
+        value: filename.clone().into_bytes(),
+    }));
+    let mut parameters = vec![DispositionParam::Filename(filename)];
+    parameters.extend(ext);
+    ContentDisposition { disposition: DispositionType::Attachment, parameters }
+}
+
+/// File name a download is saved under: the last component of `path`.
+fn download_filename(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".into())
+}
+
 /// GET /api/files/download?path=/some/file — download a file
 pub async fn files_download(
     req: HttpRequest,
@@ -28226,9 +28369,7 @@ pub async fn files_download(
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Not a file" }));
     }
 
-    let filename = canonical.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".into());
+    let filename = download_filename(&canonical);
 
     // Stream via NamedFile (chunked reads on the blocking pool) instead
     // of std::fs::read: the old path buffered the WHOLE file in RAM and
@@ -28246,10 +28387,7 @@ pub async fn files_download(
     };
     match opened {
         Ok(nf) => nf
-            .set_content_disposition(actix_web::http::header::ContentDisposition {
-                disposition: actix_web::http::header::DispositionType::Attachment,
-                parameters: vec![actix_web::http::header::DispositionParam::Filename(filename)],
-            })
+            .set_content_disposition(attachment_disposition(filename))
             .into_response(&req),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": format!("Cannot read file: {}", e)
@@ -28649,10 +28787,7 @@ pub async fn files_docker_download(
 
     match output {
         Ok(Ok(out)) if out.status.success() => {
-            let filename = std::path::Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "download".into());
+            let filename = download_filename(std::path::Path::new(&path));
 
             // Open, then unlink: the open fd keeps the data readable
             // (POSIX) while the path disappears — no leftover temp file
@@ -28674,10 +28809,7 @@ pub async fn files_docker_download(
             match opened {
                 Ok(nf) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
-                    nf.set_content_disposition(actix_web::http::header::ContentDisposition {
-                        disposition: actix_web::http::header::DispositionType::Attachment,
-                        parameters: vec![actix_web::http::header::DispositionParam::Filename(filename)],
-                    })
+                    nf.set_content_disposition(attachment_disposition(filename))
                     .into_response(&req)
                 }
                 Err(e) => {
@@ -29092,13 +29224,10 @@ pub async fn files_lxc_download(
 
     match output {
         Ok(out) if out.status.success() => {
-            let filename = std::path::Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "download".into());
+            let filename = download_filename(std::path::Path::new(&path));
 
             HttpResponse::Ok()
-                .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+                .insert_header(attachment_disposition(filename))
                 .insert_header(("Content-Type", "application/octet-stream"))
                 .body(out.stdout)
         }
@@ -49054,6 +49183,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster/diagnose", web::post().to(cluster_diagnose))
         .route("/api/nodes", web::get().to(get_nodes))
         .route("/api/nodes", web::post().to(add_node))
+        .route("/api/nodes/{id}/outages", web::get().to(get_node_outages))
         .route("/api/cluster/proxmox-cleanup", web::get().to(proxmox_cleanup_notice))
         .route("/api/cluster/proxmox-cleanup/dismiss", web::post().to(proxmox_cleanup_dismiss))
         .route("/api/nodes/{id}", web::get().to(get_node))
@@ -49378,6 +49508,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/storage/providers/{name}/config", web::get().to(storage_provider_config))
         .route("/api/storage/providers/{name}/config", web::post().to(storage_provider_config_save))
         .route("/api/system/logs", web::get().to(system_logs))
+        .route("/api/system/boots", web::get().to(system_boots))
+        .route("/api/system/journal/persistent", web::post().to(system_journal_persistent))
+        .route("/api/system/pstore", web::get().to(system_pstore))
+        .route("/api/system/pstore/file", web::get().to(system_pstore_file))
         // Cluster-internal file operations — require cluster-secret auth.
         // Used by WolfAgent tools to read/write/delete files across the
         // cluster; never reachable via a human session token.
@@ -52362,5 +52496,38 @@ mod authorized_keys_reader_tests {
         assert!(authorized_keys_present_from(passwd, |_| {
             panic!("open failures must preserve the immediate return")
         }));
+    }
+}
+
+#[cfg(test)]
+mod attachment_disposition_tests {
+    use super::{attachment_disposition, download_filename};
+    use actix_web::http::header::TryIntoHeaderValue;
+
+    fn header(name: &str) -> String {
+        let v = attachment_disposition(name.to_string()).try_into_value().unwrap();
+        String::from_utf8(v.as_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn ascii_name_is_plain_filename() {
+        assert_eq!(header("report.tar.gz"), "attachment; filename=\"report.tar.gz\"");
+    }
+
+    #[test]
+    fn quotes_are_escaped_not_breaking_the_header() {
+        assert_eq!(header("a\"b.txt"), "attachment; filename=\"a\\\"b.txt\"");
+    }
+
+    #[test]
+    fn non_ascii_name_also_gets_utf8_filename_ext() {
+        let h = header("café.txt");
+        assert!(h.contains("filename*=UTF-8''caf%C3%A9.txt"), "{h}");
+    }
+
+    #[test]
+    fn filename_is_last_path_component() {
+        assert_eq!(download_filename(std::path::Path::new("/var/log/syslog")), "syslog");
+        assert_eq!(download_filename(std::path::Path::new("/")), "download");
     }
 }

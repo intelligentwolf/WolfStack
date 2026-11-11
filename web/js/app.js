@@ -222,6 +222,11 @@ let currentPage = 'datacenter';
 let currentComponent = null;
 let currentNodeId = null;  // null = datacenter, node ID = specific server
 let allNodes = [];         // cached node list
+// Outage records from /api/nodes for the "offline since" banner (klas 2026-11-05).
+let nodeOutages = { open: {}, last: {} };
+// Set by the banner's "logs from before" button: the unix time the outage
+// began, so the System Logs page preselects the boot that was running then.
+let syslogPendingBootAt = null;
 // True once buildServerTree() has successfully rendered the sidebar. If the very
 // first render fails or is interrupted (a transient DOM/data race on load),
 // allNodes is already set, so later polls take the in-place-update branch and
@@ -2269,6 +2274,7 @@ function selectView(page) {
         }
     } catch (_) { /* history blocked (sandboxed iframe) — navigation still works */ }
     try { updateClusterPill(); } catch (_) {}
+    renderNodeOutageBanner();
 
     document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
     const el = document.getElementById(`page-${page}`);
@@ -2389,6 +2395,7 @@ function selectServerView(nodeId, view) {
     currentNodeId = nodeId;
     currentPage = view;
     try { updateClusterPill(); } catch (_) {}
+    renderNodeOutageBanner();
 
     const node = allNodes.find(n => n.id === nodeId);
     const hostname = node ? node.hostname : nodeId;
@@ -2518,7 +2525,7 @@ function selectServerView(nodeId, view) {
     if (view === 'vms') loadVms().finally(() => hidePageLoadingOverlay(el));
     if (view === 'storage') Promise.all([loadStorageProviders(), loadStorageMounts(), loadS3RemotesHealthCard().then(() => loadSyncJobsCard()), loadZfsStatus(), loadDiskInfo(), loadGlusterStatus(), loadDriveHealthCard()]).finally(() => hidePageLoadingOverlay(el));
     if (view === 'shares') { _gwClusterMode = null; gwLoad().finally(() => hidePageLoadingOverlay(el)); }
-    if (view === 'syslogs') { loadSystemLogs(); hidePageLoadingOverlay(el); }
+    if (view === 'syslogs') { loadSyslogBoots().finally(() => { loadSystemLogs(); hidePageLoadingOverlay(el); }); }
     if (view === 'files') { if (!window._skipFileReset) { containerFileMode = null; currentFilePath = '/'; } window._skipFileReset = false; loadFiles().finally(() => hidePageLoadingOverlay(el)); }
     if (view === 'networking') loadNetworking().finally(() => hidePageLoadingOverlay(el));
     if (view === 'backups') loadBackups().finally(() => hidePageLoadingOverlay(el));
@@ -6918,7 +6925,7 @@ function dashUpdateServersWidget() {
                 critical = true;
                 ledColor = 'var(--danger)';
                 ledGlow = 'rgba(239,68,68,0.4)';
-                detail = 'Offline';
+                detail = 'Offline' + (nodeOfflineSinceText(node) ? ' ' + nodeOfflineSinceText(node) : '');
             } else {
                 // Round to one decimal first — exact parity with ledDot's
                 // toFixed(1)→parseFloat path so both modes flip colour at
@@ -6951,7 +6958,7 @@ function dashUpdateServersWidget() {
                         <span class="server-dot offline" style="flex-shrink:0;"></span>
                         <span style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;" title="${escapeAttr(node.hostname||'')}">${escapeHtml(nodeName(node))}</span>
                         ${pveBadge}
-                        <span style="margin-left:auto;font-size:11px;color:var(--danger);flex-shrink:0;">Offline</span>
+                        <span style="margin-left:auto;font-size:11px;color:var(--danger);flex-shrink:0;">Offline${nodeOfflineSinceText(node) ? ' <span style="color:var(--text-secondary);">' + escapeHtml(nodeOfflineSinceText(node)) + '</span>' : ''}</span>
                     </div>
                 </div>`;
             }
@@ -6960,7 +6967,7 @@ function dashUpdateServersWidget() {
                     <span class="server-dot offline" style="flex-shrink:0;"></span>
                     <span style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escapeAttr(node.hostname||'')}">${escapeHtml(nodeName(node))}</span>
                     ${pveBadge}
-                    <span style="margin-left:auto;font-size:11px;color:var(--danger);">Offline</span>
+                    <span style="margin-left:auto;font-size:11px;color:var(--danger);">Offline${nodeOfflineSinceText(node) ? ' <span style="color:var(--text-secondary);">' + escapeHtml(nodeOfflineSinceText(node)) + '</span>' : ''}</span>
                 </div>
             </div>`;
         }
@@ -8809,6 +8816,8 @@ async function fetchNodes() {
         }
         // Track server TLS state for URL generation
         if (data.tls_enabled !== undefined) serverTlsEnabled = data.tls_enabled;
+        // Outage records for the "offline since" banner (older backends omit it).
+        nodeOutages = (data && data.outages) || { open: {}, last: {} };
 
         // Only full-rebuild when nodes are added/removed or clusters change
         var structureChanged = false;
@@ -8885,6 +8894,7 @@ async function fetchNodes() {
         if (currentPage === 'datacenter') {
             renderDatacenterOverview();
         }
+        renderNodeOutageBanner();
 
         // Update current node metrics if viewing a server dashboard
         if (currentPage === 'dashboard' && currentNodeId) {
@@ -39942,6 +39952,7 @@ async function loadPbsConfig() {
         setVal('pbs-token-name', cfg.pbs_token_name);
         setVal('pbs-fingerprint', cfg.pbs_fingerprint);
         setVal('pbs-namespace', cfg.pbs_namespace);
+        setVal('pbs-rate-limit', cfg.pbs_rate_limit_mbps);
         const flCb = document.getElementById('pbs-file-level');
         if (flCb) flCb.checked = !!cfg.pbs_file_level;
         if (cfg.has_token_secret) {
@@ -40044,6 +40055,7 @@ function pbsTargetEdit(id) {
     setVal('pbs-target-datastore', t.pbs_datastore);
     setVal('pbs-target-server', t.pbs_server);
     setVal('pbs-target-namespace', t.pbs_namespace);
+    setVal('pbs-target-rate-limit', t.pbs_rate_limit_mbps);
     setVal('pbs-target-user', t.pbs_user);
     setVal('pbs-target-token-name', t.pbs_token_name);
     setVal('pbs-target-fingerprint', t.pbs_fingerprint);
@@ -40079,6 +40091,7 @@ function pbsTargetBody() {
         pbs_datastore: getVal('pbs-target-datastore'),
         pbs_server: getVal('pbs-target-server'),
         pbs_namespace: getVal('pbs-target-namespace'),
+        pbs_rate_limit_mbps: readPbsRateLimit('pbs-target-rate-limit'),
         pbs_user: getVal('pbs-target-user'),
         pbs_token_name: getVal('pbs-target-token-name'),
         pbs_token_secret: getVal('pbs-target-token-secret'),
@@ -40091,6 +40104,7 @@ function pbsTargetBody() {
 async function pbsTargetTest() {
     const body = pbsTargetBody();
     if (!body.pbs_datastore) { pbsTargetSetResult('Enter a datastore name first.', 'error'); return; }
+    if (body.pbs_rate_limit_mbps === null) { pbsTargetSetResult('Upload limit must be a whole number of MB/s, or blank.', 'error'); return; }
     pbsTargetSetResult('Testing…', 'info');
     try {
         const r = await fetch(apiUrl('/api/backups/pbs/targets/test'), {
@@ -40114,6 +40128,7 @@ async function pbsTargetSave() {
     const body = pbsTargetBody();
     if (!body.name) { pbsTargetSetResult('Give this destination a name.', 'error'); return; }
     if (!body.pbs_datastore) { pbsTargetSetResult('Datastore is required.', 'error'); return; }
+    if (body.pbs_rate_limit_mbps === null) { pbsTargetSetResult('Upload limit must be a whole number of MB/s, or blank.', 'error'); return; }
     try {
         const r = await fetch(apiUrl('/api/backups/pbs/targets'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -40225,6 +40240,25 @@ async function updatePbsStatusBadge() {
     }
 }
 
+/// Read a PBS "Upload limit, MB/s" field. Blank → 0 (unlimited / inherit).
+/// A non-integer or out-of-range entry marks the field invalid inline and
+/// returns null so the caller stops before saving.
+function readPbsRateLimit(id) {
+    const el = document.getElementById(id);
+    if (!el) return 0;
+    const help = document.getElementById(id + '-help');
+    const raw = el.value.trim();
+    const n = raw === '' ? 0 : Number(raw);
+    const ok = Number.isInteger(n) && n >= 0 && n <= 10000;
+    el.setAttribute('aria-invalid', ok ? 'false' : 'true');
+    if (help) {
+        help.textContent = ok ? (help.dataset.defaultHelp || '') : 'Enter a whole number of MB/s from 1 to 10000, or leave it blank.';
+        help.style.color = ok ? 'var(--text-muted)' : 'var(--danger, #dc3545)';
+    }
+    if (!ok) { el.focus(); return null; }
+    return n;
+}
+
 async function savePbsConfig() {
     const getVal = id => (document.getElementById(id) || {}).value || '';
     const getChecked = id => !!(document.getElementById(id) || {}).checked;
@@ -40237,8 +40271,13 @@ async function savePbsConfig() {
         pbs_token_secret: getVal('pbs-token-secret'),
         pbs_fingerprint: getVal('pbs-fingerprint'),
         pbs_namespace: getVal('pbs-namespace'),
+        pbs_rate_limit_mbps: readPbsRateLimit('pbs-rate-limit'),
         pbs_file_level: getChecked('pbs-file-level'),
     };
+    if (body.pbs_rate_limit_mbps === null) {
+        showToast('Upload limit must be a whole number of MB/s, or blank', 'error');
+        return;
+    }
     if (!body.pbs_server || !body.pbs_datastore || !body.pbs_user) {
         showToast('Server, datastore, and user are required', 'error');
         return;
@@ -42644,7 +42683,12 @@ async function copyPbsConfigToNodes() {
         pbs_token_secret: getVal('cb-pbs-token-secret'),
         pbs_fingerprint: getVal('cb-pbs-fingerprint'),
         pbs_namespace: getVal('cb-pbs-namespace'),
+        pbs_rate_limit_mbps: readPbsRateLimit('cb-pbs-rate-limit'),
     };
+    if (body.pbs_rate_limit_mbps === null) {
+        showToast('Upload limit must be a whole number of MB/s, or blank', 'error');
+        return;
+    }
 
     if (!body.pbs_server || !body.pbs_datastore || !body.pbs_user) {
         showToast('Server, datastore, and user are required', 'error');
@@ -43153,6 +43197,7 @@ async function pullPbsFromNode(nodeId) {
         setVal('cb-pbs-password', cfg.pbs_password);
         setVal('cb-pbs-fingerprint', cfg.pbs_fingerprint);
         setVal('cb-pbs-namespace', cfg.pbs_namespace);
+        setVal('cb-pbs-rate-limit', cfg.pbs_rate_limit_mbps);
 
         // Close the modal
         const modal = document.getElementById('pbs-pull-modal');
@@ -60552,9 +60597,15 @@ async function loadSystemLogs() {
         const params = new URLSearchParams({ lines });
         if (search) params.set('search', search);
         if (unit) params.set('unit', unit);
+        const boot = document.getElementById('syslog-boot')?.value || '';
+        if (boot) params.set('boot', boot);
 
         const resp = await fetch(apiUrl(`/api/system/logs?${params}`));
-        if (!resp.ok) throw new Error('Failed to fetch logs');
+        if (!resp.ok) {
+            let msg = 'Failed to fetch logs';
+            try { msg = (await resp.json()).error || msg; } catch (_) {}
+            throw new Error(msg);
+        }
         const data = await resp.json();
 
         if (data.lines && data.lines.length > 0) {
@@ -60574,7 +60625,7 @@ async function loadSystemLogs() {
             countEl.textContent = '0 lines';
         }
     } catch (e) {
-        viewer.innerHTML = `<span style="color:#ef4444;">Error: ${e.message}</span>`;
+        viewer.innerHTML = `<span role="alert" style="color:var(--danger);">Error: ${escapeHtml(e.message)}</span>`;
     }
 }
 
@@ -60586,6 +60637,294 @@ function copySystemLogs() {
     }).catch(() => {
         showToast('Failed to copy logs', 'error');
     });
+}
+
+// ─── Boot history + "offline since" banner (klas 2026-11-05) ───
+// "Can you put in banner when a node goes offline so you can see exactly when
+// it went offline? … a way to see what was in the log before the crash."
+
+
+/// Local date+time for a unix-seconds value (operator's own timezone).
+function fmtUnixLocal(secs) {
+    if (!secs) return '—';
+    return new Date(secs * 1000).toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+}
+
+/// "2h 24m" style span between two unix-seconds values.
+function fmtSpan(secs) {
+    secs = Math.max(0, Math.floor(secs));
+    if (secs < 60) return secs + 's';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+    return Math.floor(secs / 86400) + 'd ' + Math.floor((secs % 86400) / 3600) + 'h';
+}
+
+/// Short "since …" label for an offline node (datacenter cards); '' if unknown.
+function nodeOfflineSinceText(node) {
+    const rec = node && nodeOutages.open && nodeOutages.open[node.id];
+    const t = rec && (rec.offline_since || rec.detected_at);
+    return t ? 'since ' + fmtUnixLocal(t) : '';
+}
+
+function outageDismissKey(rec) { return 'ws-outage-dismissed:' + rec.node_id + ':' + rec.detected_at; }
+
+function renderNodeOutageBanner() {
+    const el = document.getElementById('node-outage-banner');
+    if (!el) return;
+    const node = currentNodeId ? allNodes.find(n => n.id === currentNodeId) : null;
+    const hide = () => { el.style.display = 'none'; el.innerHTML = ''; el.dataset.sig = ''; };
+    if (!node || node.is_self) { hide(); return; }
+    const name = escapeHtml(nodeName(node));
+    const now = Math.floor(Date.now() / 1000);
+    const open = nodeOutages.open && nodeOutages.open[node.id];
+    let html = '', cls = '', sig = '';
+
+    if (!node.online) {
+        cls = 'ws-banner-danger';
+        if (open && open.offline_since) {
+            sig = 'open:' + open.offline_since;
+            html = `<div style="font-weight:600; margin-bottom:4px;">${name} is offline since ${escapeHtml(fmtUnixLocal(open.offline_since))} (${escapeHtml(fmtSpan(now - open.offline_since))} ago)</div>
+                <div style="color:var(--text-secondary);">That is the last time this server reached it. Once it is back, open its System Logs to read what it logged before it went down.</div>`;
+        } else if (open) {
+            sig = 'open-nc:' + open.detected_at;
+            html = `<div style="font-weight:600; margin-bottom:4px;">${name} is offline (noticed ${escapeHtml(fmtUnixLocal(open.detected_at))})</div>
+                <div style="color:var(--text-secondary);">This server has not reached it since WolfStack here last started, so the exact time it went down is not known.</div>`;
+        } else {
+            sig = 'pending';
+            html = `<div style="font-weight:600;">${name} is not responding</div>`;
+        }
+    } else {
+        const last = nodeOutages.last && nodeOutages.last[node.id];
+        // Show the most recent outage for a day after it ended, until dismissed.
+        if (last && last.restored_at && now - last.restored_at < 86400) {
+            let dismissed = false;
+            try { dismissed = localStorage.getItem(outageDismissKey(last)) === '1'; } catch (_) {}
+            if (!dismissed) {
+                cls = 'ws-banner-warning';
+                sig = 'last:' + last.detected_at;
+                const from = last.offline_since || last.detected_at;
+                const fromTxt = last.offline_since ? fmtUnixLocal(last.offline_since) : 'about ' + fmtUnixLocal(last.detected_at);
+                const why = last.rebooted_at
+                    ? `It restarted at ${escapeHtml(fmtUnixLocal(last.rebooted_at))}, so it crashed, lost power or was rebooted.`
+                    : `It did not restart, so this was a network or WolfStack service outage rather than a crash.`;
+                const logsBtn = last.rebooted_at
+                    ? `<button class="btn btn-sm btn-primary" onclick="openLogsBeforeOutage('${escapeAttr(node.id)}', ${Number(from)})">Logs from before it went down</button>`
+                    : '';
+                html = `<div style="font-weight:600; margin-bottom:4px;">${name} was offline from ${escapeHtml(fromTxt)} to ${escapeHtml(fmtUnixLocal(last.restored_at))} (${escapeHtml(fmtSpan(last.restored_at - from))})</div>
+                    <div style="color:var(--text-secondary); margin-bottom:8px;">${why}</div>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        ${logsBtn}
+                        <button class="btn btn-sm" onclick="toggleNodeOutageHistory('${escapeAttr(node.id)}')" aria-controls="node-outage-history" aria-expanded="false" id="node-outage-history-btn">Outage history</button>
+                        <button class="btn btn-sm" onclick="dismissNodeOutageBanner()" aria-label="Dismiss this outage notice">Dismiss</button>
+                    </div>
+                    <div id="node-outage-history" style="display:none; margin-top:10px;"></div>`;
+            }
+        }
+    }
+    if (!html) { hide(); return; }
+    // Don't rebuild on every 10s poll while nothing changed — that would
+    // collapse an open history list and reset focus.
+    if (el.dataset.sig === sig + '|' + node.id) {
+        // Keep the "N ago" figure fresh without re-rendering the controls.
+        if (!node.online && open && open.offline_since) {
+            const head = el.firstElementChild;
+            if (head) head.textContent = `${nodeName(node)} is offline since ${fmtUnixLocal(open.offline_since)} (${fmtSpan(now - open.offline_since)} ago)`;
+        }
+        return;
+    }
+    el.dataset.sig = sig + '|' + node.id;
+    el.className = cls;
+    el.innerHTML = html;
+    el.style.display = 'block';
+}
+
+function dismissNodeOutageBanner() {
+    const node = currentNodeId ? allNodes.find(n => n.id === currentNodeId) : null;
+    const last = node && nodeOutages.last && nodeOutages.last[node.id];
+    if (last) { try { localStorage.setItem(outageDismissKey(last), '1'); } catch (_) {} }
+    const el = document.getElementById('node-outage-banner');
+    if (el) { el.style.display = 'none'; el.innerHTML = ''; el.dataset.sig = ''; }
+}
+
+async function toggleNodeOutageHistory(nodeId) {
+    const box = document.getElementById('node-outage-history');
+    const btn = document.getElementById('node-outage-history-btn');
+    if (!box) return;
+    if (box.style.display !== 'none') {
+        box.style.display = 'none';
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+        return;
+    }
+    box.style.display = 'block';
+    if (btn) btn.setAttribute('aria-expanded', 'true');
+    box.innerHTML = '<span style="color:var(--text-muted);">Loading…</span>';
+    try {
+        // Asked of THIS server (no proxy): the history is its view of the peer.
+        const resp = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/outages`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        const rows = (data.outages || []).map(r => {
+            const from = r.offline_since || r.detected_at;
+            const end = r.restored_at ? fmtUnixLocal(r.restored_at) : 'still offline';
+            const dur = fmtSpan((r.restored_at || Math.floor(Date.now() / 1000)) - from);
+            const kind = r.restored_at ? (r.rebooted_at ? 'Restarted ' + fmtUnixLocal(r.rebooted_at) : 'No restart') : '—';
+            return `<tr><td>${escapeHtml(r.offline_since ? fmtUnixLocal(r.offline_since) : '≈ ' + fmtUnixLocal(r.detected_at))}</td><td>${escapeHtml(end)}</td><td>${escapeHtml(dur)}</td><td>${escapeHtml(kind)}</td></tr>`;
+        }).join('');
+        box.innerHTML = rows
+            ? `<div style="overflow-x:auto;"><table class="data-table" style="font-size:12px;"><thead><tr><th scope="col">Offline from</th><th scope="col">Back</th><th scope="col">Down for</th><th scope="col">Restart</th></tr></thead><tbody>${rows}</tbody></table></div>`
+            : '<span style="color:var(--text-muted);">No outages recorded.</span>';
+    } catch (e) {
+        box.innerHTML = `<span role="alert" style="color:var(--danger);">Could not load outage history: ${escapeHtml(e.message)}</span>`;
+    }
+}
+
+function openLogsBeforeOutage(nodeId, offlineSince) {
+    syslogPendingBootAt = offlineSince;
+    selectServerView(nodeId, 'syslogs');
+}
+
+/// Load the boot list for the System Logs page: fills the boot picker and
+/// the Boot History card. Never throws (the log view loads after it).
+async function loadSyslogBoots() {
+    const body = document.getElementById('syslog-boots-body');
+    const sel = document.getElementById('syslog-boot');
+    if (!body || !sel) return;
+    const wantAt = syslogPendingBootAt;
+    syslogPendingBootAt = null;
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">All boots (newest lines)</option>';
+    body.innerHTML = '<span style="color:var(--text-muted);">Loading boot history…</span>';
+    let report;
+    try {
+        const resp = await fetch(apiUrl('/api/system/boots'));
+        report = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(report.error || ('HTTP ' + resp.status));
+    } catch (e) {
+        body.innerHTML = `<span role="alert" style="color:var(--danger);">Could not load boot history: ${escapeHtml(e.message)}</span>`;
+        return;
+    }
+    const st = report.status || {};
+    const boots = report.boots || [];
+    let html = '';
+
+    if (report.error) {
+        html += `<div class="ws-banner-warning" style="padding:10px 14px; border-radius:6px; margin-bottom:10px;">${escapeHtml(report.error)}</div>`;
+    } else if (st.journald && !st.persistent) {
+        html += `<div class="ws-banner-warning" style="padding:10px 14px; border-radius:6px; margin-bottom:10px; display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+            <div style="flex:1; min-width:240px;"><strong>Logs are not kept across reboots on this server.</strong> The system journal is held in memory, so after a crash the log from before it is gone. Turn on persistent logging to keep it. The journal then uses up to 10% of the disk holding /var/log, capped at 4 GB (systemd's default).</div>
+            <button class="btn btn-sm btn-primary" id="syslog-persist-btn" onclick="enablePersistentJournal()">Keep logs across reboots</button>
+        </div>
+        <div id="syslog-persist-msg" role="status" aria-live="polite"></div>`;
+    }
+
+    // Boot rows, newest first. index 0 is the running boot.
+    let pick = '';
+    boots.forEach(b => {
+        const range = `${fmtUnixLocal(b.first_entry)} → ${b.index === 0 ? 'now' : fmtUnixLocal(b.last_entry)}`;
+        let end = '';
+        if (b.index === 0) end = 'current';
+        else if (b.clean_shutdown === true) end = b.shutdown_kind ? `clean ${b.shutdown_kind}` : 'clean shutdown';
+        else if (b.clean_shutdown === false) end = 'no shutdown logged (crash?)';
+        const label = (b.index === 0 ? 'Current boot' : `Boot ${b.index}`) + ` · ${range}` + (end && b.index !== 0 ? ` · ${end}` : '');
+        const opt = document.createElement('option');
+        opt.value = b.boot_id;
+        opt.textContent = label;
+        sel.appendChild(opt);
+        // Boots are newest-first: the first boot that started before the
+        // outage is the one that was running when it went down.
+        if (!pick && wantAt && b.first_entry && b.first_entry <= wantAt) pick = b.boot_id;
+    });
+    if (pick) sel.value = pick;
+    else if (prev && Array.from(sel.options).some(o => o.value === prev)) sel.value = prev;
+
+    if (boots.length) {
+        const rows = boots.map(b => {
+            let end;
+            if (b.index === 0) end = '<span style="color:var(--text-muted);">running</span>';
+            else if (b.clean_shutdown === true) end = `<span style="color:var(--success);">✓ ${escapeHtml(b.shutdown_kind ? 'clean ' + b.shutdown_kind : 'clean shutdown')}</span>`;
+            else if (b.clean_shutdown === false) end = '<span style="color:var(--danger); font-weight:600;">✗ No shutdown logged: crash, power loss or forced reset</span>';
+            else end = '<span style="color:var(--text-muted);">unknown</span>';
+            const btn = b.index === 0 ? '' : `<button class="btn btn-sm" onclick="showBootLog('${escapeAttr(b.boot_id)}')" aria-label="Show the log of boot ${b.index}">Show log</button>`;
+            return `<tr><td>${b.index === 0 ? 'Current' : escapeHtml(String(b.index))}</td><td>${escapeHtml(fmtUnixLocal(b.first_entry))}</td><td>${b.index === 0 ? '—' : escapeHtml(fmtUnixLocal(b.last_entry))}</td><td>${end}</td><td>${btn}</td></tr>`;
+        }).join('');
+        html += `<div style="overflow-x:auto; max-height:260px; overflow-y:auto;"><table class="data-table" style="font-size:12px;"><thead><tr><th scope="col">Boot</th><th scope="col">Started</th><th scope="col">Last log line</th><th scope="col">How it ended</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        if (boots.length === 1 && st.persistent) {
+            html += '<div style="color:var(--text-muted); margin-top:6px;">Only the current boot is on record so far. Earlier boots will appear here after the next restart.</div>';
+        }
+    } else if (!report.error) {
+        html += '<div style="color:var(--text-muted);">No boots on record.</div>';
+    }
+
+    html += '<div id="syslog-pstore" style="margin-top:12px;"></div>';
+    body.innerHTML = html;
+    loadPstoreList();
+}
+
+function showBootLog(bootId) {
+    const sel = document.getElementById('syslog-boot');
+    if (sel) sel.value = bootId;
+    loadSystemLogs();
+    document.getElementById('syslog-viewer')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function enablePersistentJournal() {
+    const btn = document.getElementById('syslog-persist-btn');
+    const msg = document.getElementById('syslog-persist-msg');
+    if (btn) { btn.disabled = true; btn.textContent = 'Turning on…'; }
+    try {
+        const resp = await fetch(apiUrl('/api/system/journal/persistent'), { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        showToast('Logs are now kept across reboots on this server', 'success');
+        await loadSyslogBoots();
+    } catch (e) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Keep logs across reboots'; }
+        if (msg) {
+            msg.setAttribute('role', 'alert');
+            msg.innerHTML = `<div style="color:var(--danger); margin-bottom:10px;">Could not turn on persistent logs: ${escapeHtml(e.message)}</div>`;
+        }
+    }
+}
+
+/// Kernel crash dumps (pstore) — only rendered when there are any.
+async function loadPstoreList() {
+    const box = document.getElementById('syslog-pstore');
+    if (!box) return;
+    try {
+        const resp = await fetch(apiUrl('/api/system/pstore'));
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        const files = data.files || [];
+        if (!files.length) { box.innerHTML = ''; return; }
+        box.innerHTML = `<div style="font-weight:600; margin-bottom:6px;">Kernel crash dumps (${files.length})</div>
+            <div style="color:var(--text-secondary); margin-bottom:6px;">The kernel saved these during a panic or oops. They often hold the cause when the journal stops without an error.</div>
+            <ul style="margin:0; padding-left:18px;">${files.map((f, i) =>
+                `<li><button class="btn btn-sm" style="margin:2px 0;" onclick="showPstoreFile(${i})">${escapeHtml(f.path)}</button> <span style="color:var(--text-muted);">${escapeHtml(formatBytes(f.size))} · ${escapeHtml(fmtUnixLocal(f.modified))}</span></li>`).join('')}</ul>
+            <pre id="syslog-pstore-view" style="display:none; margin-top:8px; padding:12px; background:var(--bg-tertiary); border-radius:6px; font-size:11px; max-height:320px; overflow:auto; white-space:pre-wrap;"></pre>`;
+        box._files = files;
+    } catch (e) {
+        box.innerHTML = `<span role="alert" style="color:var(--danger);">Could not list kernel crash dumps: ${escapeHtml(e.message)}</span>`;
+    }
+}
+
+async function showPstoreFile(i) {
+    const box = document.getElementById('syslog-pstore');
+    const view = document.getElementById('syslog-pstore-view');
+    const f = box && box._files && box._files[i];
+    if (!f || !view) return;
+    view.style.display = 'block';
+    view.textContent = 'Loading…';
+    try {
+        const resp = await fetch(apiUrl('/api/system/pstore/file?' + new URLSearchParams({ path: f.path })));
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        view.textContent = data.text + (data.truncated ? '\n\n[truncated at 512 KB]' : '');
+    } catch (e) {
+        view.textContent = 'Could not read ' + f.path + ': ' + e.message;
+    }
 }
 
 // ═══════════════════════════════════════════════

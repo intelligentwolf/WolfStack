@@ -99,6 +99,8 @@ mod cluster_browser;
 mod compat;
 mod support;
 mod danger;
+mod node_outages;
+mod boot_history;
 mod plugins;
 mod sql_connections;
 mod netguard;
