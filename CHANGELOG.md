@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.44.0: run your own mail with Stalwart, and WolfHA stops rewriting unchanged files** _(2026-11-13 — [`a286f75a`](https://github.com/intelligentwolf/WolfStack/commit/a286f75ac96f188ed3e6ee09371b8411130c910a))_
 - **v25.43.0: passkeys work with security keys, and you can see when a node went offline** _(2026-11-11 — [`09ebf626`](https://github.com/intelligentwolf/WolfStack/commit/09ebf62611e977ee57d3083364fab7ebd39bb0cf))_
 - **v25.42.10: update the HTTP stack and other dependencies with known vulnerabilities** _(2026-11-10 — [`f272ad43`](https://github.com/intelligentwolf/WolfStack/commit/f272ad43065914518b45f78f0af95c1d8b7756c5))_
 - **v25.42.9: "Run this backup now" answers at once and cannot overlap itself** _(2026-11-10 — [`ca4daece`](https://github.com/intelligentwolf/WolfStack/commit/ca4daecea151a7a7e45bdbdb96f0078445522d7f))_
