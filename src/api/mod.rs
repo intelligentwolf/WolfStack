@@ -612,6 +612,26 @@ pub const READ_ONLY_HEADER: &str = "X-WolfStack-Role";
 /// proxy from server-side session state — a browser cannot remove it.
 pub const PROXIED_ACTOR_ROLE_HEADER: &str = "X-WolfStack-Actor-Role";
 
+/// Is the operator behind this request a WolfStack administrator?
+///
+/// A direct session or API key: the local user store decides. A request a
+/// peer forwarded through `/api/nodes/{id}/proxy` arrives authenticated as
+/// "cluster-node" and carries no session here, so the forwarding node —
+/// which holds the operator's session — states the role in
+/// `X-WolfStack-Actor-Role: admin`. That header is trusted ONLY on a
+/// cluster-authenticated proxied request (the same trust the read-only flag
+/// and `X-WolfStack-Actor` already rely on); from any other caller it is
+/// ignored, so a browser cannot claim it. Found 2026-11-13: an admin could
+/// not reveal a mail cluster's admin sign-in when the cluster's record lived
+/// on another node.
+pub fn caller_is_admin(req: &HttpRequest, user: &str) -> bool {
+    if user != "cluster-node" {
+        return crate::auth::session_user_is_admin(user);
+    }
+    let proxied = req.headers().get("X-WolfStack-Proxied").and_then(|v| v.to_str().ok()) == Some("1");
+    proxied && req.headers().get(PROXIED_ACTOR_ROLE_HEADER).and_then(|v| v.to_str().ok()) == Some("admin")
+}
+
 /// The 403 every read-only refusal returns.
 pub fn read_only_forbidden(what: &str) -> HttpResponse {
     HttpResponse::Forbidden()
@@ -8887,7 +8907,22 @@ pub async fn node_proxy(
     let path_with_query = format!("/api/{}{}", api_path, query_suffix);
     let urls = build_node_urls(&node.address, node.port, &path_with_query);
 
-    let timeout_secs = if method == actix_web::http::Method::POST || method == actix_web::http::Method::PUT { 300 } else { 120 };
+    // reqwest's timeout covers the WHOLE response, body included, so a
+    // streamed job (Server-Sent Events: a Galera build, a mail install) would
+    // be cut off mid-log at 300 s while the job carried on unseen. A caller
+    // that asks for an event stream gets a long but still bounded ceiling, so
+    // a hung peer can never pin the connection forever.
+    let wants_stream = req.headers().get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    let timeout_secs = if wants_stream {
+        4 * 3600
+    } else if method == actix_web::http::Method::POST || method == actix_web::http::Method::PUT {
+        300
+    } else {
+        120
+    };
 
     // Use the shared client (accepts self-signed certs, connect_timeout 3s)
     let client = &*API_HTTP_CLIENT;
@@ -8926,6 +8961,10 @@ pub async fn node_proxy(
         // require_operator_auth refuses on this header.
         if actor_read_only {
             builder = builder.header(PROXIED_ACTOR_ROLE_HEADER, "read-only");
+        } else if actor != "cluster-node" && crate::auth::session_user_is_admin(&actor) {
+            // Admin-only handlers on the far node can't see this session;
+            // see caller_is_admin.
+            builder = builder.header(PROXIED_ACTOR_ROLE_HEADER, "admin");
         }
         if !body_vec.is_empty() {
             builder = builder.body(body_vec.clone());
@@ -14389,6 +14428,10 @@ pub async fn wolfha_apply_delta(
     let config = fields.get("config").cloned().unwrap_or_default();
     let ha_meta: Option<crate::wolfha::HaMeta> = fields.get("ha_meta")
         .and_then(|m| serde_json::from_str(m).ok());
+    // Primary's mtime per block-delta file (absent from older primaries).
+    let delta_mtimes: std::collections::HashMap<String, i64> = fields.get("delta_mtimes")
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or_default();
 
     let c = container.clone();
     let archive_c = archive.clone();
@@ -14405,7 +14448,7 @@ pub async fn wolfha_apply_delta(
         // files, so if a path somehow appears in both, the whole-file copy
         // is the newer, more complete truth and must win.
         if let Some(b) = &blockdelta_c {
-            crate::wolfha::apply_block_deltas(&c, b)?;
+            crate::wolfha::apply_block_deltas(&c, b, &delta_mtimes)?;
         }
         let deleted = match &archive_c {
             Some(a) => crate::wolfha::apply_delta(&c, a, &deletions, &config)?,
@@ -22778,6 +22821,9 @@ pub struct CreateScheduleRequest {
     /// them down. Absent → VMs are shut down for their backup, as before.
     #[serde(default)]
     pub keep_vms_running: bool,
+    /// `backup_all` schedules: Docker containers mounts-only. Absent → full.
+    #[serde(default)]
+    pub docker_mounts_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -23229,7 +23275,7 @@ pub async fn galera_status(req: HttpRequest, state: web::Data<AppState>, path: w
 /// Stream a blocking Galera job (provision/recover) to the browser as SSE.
 /// `job` runs on a dedicated OS thread (it shells out to lxc/mariadb for
 /// minutes); its log lines and a final `RESULT:OK:`/`RESULT:ERR:` are relayed.
-fn galera_stream_job<F>(job: F) -> HttpResponse
+pub(crate) fn galera_stream_job<F>(job: F) -> HttpResponse
 where
     F: FnOnce(std::sync::mpsc::Sender<String>) + Send + 'static,
 {
@@ -24603,6 +24649,7 @@ pub async fn backup_schedule_create(
         day_of_month: body.day_of_month,
         stop_containers: body.stop_containers,
         keep_vms_running: body.keep_vms_running,
+        docker_mounts_only: body.docker_mounts_only,
     };
     // Node scope: unchanged from before fleet scope existed.
     if body.scope == BackupScope::Node {
@@ -49039,6 +49086,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .configure(crate::vms::api::config)
         .configure(crate::tui::configure)
         .configure(crate::networking::router::api::configure)
+        .configure(crate::stalwart::api::configure)
         // Dangerous-op deadman switch endpoints. See src/danger.rs.
         .route("/api/danger/pending",        web::get().to(danger_list))
         .route("/api/danger/confirm/{id}",   web::post().to(danger_confirm))

@@ -2284,7 +2284,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', learn: 'Courses', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', integrations: 'Integrations', 'fleet-security': 'Fleet Security', 'fleet-manage': 'Fleet', 'fleet-logs': 'Fleet Logs', 'dashboard-sync': 'Dashboard Sync', wolfhost: 'WolfHost', exposure: 'Internet Exposure', 'ssh-keys': 'Authorised Keys', probes: 'Probe Bay' };
+    const titles = { datacenter: 'Datacenter', learn: 'Courses', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', integrations: 'Integrations', 'fleet-security': 'Fleet Security', 'fleet-manage': 'Fleet', 'fleet-logs': 'Fleet Logs', 'dashboard-sync': 'Dashboard Sync', wolfhost: 'WolfHost', mail: 'Mail', exposure: 'Internet Exposure', 'ssh-keys': 'Authorised Keys', probes: 'Probe Bay' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -2370,6 +2370,8 @@ function selectView(page) {
         learnInit();
     } else if (page === 'wolfhost') {
         if (typeof wolfhostInit === 'function') wolfhostInit();
+    } else if (page === 'mail') {
+        if (typeof mailInit === 'function') mailInit();
     } else if (page === 'exposure') {
         if (typeof exposureLoad === 'function') exposureLoad();
     }
@@ -7495,7 +7497,12 @@ function routeFromLocation() {
 }
 window.addEventListener('hashchange', routeFromLocation);
 window.addEventListener('popstate', routeFromLocation);
-if (location.hash) selectView(location.hash.replace('#', ''));
+// Deferred to after this file has finished evaluating: selectView reads
+// `let` bindings declared further down (e.g. _taskLogEntries, ~line 18300),
+// and calling it synchronously here hit their temporal dead zone — a
+// ReferenceError that aborted app.js, so ANY deep link (#mail, #settings,
+// a refresh on a top-level page) left a dead, never-loading UI.
+if (location.hash) setTimeout(() => selectView(location.hash.replace('#', '')), 0);
 
 // ─── Formatting Helpers ───
 function formatBytes(bytes) {
@@ -37805,7 +37812,7 @@ function renderBackupTargets(targets) {
                  <div id="mount-excl-${escapeHtml(key)}" data-mount-panel="${escapeHtml(key)}" style="display:none; margin-top:6px;"></div>
                </div>`
             : '';
-        const stopOption = renderStopForBackupOption(t, '');
+        const stopOption = renderStopForBackupOption(t, '') + renderMountsOnlyOption(t, '');
         return `<div style="background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 14px; font-size:13px;">
             <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
                 <input type="checkbox" class="backup-target-cb" value="${val}" data-target-key="${escapeHtml(key)}" onchange="updateBackupSelectedCount()">
@@ -37859,6 +37866,33 @@ function toggleKeepRunning(type, name, prefix, checked) {
     const map = keepMapFor(prefix);
     const key = `${type}:${name}`;
     if (checked) map[key] = true; else delete map[key];
+}
+
+// Per-Docker-target "mounts only" flags (image pulled on restore instead of
+// archived — RutgerDiehard 2026-11-13), split page/modal the same way. Unlike
+// the stop flag this one survives "back up everything": it is saved as a
+// per-container override, like mount exclusions (scheduleMountOverrides).
+let _backupMountsOnlyMap = {};
+let _scheduleMountsOnlyMap = {};
+function mountsOnlyMapFor(prefix) { return prefix === 'sched-' ? _scheduleMountsOnlyMap : _backupMountsOnlyMap; }
+function toggleMountsOnly(type, name, prefix, checked) {
+    const map = mountsOnlyMapFor(prefix);
+    const key = `${type}:${name}`;
+    if (checked) map[key] = true; else delete map[key];
+}
+const MOUNTS_ONLY_TIP = "Ticked: only this container's volumes, bind mounts and settings are saved — not its image — so the backup is much smaller. Restoring then needs this server to reach the image's registry: WolfStack pulls the exact image version (pinned by digest) back. A container whose image was built or loaded locally has no registry copy, so it still gets a full backup, and the backup log says so. Unticked (default): the image is saved too, and a restore needs nothing from the internet.";
+
+// "Mounts only" row for Docker targets.
+function renderMountsOnlyOption(t, prefix) {
+    if (t.type !== 'docker') return '';
+    const key = `${t.type}:${t.name}`;
+    const checked = mountsOnlyMapFor(prefix)[key] ? 'checked' : '';
+    return `<div style="margin-top:3px;${prefix ? ' padding-left:24px;' : ''}">
+        <label style="font-size:11px; color:var(--text-muted); display:inline-flex; align-items:center; gap:5px; cursor:pointer;" title="${escapeHtml(MOUNTS_ONLY_TIP)}">
+            <input type="checkbox" ${checked} onchange="toggleMountsOnly('${escapeHtml(t.type)}','${escapeHtml(t.name)}','${prefix}', this.checked)">
+            Mounts only — pull the image on restore (smaller backup, needs registry access)
+        </label>
+    </div>`;
 }
 
 // Why a per-container tick is inert under "back up everything" — shown as the
@@ -38170,6 +38204,7 @@ function getSelectedTargets() {
             if (Array.isArray(excl) && excl.length) t.exclude_mounts = excl;
             if (_backupStopMap[key]) t.stop_for_backup = true;
             if (_backupKeepMap[key]) t.keep_running = true;
+            if (_backupMountsOnlyMap[key]) t.mounts_only = true;
             targets.push(t);
         } catch (e) { }
     });
@@ -38247,6 +38282,7 @@ function renderScheduleTargets(selectedKeys, backupAll, savedTargets = []) {
             </label>
             ${mountsLink}
             ${renderStopForBackupOption(t, 'sched-', backupAll)}
+            ${renderMountsOnlyOption(t, 'sched-')}
         </div>`;
     };
 
@@ -38274,6 +38310,7 @@ function getScheduleTargets() {
             if (Array.isArray(excl) && excl.length) t.exclude_mounts = excl;
             if (_scheduleStopMap[key]) t.stop_for_backup = true;
             if (_scheduleKeepMap[key]) t.keep_running = true;
+            if (_scheduleMountsOnlyMap[key]) t.mounts_only = true;
             out.push(t);
         } catch (e) { console.warn('getScheduleTargets: bad checkbox value', e); }
     });
@@ -38285,7 +38322,12 @@ function getScheduleTargets() {
 // exclusion the operator just saved is invisible until they reopen Edit.
 function scheduleAllLabel(s) {
     const n = (s.targets || []).filter(t => t && Array.isArray(t.exclude_mounts) && t.exclude_mounts.length).length;
-    return n ? `All (mounts excluded on ${n})` : 'All';
+    const mo = (s.targets || []).filter(t => t && t.type === 'docker' && t.mounts_only).length;
+    const parts = [];
+    if (n) parts.push(`mounts excluded on ${n}`);
+    if (s.docker_mounts_only) parts.push('Docker mounts only');
+    else if (mo) parts.push(`mounts only on ${mo}`);
+    return parts.length ? `All (${parts.join('; ')})` : 'All';
 }
 
 // Copies of every live item with the modal's mount exclusions merged in —
@@ -38295,8 +38337,12 @@ function scheduleAllLabel(s) {
 function scheduleLiveTargetsWithExclusions() {
     const live = Array.isArray(window._backupTargets) ? window._backupTargets : [];
     return live.map(t => {
-        const excl = _scheduleExcludeMap[`${t.type}:${t.name}`];
-        return Object.assign({}, t, { exclude_mounts: Array.isArray(excl) ? excl.slice() : [] });
+        const key = `${t.type}:${t.name}`;
+        const excl = _scheduleExcludeMap[key];
+        return Object.assign({}, t, {
+            exclude_mounts: Array.isArray(excl) ? excl.slice() : [],
+            mounts_only: t.type === 'docker' && !!_scheduleMountsOnlyMap[key],
+        });
     });
 }
 
@@ -38308,8 +38354,17 @@ function scheduleLiveTargetsWithExclusions() {
 // operator never saw them, so dropping them would lose an exclusion silently.
 function scheduleMountOverrides(liveTargets, editing) {
     const isContainer = t => t && (t.type === 'docker' || t.type === 'lxc');
-    const hasExcludes = t => Array.isArray(t.exclude_mounts) && t.exclude_mounts.length > 0;
-    const override = t => ({ type: t.type, name: t.name, exclude_mounts: t.exclude_mounts.slice() });
+    // An override is worth storing when it excludes mounts or asks for a
+    // mounts-only Docker backup — the two per-container settings the backend
+    // applies under "everything" (backup_all → mount_overrides_for /
+    // docker_mounts_only_for).
+    const hasExcludes = t => (Array.isArray(t.exclude_mounts) && t.exclude_mounts.length > 0)
+        || (t.type === 'docker' && !!t.mounts_only);
+    const override = t => {
+        const o = { type: t.type, name: t.name, exclude_mounts: (t.exclude_mounts || []).slice() };
+        if (t.type === 'docker' && t.mounts_only) o.mounts_only = true;
+        return o;
+    };
     const out = liveTargets.filter(t => isContainer(t) && hasExcludes(t)).map(override);
     const seen = new Set(liveTargets.map(t => `${t.type}:${t.name}`));
     ((editing && editing.targets) || [])
@@ -38352,6 +38407,8 @@ function setScheduleStopContainersMode(backupAll) {
     if (row) row.style.display = backupAll ? 'flex' : 'none';
     const vmRow = document.getElementById('schedule-keep-vms-running-row');
     if (vmRow) vmRow.style.display = backupAll ? 'flex' : 'none';
+    const moRow = document.getElementById('schedule-docker-mounts-only-row');
+    if (moRow) moRow.style.display = backupAll ? 'flex' : 'none';
     document.querySelectorAll('#schedule-target-list [data-keep-running-row]').forEach(label => {
         const cb = label.querySelector('input[type=checkbox]');
         if (cb) cb.disabled = !!backupAll;
@@ -38717,6 +38774,12 @@ function renderBackupHistory(backups) {
                 mountsBadge += `<span class="badge" title="${escapeHtml(tip)}" style="background:rgba(245,158,11,0.15); color:#f59e0b; font-size:10px; margin-left:4px;">${skipped.length} skipped</span>`;
             }
         }
+        // Mounts-only Docker backup: no image inside, restore pulls it.
+        // target.mounts_only records what was actually done (a request
+        // that fell back to a full backup is stored as false).
+        if (b.target?.type === 'docker' && b.target?.mounts_only) {
+            mountsBadge += `<span class="badge" title="This backup holds the container's mounts and settings but not its image. Restoring pulls the exact image back from its registry, so the server needs registry access." style="background:rgba(124,92,255,0.15); color:var(--accent,#7c5cff); font-size:10px; margin-left:4px;">mounts only · image pulled on restore</span>`;
+        }
         const nodeLabel = b.node_hostname ? `<span style="font-size:11px; color:var(--text-muted);">${escapeHtml(b.node_hostname)}</span>` : '';
         // Failed rows expose the error inline so operators don't have
         // to read backups.json to know what went wrong. Long errors
@@ -39036,6 +39099,8 @@ function editSchedule(id) {
     if (stopAllEl) stopAllEl.checked = !!s.stop_containers;
     const keepAllEl = document.getElementById('schedule-keep-vms-running');
     if (keepAllEl) keepAllEl.checked = !!s.keep_vms_running;
+    const moAllEl = document.getElementById('schedule-docker-mounts-only');
+    if (moAllEl) moAllEl.checked = !!s.docker_mounts_only;
     setScheduleStopContainersMode(!!s.backup_all);
 
     const schedTargets = Array.isArray(s.targets) ? s.targets : [];
@@ -39045,7 +39110,11 @@ function editSchedule(id) {
     _scheduleExcludeMap = {};
     _scheduleStopMap = {};
     _scheduleKeepMap = {};
+    _scheduleMountsOnlyMap = {};
     schedTargets.forEach(t => {
+        if (t && t.type === 'docker' && t.mounts_only) {
+            _scheduleMountsOnlyMap[`${t.type}:${t.name}`] = true;
+        }
         if (t && Array.isArray(t.exclude_mounts) && t.exclude_mounts.length) {
             _scheduleExcludeMap[`${t.type}:${t.name}`] = t.exclude_mounts.slice();
         }
@@ -39284,6 +39353,7 @@ async function scheduleSystemFolder() {
     _editFolderTargets = null;
     _scheduleExcludeMap = {};              // folders have no per-container mounts
     _scheduleStopMap = {};                 // ...nor containers to stop
+    _scheduleMountsOnlyMap = {};
     const allCb = document.getElementById('schedule-backup-all');
     if (allCb) { allCb.checked = false; allCb.disabled = false; }
 
@@ -39304,6 +39374,8 @@ async function scheduleSystemFolder() {
     if (stopAllEl) stopAllEl.checked = false;
     const keepAllEl = document.getElementById('schedule-keep-vms-running');
     if (keepAllEl) keepAllEl.checked = false;
+    const moAllEl = document.getElementById('schedule-docker-mounts-only');
+    if (moAllEl) moAllEl.checked = false;
     setScheduleStopContainersMode(false);
     document.getElementById('create-schedule-modal').classList.add('active');
 }
@@ -39538,6 +39610,11 @@ async function openRestoreDialog(id, type, name) {
     // Config backup: offer a same-machine vs different-machine restore mode.
     // "Different machine" tells the backend to skip this host's identity, TLS
     // cert and networking so the config doesn't clash with the box it came from.
+    // Mounts-only Docker backup: say up front that the image is pulled.
+    const mountsOnlyRow = (type === 'docker' && _entry && _entry.target && _entry.target.mounts_only) ? `
+        <div style="margin-bottom:14px;font-size:12px;color:var(--text-secondary);border-left:3px solid var(--accent,#7c5cff);padding:6px 10px;">
+            This backup has no container image in it. Restoring pulls the exact image version it ran from its registry, so this server needs internet access to that registry (and to be logged in to it, if the image is private).
+        </div>` : '';
     const isConfig = type === 'config';
     const configModeRow = isConfig ? `
         <div style="margin-bottom:14px;">
@@ -39568,6 +39645,7 @@ async function openRestoreDialog(id, type, name) {
             <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">${escapeHtml(String(name || id))} — ${escapeHtml(String(type || 'backup').toUpperCase())}</div>
             ${nameRow}
             ${storageRow}
+            ${mountsOnlyRow}
             ${configModeRow}
             ${isConfig ? '' : `<label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer;">
                 <input type="checkbox" id="restore-overwrite" style="margin-top:2px;">
@@ -39727,6 +39805,7 @@ async function showScheduleSelectedModal() {
     _scheduleExcludeMap = Object.assign({}, _backupExcludeMap);
     _scheduleStopMap = Object.assign({}, _backupStopMap);
     _scheduleKeepMap = Object.assign({}, _backupKeepMap);
+    _scheduleMountsOnlyMap = Object.assign({}, _backupMountsOnlyMap);
     const targets = getSelectedTargets();
     if (targets.length === 0) {
         showToast('Please select at least one item to schedule', 'error');
@@ -39765,6 +39844,10 @@ async function showScheduleSelectedModal() {
     // Same carry-over for VMs marked "keep running" on the page.
     const keepAllEl = document.getElementById('schedule-keep-vms-running');
     if (keepAllEl) keepAllEl.checked = allSelected && targets.some(t => t.keep_running);
+    // Mounts-only ticks need no carry-over: they ride along as per-container
+    // overrides under "everything" too. The schedule-wide box starts off.
+    const moAllEl = document.getElementById('schedule-docker-mounts-only');
+    if (moAllEl) moAllEl.checked = false;
     setScheduleStopContainersMode(allSelected);
     document.getElementById('create-schedule-modal').classList.add('active');
 }
@@ -39868,6 +39951,9 @@ async function createSchedule() {
         // Live VM backups for a "back up everything" schedule, for the same reason.
         keep_vms_running: backup_all
             && !!(document.getElementById('schedule-keep-vms-running') || {}).checked,
+        // Mounts-only for every Docker container of a "back up everything" schedule.
+        docker_mounts_only: backup_all
+            && !!(document.getElementById('schedule-docker-mounts-only') || {}).checked,
     };
     if (editing) body.id = editing.id; // update in place
 
@@ -42901,6 +42987,7 @@ async function pushClusterSchedule() {
     const days = getClusterScheduleDayFields();
     const stopContainers = !!(document.getElementById('cb-schedule-stop-containers') || {}).checked;
     const keepVmsRunning = !!(document.getElementById('cb-schedule-keep-vms-running') || {}).checked;
+    const dockerMountsOnly = !!(document.getElementById('cb-schedule-docker-mounts-only') || {}).checked;
 
     const selectedIds = [...document.querySelectorAll('.cb-sched-node-cb:checked')].map(cb => cb.value);
     if (selectedIds.length === 0) { showToast('No nodes selected', 'error'); return; }
@@ -42929,7 +43016,7 @@ async function pushClusterSchedule() {
     const summary = scope === 'all' ? 'backing up everything'
         : 'backing up selected targets';
     const dayLabel = formatScheduleRunDay({ frequency, day_of_week: days.day_of_week, day_of_month: days.day_of_month });
-    if (!await showConfirm(`Create schedule "${name}" (${frequency}${dayLabel ? ` on ${dayLabel}` : ''} at ${time} UTC${stopContainers ? ', containers stopped for a cold backup' : ''}${keepVmsRunning ? ', VMs kept running' : ''}) on ${nodes.length} node(s), ${summary}?\n\n${nodes.map(n => n.hostname).join(', ')}`)) return;
+    if (!await showConfirm(`Create schedule "${name}" (${frequency}${dayLabel ? ` on ${dayLabel}` : ''} at ${time} UTC${stopContainers ? ', containers stopped for a cold backup' : ''}${keepVmsRunning ? ', VMs kept running' : ''}${dockerMountsOnly ? ', Docker images pulled on restore (mounts only)' : ''}) on ${nodes.length} node(s), ${summary}?\n\n${nodes.map(n => n.hostname).join(', ')}`)) return;
 
     await refreshBackupLocalDir();
     let storage;
@@ -42959,6 +43046,7 @@ async function pushClusterSchedule() {
             day_of_week: days.day_of_week, day_of_month: days.day_of_month,
             stop_containers: stopContainers,
             keep_vms_running: keepVmsRunning,
+            docker_mounts_only: dockerMountsOnly,
         });
     }
 
@@ -42973,6 +43061,7 @@ async function pushClusterSchedule() {
                 day_of_week: days.day_of_week, day_of_month: days.day_of_month,
                 stop_containers: stopContainers,
                 keep_vms_running: keepVmsRunning,
+                docker_mounts_only: dockerMountsOnly,
                 scope: 'fleet',
                 target_nodes: nodes.map(n => n.id),
             }),
@@ -43003,7 +43092,7 @@ async function pushClusterSchedule() {
 // Per-node fallback for "select" scope, where each node gets a different
 // target list and so genuinely needs its own request.
 async function pushClusterSchedulePerNode(nodes, perNodeTargets, common) {
-    const { name, frequency, time, retention, storage, day_of_week, day_of_month, stop_containers, keep_vms_running } = common;
+    const { name, frequency, time, retention, storage, day_of_week, day_of_month, stop_containers, keep_vms_running, docker_mounts_only } = common;
     let success = 0;
     const failures = [];
     const results = await Promise.allSettled(nodes.map(async (node) => {
@@ -43024,6 +43113,7 @@ async function pushClusterSchedulePerNode(nodes, perNodeTargets, common) {
         const coldTargets = targets.map(t => {
             if (stop_containers && (t.type === 'docker' || t.type === 'lxc')) return { ...t, stop_for_backup: true };
             if (keep_vms_running && t.type === 'vm') return { ...t, keep_running: true };
+            if (docker_mounts_only && t.type === 'docker') return { ...t, mounts_only: true };
             return t;
         });
         const body = {
@@ -43032,6 +43122,7 @@ async function pushClusterSchedulePerNode(nodes, perNodeTargets, common) {
             day_of_week, day_of_month,
             stop_containers: backupAll ? !!stop_containers : false,
             keep_vms_running: backupAll ? !!keep_vms_running : false,
+            docker_mounts_only: backupAll ? !!docker_mounts_only : false,
         };
         try {
             const res = await fetch(nodeApiUrl(node.id, '/api/backups/schedules'), {
@@ -81841,6 +81932,10 @@ const APP_DRAWER_TILES = [
     {
         id: 'probes', icon: '', name: 'Probe Bay',
         desc: 'Launch probes that watch your containers and VMs — Docker, LXC, libvirt, Proxmox — and signal you on Discord, Slack, Telegram, ntfy or email when something goes down.',
+    },
+    {
+        id: 'mail', icon: '', name: 'Mail',
+        desc: 'Run your own mail with Stalwart across your servers — domains, mailboxes, two-factor sign-in and the DNS records to publish. Shares one Galera database so any server can fail.',
     },
     {
         id: 'wolfhost', icon: '', name: 'WolfHost',

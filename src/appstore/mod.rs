@@ -7452,10 +7452,13 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Stalwart Mail Server".into(),
             icon: "📬".into(),
             category: "Communication".into(),
-            description: "All-in-one secure mail server — SMTP, IMAP, POP3, JMAP & ManageSieve in one Rust binary".into(),
+            description: "All-in-one mail server — SMTP, IMAP, POP3, JMAP & ManageSieve in one Rust binary. Single server; for a hardened multi-server install use Mail Manager. The admin password you set here stays valid until you remove STALWART_RECOVERY_ADMIN from the container".into(),
             website: Some("https://stalw.art".into()),
             docker: Some(DockerTarget {
-                image: "stalwartlabs/stalwart:latest".into(),
+                // Major tag, not `latest`: Stalwart's docs recommend `v1`
+                // (docs install/platform/docker.md "Choosing a tag") — a
+                // `latest` that jumps a major version breaks the config.
+                image: "stalwartlabs/stalwart:v1".into(),
                 // HTTPS/admin+JMAP, HTTP admin, SMTP (25/587/465),
                 // IMAP (143/993), POP3 (110/995), ManageSieve (4190).
                 ports: vec![

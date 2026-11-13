@@ -721,7 +721,7 @@ pub async fn get_local_digest(container_name: &str) -> Result<String, String> {
 /// still right for the common single-repo case where the entry's spelling
 /// differs in a way normalisation doesn't cover. None only when the list is
 /// empty.
-fn select_repo_digest(image: &str, repo_digests: &[String]) -> Option<String> {
+pub(crate) fn select_repo_digest(image: &str, repo_digests: &[String]) -> Option<String> {
     let want = ImageRef::parse(image);
     repo_digests
         .iter()
@@ -1392,9 +1392,11 @@ fn run_update_blocking(guard: &UpdateGuard, config: &ImageWatcherConfig) -> Imag
         } else {
             Vec::new()
         };
-        match crate::backup::backup_docker(container_name, &exclude_mounts, false) {
-            Ok((path, _size, _sha, _mounts)) => {
-                event.backup_id = path.file_name()
+        // Always a full-image backup: it is the rollback for an update that
+        // may have moved the tag, so it must not depend on pulling.
+        match crate::backup::backup_docker(container_name, &exclude_mounts, false, false) {
+            Ok(out) => {
+                event.backup_id = out.path.file_name()
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string());
             }
