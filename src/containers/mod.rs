@@ -15307,11 +15307,15 @@ pub struct DockerRuntimeSpec {
     pub origin_digest: Option<String>,
 }
 
-/// Migration snapshots: `wolfstack-migrate/<name>` is the current migrate
-/// path's `docker commit` tag; `wolfrun-migrate:<name>` is the legacy one.
-/// Both are local-only names no registry knows about.
+/// Local-only snapshot images no registry knows about:
+/// `wolfstack-migrate/<name>` (the migrate path's `docker commit` tag),
+/// `wolfrun-migrate:<name>` (the legacy one) and `wolfstack-backup/<name>`
+/// (what a full-image backup restores as). Containers running one carry
+/// their real origin in the `wolfstack.origin-*` labels.
 pub fn is_migrated_snapshot_image(image: &str) -> bool {
-    image.starts_with("wolfstack-migrate/") || image.starts_with("wolfrun-migrate:")
+    image.starts_with("wolfstack-migrate/")
+        || image.starts_with("wolfrun-migrate:")
+        || image.starts_with("wolfstack-backup/")
 }
 
 /// Label names carrying origin provenance on migrated containers.
@@ -18342,6 +18346,7 @@ mod migrate_spec_tests {
         // Both generations of migrate tag, and nothing else.
         assert!(is_migrated_snapshot_image("wolfstack-migrate/speedtest:latest"));
         assert!(is_migrated_snapshot_image("wolfrun-migrate:speedtest"));
+        assert!(is_migrated_snapshot_image("wolfstack-backup/speedtest"));
         assert!(!is_migrated_snapshot_image("lscr.io/linuxserver/speedtest-tracker:latest"));
         assert!(!is_migrated_snapshot_image("nginx"));
         // A registry image that merely CONTAINS the word must not match.

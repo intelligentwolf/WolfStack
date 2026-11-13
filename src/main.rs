@@ -36,6 +36,7 @@ mod backup;
 mod secrets;
 mod browse;
 mod galera;
+mod stalwart;
 mod postgres_ha;
 mod mail_tier;
 mod site_failover;

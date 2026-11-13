@@ -927,7 +927,26 @@ pub fn demote_local(container: &str, new_primary: HaPeer) -> Result<(), String> 
 /// defaults, so without this every delta would quietly turn its target
 /// into root:root 0644 — and a rootfs whose files change owner on first
 /// sync is a container that breaks the next time it starts.
-fn install_reconstructed_file(target: &str, ops: &[replication::rolling::DeltaOp]) -> Result<(), String> {
+fn install_reconstructed_file(
+    target: &str,
+    ops: &[replication::rolling::DeltaOp],
+    primary_mtime: Option<i64>,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let base_meta = std::fs::metadata(target).map_err(|e| format!("stat {}: {}", target, e))?;
+
+    // An identity delta — the replica already holds exactly the primary's
+    // bytes — needs no rewrite at all, only the primary's mtime. Without
+    // this, a file whose mtime once diverged was re-read, rewritten and
+    // fsynced in full on every round (RutgerDiehard 2026-11-13: ~540 GB/day
+    // of standby writes on an ext4 dir backend).
+    if is_identity_delta(ops, base_meta.len(), replication::rolling::BLOCK_SIZE as u64) {
+        if let Some(m) = primary_mtime {
+            set_mtime(target, m)?;
+        }
+        return Ok(());
+    }
+
     let tmp = format!("{}.wolfha-delta", target);
     if let Err(e) = replication::rolling::apply_delta(
         target,
@@ -938,25 +957,100 @@ fn install_reconstructed_file(target: &str, ops: &[replication::rolling::DeltaOp
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Ok(meta) = std::fs::metadata(target) {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let _ = std::fs::set_permissions(
-            &tmp,
-            std::fs::Permissions::from_mode(meta.permissions().mode()),
-        );
-        // chown needs the raw syscall — std has no stable API for it.
-        if let Ok(c_tmp) = std::ffi::CString::new(tmp.as_str()) {
-            // SAFETY: c_tmp is a NUL-terminated path we just created, and
-            // uid/gid come from the file being replaced.
-            unsafe {
-                libc::chown(c_tmp.as_ptr(), meta.uid(), meta.gid());
+    let finish = || -> Result<(), String> {
+        // chown BEFORE chmod: on Linux, chown of a regular file clears the
+        // setuid/setgid bits (chown(2)), so the opposite order silently
+        // dropped them on every large set-id binary.
+        let c_tmp = std::ffi::CString::new(tmp.as_str()).map_err(|e| e.to_string())?;
+        // SAFETY: c_tmp is a NUL-terminated path we just created, and
+        // uid/gid come from the file being replaced.
+        if unsafe { libc::chown(c_tmp.as_ptr(), base_meta.uid(), base_meta.gid()) } != 0 {
+            return Err(format!("chown {}: {}", tmp, std::io::Error::last_os_error()));
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(base_meta.permissions().mode()))
+            .map_err(|e| format!("chmod {}: {}", tmp, e))?;
+        // Extended attributes (file capabilities, SELinux labels, ACLs) the
+        // tar path keeps with --xattrs --acls. After chown, which also
+        // clears security.capability. Not fatal: before this they were
+        // always dropped, and refusing the whole round over one attribute
+        // would stop replication outright.
+        if let Err(e) = copy_xattrs(target, &tmp) {
+            tracing::warn!("wolfha: {} — extended attributes not copied: {}", target, e);
+        }
+        // The primary's mtime, so the next round's size+mtime comparison
+        // (manifest_diff) sees the file as unchanged.
+        if let Some(m) = primary_mtime {
+            set_mtime(&tmp, m)?;
+        }
+        std::fs::rename(&tmp, target).map_err(|e| format!("install: {}", e))
+    };
+    finish().inspect_err(|_| { let _ = std::fs::remove_file(&tmp); })
+}
+
+/// True when `ops` rebuild exactly the base file: only Copy runs, in order
+/// from block 0, covering every block of a base `base_len` bytes long.
+fn is_identity_delta(ops: &[replication::rolling::DeltaOp], base_len: u64, block_size: u64) -> bool {
+    let blocks = base_len.div_ceil(block_size);
+    let mut next: u64 = 0;
+    for op in ops {
+        match op {
+            replication::rolling::DeltaOp::Copy { index, count } if *index as u64 == next => {
+                next += *count as u64;
             }
+            _ => return false,
         }
     }
-    std::fs::rename(&tmp, target).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("install: {}", e)
-    })
+    next == blocks
+}
+
+/// Set a file's modification time (whole seconds, as the manifest records).
+fn set_mtime(path: &str, mtime_secs: i64) -> Result<(), String> {
+    let when = if mtime_secs >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs as u64)
+    } else {
+        std::time::UNIX_EPOCH - std::time::Duration::from_secs(mtime_secs.unsigned_abs())
+    };
+    let f = std::fs::OpenOptions::new().write(true).open(path)
+        .map_err(|e| format!("open {} for mtime: {}", path, e))?;
+    f.set_times(std::fs::FileTimes::new().set_modified(when))
+        .map_err(|e| format!("set mtime on {}: {}", path, e))
+}
+
+/// Copy every extended attribute of `from` onto `to` (both regular files).
+fn copy_xattrs(from: &str, to: &str) -> Result<(), String> {
+    let c_from = std::ffi::CString::new(from).map_err(|e| e.to_string())?;
+    let c_to = std::ffi::CString::new(to).map_err(|e| e.to_string())?;
+    // SAFETY: valid NUL-terminated paths; a null buffer with size 0 asks
+    // for the required length (listxattr(2)).
+    let len = unsafe { libc::llistxattr(c_from.as_ptr(), std::ptr::null_mut(), 0) };
+    if len < 0 {
+        let e = std::io::Error::last_os_error();
+        // Filesystems without xattr support have nothing to copy.
+        if e.raw_os_error() == Some(libc::ENOTSUP) { return Ok(()); }
+        return Err(format!("listxattr {}: {}", from, e));
+    }
+    if len == 0 { return Ok(()); }
+    let mut names = vec![0u8; len as usize];
+    // SAFETY: names has exactly `len` bytes.
+    let len = unsafe { libc::llistxattr(c_from.as_ptr(), names.as_mut_ptr() as *mut libc::c_char, names.len()) };
+    if len < 0 {
+        return Err(format!("listxattr {}: {}", from, std::io::Error::last_os_error()));
+    }
+    names.truncate(len as usize);
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let c_name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
+        // SAFETY: as above — size query, then a buffer of that size.
+        let vlen = unsafe { libc::lgetxattr(c_from.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+        if vlen < 0 { continue; } // removed meanwhile
+        let mut val = vec![0u8; vlen as usize];
+        let vlen = unsafe { libc::lgetxattr(c_from.as_ptr(), c_name.as_ptr(), val.as_mut_ptr() as *mut libc::c_void, val.len()) };
+        if vlen < 0 { continue; }
+        // SAFETY: val holds vlen bytes read above.
+        if unsafe { libc::lsetxattr(c_to.as_ptr(), c_name.as_ptr(), val.as_ptr() as *const libc::c_void, vlen as usize, 0) } != 0 {
+            return Err(format!("setxattr {} on {}: {}", String::from_utf8_lossy(name), to, std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }
 
 /// Where a VM's OS disk lives on this node, and its config.
@@ -1557,7 +1651,11 @@ async fn vm_reseed_replica_round(
 /// Every path is checked with [`is_safe_rel_path`] before use — this
 /// bundle came off the network, and a `../` in a path would otherwise let
 /// a peer write outside the container.
-pub fn apply_block_deltas(container: &str, bundle_path: &str) -> Result<usize, String> {
+pub fn apply_block_deltas(
+    container: &str,
+    bundle_path: &str,
+    mtimes: &std::collections::HashMap<String, i64>,
+) -> Result<usize, String> {
     let base = crate::containers::lxc_base_dir(container);
     let rootfs = format!("{}/{}/rootfs", base, container);
     let blob = std::fs::read(bundle_path)
@@ -1577,7 +1675,9 @@ pub fn apply_block_deltas(container: &str, bundle_path: &str) -> Result<usize, S
                 item.path
             ));
         }
-        install_reconstructed_file(&target, &item.ops)
+        // An older primary sends no mtimes; the file is then installed with
+        // the round's time, exactly as before.
+        install_reconstructed_file(&target, &item.ops, mtimes.get(&item.path).copied())
             .map_err(|e| format!("apply {}: {}", item.path, e))?;
         applied += 1;
     }
@@ -1916,6 +2016,20 @@ async fn sync_one_replica_from(
         }
     }
     let changed = changed;
+    // The primary's mtime for each file sent as a block delta. The delta
+    // frame cannot carry it, and without it the replica's copy takes the
+    // round's time — so the next round's size+mtime diff flags it again,
+    // forever. Sent as its own text field so an older replica, whose
+    // multipart reader keeps unknown text fields aside, ignores it.
+    let delta_mtimes_json = if block_delta_path.is_some() {
+        let m: std::collections::HashMap<&str, i64> = local.iter()
+            .filter(|e| e.k == "f" && delta_paths.contains(&e.p) && !changed.contains(&e.p))
+            .map(|e| (e.p.as_str(), e.m))
+            .collect();
+        serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        String::new()
+    };
 
     // A quiet round still ships a metadata-only heartbeat (no archive):
     // settings changes must reach standbys without waiting for a file to
@@ -1989,6 +2103,9 @@ async fn sync_one_replica_from(
             .text("config", config.clone())
             .text("ha_meta", ha_meta_json.clone());
         form = form.text("driver", format!("{:?}", driver));
+        if !delta_mtimes_json.is_empty() {
+            form = form.text("delta_mtimes", delta_mtimes_json.clone());
+        }
         if let Some(path) = archive_on_disk.as_deref() {
             // Fresh streaming part per attempt — a stream can't be
             // cloned the way the old in-RAM bytes could.
@@ -3650,7 +3767,7 @@ mod tests {
         let items = rolling::unpack_file_deltas(&bundle).unwrap();
         assert_eq!(items.len(), 1);
 
-        super::install_reconstructed_file(replica.to_str().unwrap(), &items[0].ops).unwrap();
+        super::install_reconstructed_file(replica.to_str().unwrap(), &items[0].ops, None).unwrap();
         assert_eq!(std::fs::read(&replica).unwrap(), base, "replica must match the primary exactly");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3703,7 +3820,7 @@ mod tests {
         let new = b"#!/bin/sh\necho two\n".to_vec();
         let sig = rolling::signatures(target.to_str().unwrap(), rolling::BLOCK_SIZE).unwrap();
         let ops = rolling::delta_from_bytes(&new, &sig);
-        super::install_reconstructed_file(target.to_str().unwrap(), &ops).unwrap();
+        super::install_reconstructed_file(target.to_str().unwrap(), &ops, None).unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), new);
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
@@ -3711,6 +3828,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    /// RutgerDiehard 2026-11-13: a block-delta install must leave the
+    /// replica matching the primary's manifest (size AND mtime), or the next
+    /// round flags the file again and rewrites it in full, forever.
+    #[test]
+    fn a_block_delta_install_converges_the_manifest() {
+        use super::replication::rolling;
+        let root = std::env::temp_dir().join(format!("wolfha-converge-{}", std::process::id()));
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let size = rolling::MIN_DELTA_SIZE as usize + 3 * rolling::BLOCK_SIZE + 17;
+        let mut old: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dst.join("big.bin"), &old).unwrap();
+        old[size / 2] ^= 0xff; // one changed byte on the primary
+        std::fs::write(src.join("big.bin"), &old).unwrap();
+        // A primary mtime well in the past, so a replica stamped with "now"
+        // can never match it by accident within the same second.
+        super::set_mtime(src.join("big.bin").to_str().unwrap(), 1_500_000_000).unwrap();
+        let src_s = src.to_str().unwrap();
+        let primary = super::build_manifest(src_s).unwrap();
+        let mtime = primary.iter().find(|e| e.p == "big.bin").unwrap().m;
+
+        let target = dst.join("big.bin");
+        let sig = rolling::signatures(target.to_str().unwrap(), rolling::BLOCK_SIZE).unwrap();
+        let ops = rolling::compute_delta(src.join("big.bin").to_str().unwrap(), &sig).unwrap();
+        super::install_reconstructed_file(target.to_str().unwrap(), &ops, Some(mtime)).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), old);
+        let replica = super::build_manifest(dst.to_str().unwrap()).unwrap();
+        let (changed, deletions) = super::manifest_diff(&primary, &replica);
+        assert!(changed.is_empty() && deletions.is_empty(),
+            "replica still differs after a delta install: changed={:?}", changed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A delta of an unchanged file must not rewrite it — only take the
+    /// primary's mtime. This is also what heals replicas already caught in
+    /// the rewrite loop, without a reseed.
+    #[test]
+    fn an_identity_delta_sets_mtime_without_rewriting() {
+        use std::os::unix::fs::MetadataExt;
+        use super::replication::rolling;
+        let dir = std::env::temp_dir().join(format!("wolfha-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("same.bin");
+        let data: Vec<u8> = (0..(rolling::BLOCK_SIZE * 5 + 9)).map(|i| (i % 7) as u8).collect();
+        std::fs::write(&target, &data).unwrap();
+        let ino = std::fs::metadata(&target).unwrap().ino();
+        let sig = rolling::signatures(target.to_str().unwrap(), rolling::BLOCK_SIZE).unwrap();
+        let ops = rolling::delta_from_bytes(&data, &sig);
+        assert!(super::is_identity_delta(&ops, data.len() as u64, rolling::BLOCK_SIZE as u64));
+
+        super::install_reconstructed_file(target.to_str().unwrap(), &ops, Some(1_600_000_000)).unwrap();
+        let md = std::fs::metadata(&target).unwrap();
+        assert_eq!(md.ino(), ino, "an identity delta replaced the file");
+        assert_eq!(md.mtime(), 1_600_000_000);
+        assert_eq!(std::fs::read(&target).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_detection_rejects_real_changes() {
+        use super::replication::rolling::DeltaOp;
+        let bs = 65536u64;
+        assert!(super::is_identity_delta(&[DeltaOp::Copy { index: 0, count: 3 }], 3 * bs, bs));
+        assert!(super::is_identity_delta(&[DeltaOp::Copy { index: 0, count: 2 }, DeltaOp::Copy { index: 2, count: 1 }], 2 * bs + 1, bs));
+        assert!(super::is_identity_delta(&[], 0, bs));
+        assert!(!super::is_identity_delta(&[DeltaOp::Copy { index: 0, count: 2 }], 3 * bs, bs), "truncation");
+        assert!(!super::is_identity_delta(&[DeltaOp::Copy { index: 1, count: 1 }, DeltaOp::Copy { index: 0, count: 1 }], 2 * bs, bs), "reorder");
+        assert!(!super::is_identity_delta(&[DeltaOp::Copy { index: 0, count: 1 }, DeltaOp::Literal(vec![1])], bs + 1, bs), "literal");
+    }
+
+    /// chown clears set-id bits, so it must run before chmod.
+    #[test]
+    fn a_delta_install_keeps_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+        use super::replication::rolling;
+        let dir = std::env::temp_dir().join(format!("wolfha-setuid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("tool");
+        std::fs::write(&target, b"old contents").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let sig = rolling::signatures(target.to_str().unwrap(), rolling::BLOCK_SIZE).unwrap();
+        let ops = rolling::delta_from_bytes(b"new contents!", &sig);
+        super::install_reconstructed_file(target.to_str().unwrap(), &ops, Some(1_700_000_000)).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4755, "mode became {:o}", mode);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// THE golden-rule guarantee for VM support: every wolfha.json written
     /// before `kind` existed must still parse, and must still mean

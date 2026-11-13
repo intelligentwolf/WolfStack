@@ -1201,9 +1201,84 @@ fn maxscale_cnf(servers: &[(String, String, u16)], user: &str, password: &str, l
         "[Read-Write-Service]\ntype=service\nrouter=readwritesplit\nservers={list}\nuser={user}\npassword={pw}\nenable_root_user=true\n\n",
         list = list, user = user, pw = password));
     s.push_str(&format!(
-        "[Read-Write-Listener]\ntype=listener\nservice=Read-Write-Service\naddress=0.0.0.0\nport={port}\n",
+        "[Read-Write-Listener]\ntype=listener\nservice=Read-Write-Service\naddress=0.0.0.0\nport={port}\n\n",
         port = listener_port));
+    // A master-only route on the next port, for apps that read their own
+    // writes straight back (see ensure_master_listener).
+    s.push_str(&format!(
+        "[{svc}]\ntype=service\nrouter=readconnroute\nrouter_options=master\nservers={list}\nuser={user}\npassword={pw}\n\n\
+         [{lst}]\ntype=listener\nservice={svc}\naddress=0.0.0.0\nport={port}\n",
+        svc = MASTER_ONLY_SERVICE, lst = MASTER_ONLY_LISTENER, list = list, user = user, pw = password,
+        port = listener_port + 1));
     s
+}
+
+/// MaxScale objects for the master-only route.
+pub const MASTER_ONLY_SERVICE: &str = "Master-Only-Service";
+pub const MASTER_ONLY_LISTENER: &str = "Master-Only-Listener";
+
+/// Make sure the cluster's MaxScale proxy has a master-only route, and return
+/// its `(address, port)`.
+///
+/// readwritesplit sends a write to the primary and the very next read to
+/// another member, which may not have applied it yet. An app that writes then
+/// reads straight back sees its own write missing — measured on the grid
+/// 2026-07-27 at 4–37% of write-then-read pairs (robust logins), and hit by a
+/// Stalwart mail install 2026-11-13 ("invalidForeignKey" on a domain it had
+/// just written). `wsrep_sync_wait` did NOT fix it on the MaxScale path; a
+/// readconnroute `router_options=master` service did (400/400). This adds
+/// that service + a listener on the read/write port + 1 at runtime with
+/// maxctrl (no MaxScale restart; runtime objects persist in
+/// /var/lib/maxscale/maxscale.cnf.d/), reusing the existing service's
+/// servers and MaxScale user. Proxies WolfStack builds already carry it
+/// (maxscale_cnf); this covers older ones. MaxScale still follows galeramon's
+/// primary election, so failover is kept.
+pub fn ensure_master_listener(cluster: &GaleraCluster, ctx: &GaleraOpCtx) -> Result<(String, u16), String> {
+    let proxy = cluster.proxies.first().ok_or_else(|| format!("Galera cluster '{}' has no MaxScale proxy", cluster.name))?;
+    if !proxy.node_id.is_empty() && !ctx.is_self_host(&proxy.node_id) {
+        return Err(format!("the MaxScale proxy '{}' runs on another server — open the installer from the server that hosts it", proxy.container));
+    }
+    let port = proxy.listener_port + 1;
+    let services = lxc_exec(&proxy.container, "maxctrl --tsv list services")?;
+    if services.lines().any(|l| l.split('\t').next() == Some(MASTER_ONLY_SERVICE)) {
+        return Ok((proxy.address.clone(), port));
+    }
+    // servers / user / password of the existing read-write service.
+    let cnf = lxc_exec(&proxy.container, "cat /etc/maxscale.cnf")?;
+    let mut in_rw = false;
+    let (mut servers, mut user, mut password) = (String::new(), String::new(), String::new());
+    for line in cnf.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_rw = l == "[Read-Write-Service]";
+            continue;
+        }
+        if !in_rw { continue; }
+        if let Some((k, v)) = l.split_once('=') {
+            match k.trim() {
+                "servers" => servers = v.trim().to_string(),
+                "user" => user = v.trim().to_string(),
+                "password" => password = v.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    let server_list: Vec<&str> = servers.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
+    if server_list.is_empty() || user.is_empty() || password.is_empty() {
+        return Err(format!("could not read the read-write service from {}'s /etc/maxscale.cnf", proxy.container));
+    }
+    for t in server_list.iter().chain([&user.as_str()]) { safe_token(t)?; }
+    if !valid_proxy_secret(&password) {
+        return Err("the MaxScale service password has characters WolfStack won't pass to maxctrl".into());
+    }
+    // Every value is validated above (no quotes/spaces), and single-quoted.
+    lxc_exec(&proxy.container, &format!(
+        "maxctrl create service '{svc}' readconnroute 'user={u}' 'password={p}' router_options=master --servers {srv}",
+        svc = MASTER_ONLY_SERVICE, u = user, p = password, srv = server_list.join(" ")))?;
+    lxc_exec(&proxy.container, &format!(
+        "maxctrl create listener '{svc}' '{lst}' {port} protocol=MariaDBClient address=0.0.0.0",
+        svc = MASTER_ONLY_SERVICE, lst = MASTER_ONLY_LISTENER, port = port))?;
+    Ok((proxy.address.clone(), port))
 }
 
 /// A password that's safe to drop into BOTH a maxscale.cnf value AND a SQL

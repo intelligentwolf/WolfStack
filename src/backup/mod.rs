@@ -101,6 +101,15 @@ pub struct BackupTarget {
     /// 2026-09-26 asked for the VM to stay up.
     #[serde(default)]
     pub keep_running: bool,
+    /// Docker targets only: back up the mounts (volumes + binds) and the
+    /// container's settings, but NOT its filesystem image — restore pulls the
+    /// exact image (pinned by digest) from its registry instead. Much smaller
+    /// archives, at the cost of needing registry access to restore
+    /// (RutgerDiehard 2026-11-13). A container whose image has no registry
+    /// digest (built or loaded locally) falls back to a full backup, and the
+    /// stored entry records what was actually done. OFF by default.
+    #[serde(default)]
+    pub mounts_only: bool,
 }
 
 impl Default for BackupTarget {
@@ -116,6 +125,7 @@ impl Default for BackupTarget {
             compose_project: None,
             stop_for_backup: false,
             keep_running: false,
+            mounts_only: false,
         }
     }
 }
@@ -1341,6 +1351,13 @@ pub struct BackupSchedule {
     /// Ignored when `backup_all` is false; the per-target flag governs then.
     #[serde(default)]
     pub keep_vms_running: bool,
+    /// `backup_all` schedules: back every Docker container up mounts-only
+    /// (`BackupTarget::mounts_only`, which a run-time target list has
+    /// nowhere to carry — the same reason `stop_containers` exists). A
+    /// per-container override with `mounts_only` set also applies on its
+    /// own. Absent → full-image backups, as before.
+    #[serde(default)]
+    pub docker_mounts_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2260,13 +2277,18 @@ fn subtract_excluded_bytes(total: u64, exclude_mounts: &[String]) -> u64 {
 ///
 /// `None` when docker can't be asked at all — the guard then stands down rather
 /// than blocking the backup.
-fn docker_content_bytes(name: &str, exclude_mounts: &[String]) -> Option<u64> {
-    let out = Command::new("docker")
-        .args(["inspect", "-s", "--format", "{{.SizeRootFs}}", name])
-        .output()
-        .ok()?;
-    if !out.status.success() { return None; }
-    let root_fs: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+fn docker_content_bytes(name: &str, exclude_mounts: &[String], include_image: bool) -> Option<u64> {
+    // A mounts-only backup carries no image, so its size is the mounts alone.
+    let root_fs: u64 = if include_image {
+        let out = Command::new("docker")
+            .args(["inspect", "-s", "--format", "{{.SizeRootFs}}", name])
+            .output()
+            .ok()?;
+        if !out.status.success() { return None; }
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()?
+    } else {
+        0
+    };
 
     // Mounts are separate archives inside the wrapper, so they add to it. The
     // same exclusion list the backup itself honours applies here — otherwise
@@ -2300,7 +2322,9 @@ fn ensure_staging_dir() -> Result<PathBuf, String> {
 /// The output tarball is a *wrapper* containing:
 ///   inspect.json              ← `docker inspect` output (the original docker_config)
 ///   mounts.json               ← list of MountInfo, telling restore where each archive goes
-///   image.tar.gz              ← `docker commit` + `docker save | gzip` (existing v20.10.x behaviour)
+///   image.json                ← DockerImageOrigin: the registry image + pinned digest
+///   image.tar.gz              ← `docker commit` + `docker save | gzip` — ABSENT in a
+///                               mounts-only backup, whose restore pulls image.json's pin
 ///   volumes/vol-{name}.tar.gz ← per named volume, content of /var/lib/docker/volumes/{name}/_data
 ///   binds/bind-{idx}.tar.gz   ← per bind mount, content of the host source path
 ///
@@ -2311,6 +2335,82 @@ fn ensure_staging_dir() -> Result<PathBuf, String> {
 /// Bind mounts to system paths (/, /etc, /var/lib/docker, etc.) are
 /// refused with a recorded skipped_reason so the user can tell from the
 /// backup metadata what was excluded and why.
+/// The registry image a Docker container runs, as a backup records it so a
+/// restore can pull it back (`image.json` in the archive).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerImageOrigin {
+    /// The reference the container was created from, e.g. `nginx:1.27`.
+    #[serde(default)]
+    pub image: String,
+    /// The same image pinned by digest, `repo@sha256:…`. Empty when the image
+    /// has no registry digest (built or `docker load`ed locally).
+    #[serde(default)]
+    pub pinned: String,
+}
+
+/// `repo[:tag][@digest]` → `repo`. The tag is the part after the last `:`
+/// that comes after the last `/` (a registry port `host:5000/app` stays).
+fn image_repo_without_tag(image: &str) -> &str {
+    let no_digest = image.split('@').next().unwrap_or(image);
+    let last_slash = no_digest.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match no_digest[last_slash..].rfind(':') {
+        Some(i) => &no_digest[..last_slash + i],
+        None => no_digest,
+    }
+}
+
+/// Work out which registry image a container runs and its pinned digest.
+///
+/// A container running a local snapshot (`wolfstack-backup/…` after a
+/// full-image restore, `wolfstack-migrate/…` after a migration) carries its
+/// real origin in the `wolfstack.origin-image` / `-digest` labels, which
+/// migration (containers::capture_runtime_spec) and restore both write.
+/// Otherwise the digest comes from the image's own RepoDigests, chosen with
+/// the image watcher's repo-matching picker.
+pub fn resolve_docker_image_origin(container: &serde_json::Value) -> DockerImageOrigin {
+    let image = container.pointer("/Config/Image").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let label = |name: &str| -> String {
+        container.pointer(&format!("/Config/Labels/{}", name.replace('/', "~1")))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
+    if crate::containers::is_migrated_snapshot_image(&image) {
+        let origin = label(crate::containers::ORIGIN_IMAGE_LABEL);
+        let digest = label(crate::containers::ORIGIN_DIGEST_LABEL);
+        if origin.is_empty() {
+            return DockerImageOrigin::default();
+        }
+        let pinned = if digest.is_empty() { String::new() } else { format!("{}@{}", image_repo_without_tag(&origin), digest) };
+        return DockerImageOrigin { image: origin, pinned };
+    }
+    if image.is_empty() {
+        return DockerImageOrigin::default();
+    }
+    // `.Image` is the exact local image id the container was created from;
+    // asking by id avoids a tag that has since moved to a newer pull.
+    let id = container.get("Image").and_then(|v| v.as_str()).unwrap_or(&image).to_string();
+    let digests: Vec<String> = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{json .RepoDigests}}", &id])
+        .output().ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
+        .unwrap_or_default();
+    let pinned = crate::containers::image_watcher::select_repo_digest(&image, &digests).unwrap_or_default();
+    DockerImageOrigin { image, pinned }
+}
+
+/// What `backup_docker` produced.
+pub struct DockerBackupOutput {
+    pub path: PathBuf,
+    pub size: u64,
+    pub docker_config: String,
+    pub mounts: Vec<MountInfo>,
+    pub origin: DockerImageOrigin,
+    /// True when the archive really is mounts-only (the image was left out).
+    pub mounts_only: bool,
+    /// Why a requested mounts-only backup fell back to a full one, if it did.
+    pub fallback_reason: String,
+}
+
 /// Restarts a container that we stopped for a consistent backup, on
 /// EVERY exit path (`?` error returns, panics) via Drop. Same guarantee
 /// as backup_lxc's stop/restart, without threading restart calls
@@ -2326,14 +2426,32 @@ impl Drop for DockerRestartGuard {
     }
 }
 
-pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: bool) -> Result<(PathBuf, u64, String, Vec<MountInfo>), String> {
+pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: bool, mounts_only: bool) -> Result<DockerBackupOutput, String> {
     let staging = ensure_staging_dir()?;
+    // Which registry image this is, decided before anything is written: a
+    // mounts-only backup is only restorable if the image can be pulled back
+    // by digest, so without a pin it falls back to a full backup.
+    let origin = Command::new("docker").args(["inspect", name]).output().ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v.get(0).cloned())
+        .map(|c| resolve_docker_image_origin(&c))
+        .unwrap_or_default();
+    let (skip_image, fallback_reason) = if !mounts_only {
+        (false, String::new())
+    } else if origin.pinned.is_empty() {
+        (false, format!(
+            "mounts-only was requested, but image '{}' has no registry digest (built or loaded locally), so a restore could not pull it back — made a full backup instead",
+            if origin.image.is_empty() { "?" } else { &origin.image }))
+    } else {
+        (true, String::new())
+    };
     // Refuse before writing anything if the archive cannot fit: this is the path
     // that filled a system disk (klas 2026-08-19), because a container's image
     // plus its volumes and binds all land in staging first.
     ensure_staging_space(
         &format!("Docker container '{}'", name),
-        docker_content_bytes(name, exclude_mounts),
+        docker_content_bytes(name, exclude_mounts, !skip_image),
         &staging,
     )?;
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
@@ -2557,25 +2675,34 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
         }
     }
 
-    // Commit + save the image into work_dir/image.tar.gz. Same as
-    // pre-v20.11.0 behaviour, just in a subdirectory now.
-    let image_path = work_dir.join("image.tar.gz");
-    let commit = Command::new("docker")
-        .env("DOCKER_CONTENT_TRUST", "0")
-        .args(["commit", name, &temp_image])
-        .output()
-        .map_err(|e| format!("Failed to commit container: {}", e))?;
-    if !commit.status.success() {
-        return Err(format!("Docker commit failed: {}", String::from_utf8_lossy(&commit.stderr)));
+    // Commit + save the image into work_dir/image.tar.gz — skipped for a
+    // mounts-only backup, whose restore pulls `origin.pinned` instead.
+    if !skip_image {
+        let image_path = work_dir.join("image.tar.gz");
+        let commit = Command::new("docker")
+            .env("DOCKER_CONTENT_TRUST", "0")
+            .args(["commit", name, &temp_image])
+            .output()
+            .map_err(|e| format!("Failed to commit container: {}", e))?;
+        if !commit.status.success() {
+            return Err(format!("Docker commit failed: {}", String::from_utf8_lossy(&commit.stderr)));
+        }
+        let save = Command::new("sh")
+            .args(["-c", &format!("docker save '{}' | gzip > '{}'", temp_image, image_path.display())])
+            .output()
+            .map_err(|e| format!("Failed to save image: {}", e))?;
+        let _ = Command::new("docker").args(["rmi", &temp_image]).output();
+        if !save.status.success() {
+            return Err(format!("Docker save failed: {}", String::from_utf8_lossy(&save.stderr)));
+        }
     }
-    let save = Command::new("sh")
-        .args(["-c", &format!("docker save '{}' | gzip > '{}'", temp_image, image_path.display())])
-        .output()
-        .map_err(|e| format!("Failed to save image: {}", e))?;
-    let _ = Command::new("docker").args(["rmi", &temp_image]).output();
-    if !save.status.success() {
-        return Err(format!("Docker save failed: {}", String::from_utf8_lossy(&save.stderr)));
-    }
+    // Recorded for every backup, so a full-image restore can label the
+    // container with its origin and a later mounts-only backup of it still
+    // knows what to pull.
+    let image_json = serde_json::to_string_pretty(&origin)
+        .map_err(|e| format!("Failed to serialise image origin: {}", e))?;
+    fs::write(work_dir.join("image.json"), image_json)
+        .map_err(|e| format!("Failed to write image.json: {}", e))?;
 
     // inspect.json + mounts.json — the metadata restore will read.
     fs::write(work_dir.join("inspect.json"), &docker_config)
@@ -2599,7 +2726,10 @@ pub fn backup_docker(name: &str, exclude_mounts: &[String], stop_for_backup: boo
     }
 
     let size = fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-    Ok((staged_archive.keep(), size, docker_config, mounts))
+    Ok(DockerBackupOutput {
+        path: staged_archive.keep(), size, docker_config, mounts, origin,
+        mounts_only: skip_image, fallback_reason,
+    })
 }
 
 /// Sanitize a string for use as a filename component. Volume names are
@@ -4296,11 +4426,19 @@ pub fn restore_system_path(entry: &BackupEntry, target_dir: &str) -> Result<Stri
 /// mounts have nothing to do with each other. No override, or an override with
 /// nothing excluded, means the container archives in full.
 fn mount_overrides_for(overrides: &[BackupTarget], kind: &BackupTargetType, name: &str) -> Vec<String> {
-    overrides
-        .iter()
-        .find(|t| &t.target_type == kind && t.name == name)
+    override_for(overrides, kind, name)
         .map(|t| t.exclude_mounts.clone())
         .unwrap_or_default()
+}
+
+/// A Docker container under `backup_all` is mounts-only when the schedule
+/// says so for every container, or its own override does.
+fn docker_mounts_only_for(overrides: &[BackupTarget], name: &str, schedule_wide: bool) -> bool {
+    schedule_wide || override_for(overrides, &BackupTargetType::Docker, name).map(|t| t.mounts_only).unwrap_or(false)
+}
+
+fn override_for<'a>(overrides: &'a [BackupTarget], kind: &BackupTargetType, name: &str) -> Option<&'a BackupTarget> {
+    overrides.iter().find(|t| &t.target_type == kind && t.name == name)
 }
 
 /// Backup everything on the server.
@@ -4322,6 +4460,7 @@ pub fn backup_all(
     storage: &BackupStorage,
     stop_containers: bool,
     keep_vms_running: bool,
+    docker_mounts_only: bool,
     overrides: &[BackupTarget],
 ) -> Vec<BackupEntry> {
     let mut entries = Vec::new();
@@ -4338,12 +4477,14 @@ pub fn backup_all(
             .collect();
         for name in names {
             let exclude_mounts = mount_overrides_for(overrides, &BackupTargetType::Docker, &name);
+            let mounts_only = docker_mounts_only_for(overrides, &name, docker_mounts_only);
             entries.push(create_backup_entry(
                 BackupTarget {
                     target_type: BackupTargetType::Docker,
                     name: name.clone(),
                     exclude_mounts,
                     stop_for_backup: stop_containers,
+                    mounts_only,
                     ..Default::default()
                 },
                 storage,
@@ -4485,10 +4626,11 @@ fn backup_comments_with_cluster(target: &BackupTarget, cluster: &str) -> String 
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
+            let mode = if target.mounts_only { " — mounts only, image pulled on restore" } else { "" };
             if image.is_empty() {
-                format!("Docker container: {}", target.name)
+                format!("Docker container: {}{}", target.name, mode)
             } else {
-                format!("Docker container: {} (image: {})", target.name, image)
+                format!("Docker container: {} (image: {}){}", target.name, image, mode)
             }
         }
         BackupTargetType::Lxc => {
@@ -4585,12 +4727,18 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
 
     // `tar_warning`: tar's text when the archive completed but files changed
     // while it was read (see `tar_create_outcome`); empty otherwise.
+    // What a Docker backup actually did: mounts-only, or a full fallback.
+    let mut docker_mode: Option<(bool, String)> = None;
     let (result, docker_config, mounts, tar_warning) = match target.target_type {
         BackupTargetType::Docker => {
-            match backup_docker(&target.name, &target.exclude_mounts, target.stop_for_backup) {
-                Ok((path, size, config, m)) => {
-                    let w = docker_mount_warnings(&m);
-                    (Ok((path, size)), config, m, w)
+            match backup_docker(&target.name, &target.exclude_mounts, target.stop_for_backup, target.mounts_only) {
+                Ok(out) => {
+                    let w = docker_mount_warnings(&out.mounts);
+                    if !out.fallback_reason.is_empty() {
+                        warn!("Backup of Docker '{}': {}", target.name, out.fallback_reason);
+                    }
+                    docker_mode = Some((out.mounts_only, out.fallback_reason));
+                    (Ok((out.path, out.size)), out.docker_config, out.mounts, w)
                 }
                 Err(e) => (Err(e), String::new(), Vec::new(), String::new()),
             }
@@ -4605,6 +4753,15 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
             }
         }
     };
+    // The stored entry records what was actually done, so restore and the
+    // history view never claim a mounts-only backup that fell back.
+    let mut target = target;
+    if let Some((applied, reason)) = docker_mode {
+        target.mounts_only = applied;
+        if !reason.is_empty() {
+            comments = format!("{} | {}", comments, reason);
+        }
+    }
 
     match result {
         Ok((local_path, size)) => {
@@ -5487,38 +5644,43 @@ fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPa
             // Using two Command processes with an OS pipe avoids any shell
             // metacharacter interpretation of the container name (a name like
             // `$(rm -rf /)` is just an argv element to docker, never evaluated).
-            use std::process::Stdio;
-            // stderr is sent to null rather than piped: nothing drains it while
-            // we block on tar consuming stdout, and a full stderr pipe buffer
-            // would deadlock docker. `docker export` stderr is trivial anyway;
-            // the exit code is the signal we act on.
-            let mut exporter = Command::new("docker")
-                .arg("export")
-                .arg(&target.name)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| { let _ = fs::remove_dir_all(&work); format!("docker export failed to start: {}", e) })?;
-            let export_stdout = exporter.stdout.take()
-                .ok_or_else(|| { let _ = fs::remove_dir_all(&work); "docker export produced no stdout".to_string() })?;
-            let tar_status = Command::new("tar")
-                .arg("-x")
-                .arg("-C").arg(&rootfs)
-                .stdin(Stdio::from(export_stdout))
-                .status()
-                .map_err(|e| { let _ = fs::remove_dir_all(&work); format!("tar extract failed to start: {}", e) })?;
-            let exporter_status = exporter.wait()
-                .map_err(|e| { let _ = fs::remove_dir_all(&work); format!("docker export wait failed: {}", e) })?;
-            if !exporter_status.success() {
-                let _ = fs::remove_dir_all(&work);
-                return Err(format!("docker export failed (exit {})",
-                    exporter_status.code().unwrap_or(-1)));
+            // Mounts-only: the container filesystem is left out. File-level
+            // restores extract files and never recreate the container, so
+            // there is no image to pin here — only the mounts are kept.
+            if !target.mounts_only {
+                use std::process::Stdio;
+                // stderr is sent to null rather than piped: nothing drains it while
+                // we block on tar consuming stdout, and a full stderr pipe buffer
+                // would deadlock docker. `docker export` stderr is trivial anyway;
+                // the exit code is the signal we act on.
+                let mut exporter = Command::new("docker")
+                    .arg("export")
+                    .arg(&target.name)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| { let _ = fs::remove_dir_all(&work); format!("docker export failed to start: {}", e) })?;
+                let export_stdout = exporter.stdout.take()
+                    .ok_or_else(|| { let _ = fs::remove_dir_all(&work); "docker export produced no stdout".to_string() })?;
+                let tar_status = Command::new("tar")
+                    .arg("-x")
+                    .arg("-C").arg(&rootfs)
+                    .stdin(Stdio::from(export_stdout))
+                    .status()
+                    .map_err(|e| { let _ = fs::remove_dir_all(&work); format!("tar extract failed to start: {}", e) })?;
+                let exporter_status = exporter.wait()
+                    .map_err(|e| { let _ = fs::remove_dir_all(&work); format!("docker export wait failed: {}", e) })?;
+                if !exporter_status.success() {
+                    let _ = fs::remove_dir_all(&work);
+                    return Err(format!("docker export failed (exit {})",
+                        exporter_status.code().unwrap_or(-1)));
+                }
+                if !tar_status.success() {
+                    let _ = fs::remove_dir_all(&work);
+                    return Err("docker export tar extract failed".to_string());
+                }
+                pairs.push(PxarPair { archive: "root.pxar".into(), dir: rootfs, ephemeral: false });
             }
-            if !tar_status.success() {
-                let _ = fs::remove_dir_all(&work);
-                return Err("docker export tar extract failed".to_string());
-            }
-            pairs.push(PxarPair { archive: "root.pxar".into(), dir: rootfs, ephemeral: false });
             // The whole `work` dir is the ephemeral owner — track it via a
             // sentinel pair so cleanup removes it once.
             pairs.push(PxarPair { archive: String::new(), dir: work.clone(), ephemeral: true });
@@ -6195,13 +6357,43 @@ fn retrieve_from_s3(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
 
 // ─── Restore Functions ───
 
-/// Restore a Docker container from backup
-/// Build docker run arguments from a docker inspect JSON
-fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
+/// How to recreate a container from its saved `docker inspect`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DockerRunPlan {
+    /// `docker run` flags (before the image).
+    pub args: Vec<String>,
+    /// Positional words after the image: the rest of the entrypoint, then Cmd.
+    pub tail: Vec<String>,
+    /// Networks to `docker network connect` once the container exists — only
+    /// one network can be given to `docker run`.
+    pub extra_networks: Vec<String>,
+}
+
+/// Labels WolfStack re-derives on restore rather than copying from inspect.
+fn is_origin_label(k: &str) -> bool {
+    k == crate::containers::ORIGIN_IMAGE_LABEL || k == crate::containers::ORIGIN_DIGEST_LABEL
+}
+
+/// Build the `docker run` flags that reproduce a container from its saved
+/// `docker inspect` (Config + HostConfig + Mounts + NetworkSettings).
+///
+/// Complete enough to recreate the container on an image that is NOT a
+/// commit of it — a mounts-only restore pulls the upstream image, which knows
+/// nothing of the container's own Cmd, Entrypoint, User or labels. Before
+/// 2026-11-13 this emitted only ports/env/binds/restart/network/hostname/
+/// workdir/first-entrypoint-word/tty/privileged/limits, so even a full
+/// restore lost labels (compose membership), CapAdd, devices, user, extra
+/// networks, and named volumes mounted through `Mounts` instead of `Binds`
+/// (every compose volume) — those came back restored but unattached.
+pub fn docker_run_plan_from_inspect(inspect: &serde_json::Value) -> DockerRunPlan {
     let mut args = Vec::new();
     let container = if inspect.is_array() { &inspect[0] } else { inspect };
     let config = &container["Config"];
     let host_config = &container["HostConfig"];
+    let push = |args: &mut Vec<String>, flag: &str, v: String| { args.push(flag.to_string()); args.push(v); };
+    let strs = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    };
 
     // Port bindings: HostConfig.PortBindings
     if let Some(bindings) = host_config["PortBindings"].as_object() {
@@ -6216,8 +6408,7 @@ fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
                         } else {
                             format!("{}:{}", host_port, container_port)
                         };
-                        args.push("-p".to_string());
-                        args.push(binding);
+                        push(&mut args, "-p", binding);
                     }
                 }
             }
@@ -6225,26 +6416,42 @@ fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
     }
 
     // Environment variables: Config.Env
-    if let Some(env) = config["Env"].as_array() {
-        for e in env {
-            if let Some(s) = e.as_str() {
-                // Skip common default vars that come from the image
-                if s.starts_with("PATH=") || s.starts_with("HOME=") || s.starts_with("HOSTNAME=") {
-                    continue;
-                }
-                args.push("-e".to_string());
-                args.push(s.to_string());
-            }
+    for s in strs(&config["Env"]) {
+        // Skip common default vars that come from the image
+        if s.starts_with("PATH=") || s.starts_with("HOME=") || s.starts_with("HOSTNAME=") {
+            continue;
         }
+        push(&mut args, "-e", s);
     }
 
-    // Volume mounts: HostConfig.Binds
-    if let Some(binds) = host_config["Binds"].as_array() {
-        for b in binds {
-            if let Some(s) = b.as_str() {
-                args.push("-v".to_string());
-                args.push(s.to_string());
-            }
+    // Mounts. HostConfig.Binds covers `-v` binds and volumes; every mount
+    // created through the Mounts API (compose, `--mount`) appears only in
+    // the resolved `.Mounts` list, so anything there whose destination the
+    // Binds didn't cover is added as `-v`.
+    let mut covered: Vec<String> = Vec::new();
+    for b in strs(&host_config["Binds"]) {
+        if let Some(dst) = b.split(':').nth(1) { covered.push(dst.to_string()); }
+        push(&mut args, "-v", b);
+    }
+    if let Some(mounts) = container["Mounts"].as_array() {
+        for m in mounts {
+            let dst = m["Destination"].as_str().unwrap_or("");
+            if dst.is_empty() || covered.iter().any(|c| c == dst) { continue; }
+            let src = match m["Type"].as_str().unwrap_or("") {
+                "volume" => m["Name"].as_str().unwrap_or(""),
+                "bind" => m["Source"].as_str().unwrap_or(""),
+                _ => continue, // tmpfs is handled below; npipe/cluster don't apply
+            };
+            if src.is_empty() { continue; }
+            let ro = if m["RW"].as_bool() == Some(false) { ":ro" } else { "" };
+            covered.push(dst.to_string());
+            push(&mut args, "-v", format!("{}:{}{}", src, dst, ro));
+        }
+    }
+    if let Some(tmpfs) = host_config["Tmpfs"].as_object() {
+        for (dst, opts) in tmpfs {
+            let o = opts.as_str().unwrap_or("");
+            push(&mut args, "--tmpfs", if o.is_empty() { dst.clone() } else { format!("{}:{}", dst, o) });
         }
     }
 
@@ -6253,73 +6460,91 @@ fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
     if !restart_name.is_empty() && restart_name != "no" {
         let max_retry = host_config["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0);
         if restart_name == "on-failure" && max_retry > 0 {
-            args.push("--restart".to_string());
-            args.push(format!("on-failure:{}", max_retry));
+            push(&mut args, "--restart", format!("on-failure:{}", max_retry));
         } else {
-            args.push("--restart".to_string());
-            args.push(restart_name.to_string());
+            push(&mut args, "--restart", restart_name.to_string());
         }
     } else {
-        args.push("--restart".to_string());
-        args.push("unless-stopped".to_string());
+        push(&mut args, "--restart", "unless-stopped".to_string());
     }
 
-    // Network mode: HostConfig.NetworkMode
+    // Network mode, then every other attached network for after the run.
     let network = host_config["NetworkMode"].as_str().unwrap_or("default");
     if network != "default" && network != "bridge" && !network.is_empty() {
-        args.push("--network".to_string());
-        args.push(network.to_string());
+        push(&mut args, "--network", network.to_string());
     }
+    let mut extra_networks: Vec<String> = container["NetworkSettings"]["Networks"].as_object()
+        .map(|m| m.keys()
+            .filter(|n| n.as_str() != network && !matches!(n.as_str(), "bridge" | "host" | "none" | "default"))
+            .cloned().collect())
+        .unwrap_or_default();
+    extra_networks.sort();
 
-    // Hostname
     if let Some(hostname) = config["Hostname"].as_str()
-        && !hostname.is_empty() {
-            args.push("--hostname".to_string());
-            args.push(hostname.to_string());
+        && !hostname.is_empty() && !network.starts_with("container:") && network != "host" {
+            push(&mut args, "--hostname", hostname.to_string());
         }
-
-    // Working dir
     if let Some(workdir) = config["WorkingDir"].as_str()
         && !workdir.is_empty() {
-            args.push("-w".to_string());
-            args.push(workdir.to_string());
+            push(&mut args, "-w", workdir.to_string());
+        }
+    if let Some(user) = config["User"].as_str()
+        && !user.is_empty() {
+            push(&mut args, "--user", user.to_string());
         }
 
-    // Entrypoint override (only if different from image default)
-    if let Some(ep) = config["Entrypoint"].as_array()
-        && !ep.is_empty() {
-            args.push("--entrypoint".to_string());
-            args.push(ep[0].as_str().unwrap_or("").to_string());
+    // Labels — compose membership, app metadata. The origin labels are
+    // written fresh by the restore itself.
+    if let Some(labels) = config["Labels"].as_object() {
+        let mut keys: Vec<&String> = labels.keys().filter(|k| !is_origin_label(k)).collect();
+        keys.sort();
+        for k in keys {
+            push(&mut args, "--label", format!("{}={}", k, labels[k].as_str().unwrap_or("")));
+        }
+    }
+
+    // Entrypoint + Cmd. `--entrypoint` takes one word and resets the
+    // image's CMD, so the remaining entrypoint words and the container's
+    // own Cmd go after the image, in that order (Docker's exec form).
+    let ep = strs(&config["Entrypoint"]);
+    let mut tail = Vec::new();
+    if let Some((first, rest)) = ep.split_first() {
+        push(&mut args, "--entrypoint", first.clone());
+        tail.extend(rest.iter().cloned());
+    }
+    tail.extend(strs(&config["Cmd"]));
+
+    if config["Tty"].as_bool().unwrap_or(false) { args.push("-t".to_string()); }
+    if config["OpenStdin"].as_bool().unwrap_or(false) { args.push("-i".to_string()); }
+    if host_config["Privileged"].as_bool().unwrap_or(false) { args.push("--privileged".to_string()); }
+    if host_config["Init"].as_bool().unwrap_or(false) { args.push("--init".to_string()); }
+    for c in strs(&host_config["CapAdd"]) { push(&mut args, "--cap-add", c); }
+    for c in strs(&host_config["CapDrop"]) { push(&mut args, "--cap-drop", c); }
+    for so in strs(&host_config["SecurityOpt"]) { push(&mut args, "--security-opt", so); }
+    for h in strs(&host_config["ExtraHosts"]) { push(&mut args, "--add-host", h); }
+    if let Some(devs) = host_config["Devices"].as_array() {
+        for d in devs {
+            if let (Some(h), Some(c)) = (d["PathOnHost"].as_str(), d["PathInContainer"].as_str()) {
+                let perms = d["CgroupPermissions"].as_str().unwrap_or("rwm");
+                push(&mut args, "--device", format!("{}:{}:{}", h, c, perms));
+            }
+        }
+    }
+    if let Some(sig) = config["StopSignal"].as_str()
+        && !sig.is_empty() {
+            push(&mut args, "--stop-signal", sig.to_string());
         }
 
-    // TTY and stdin (needed for interactive containers like debian, ubuntu)
-    if config["Tty"].as_bool().unwrap_or(false) {
-        args.push("-t".to_string());
-    }
-    if config["OpenStdin"].as_bool().unwrap_or(false) {
-        args.push("-i".to_string());
-    }
-
-    // Privileged
-    if host_config["Privileged"].as_bool().unwrap_or(false) {
-        args.push("--privileged".to_string());
-    }
-
-    // Memory limit
     if let Some(mem) = host_config["Memory"].as_u64()
         && mem > 0 {
-            args.push("-m".to_string());
-            args.push(format!("{}b", mem));
+            push(&mut args, "-m", format!("{}b", mem));
         }
-
-    // CPU quota
     if let Some(cpus) = host_config["NanoCpus"].as_u64()
         && cpus > 0 {
-            args.push("--cpus".to_string());
-            args.push(format!("{:.2}", cpus as f64 / 1_000_000_000.0));
+            push(&mut args, "--cpus", format!("{:.2}", cpus as f64 / 1_000_000_000.0));
         }
 
-    args
+    DockerRunPlan { args, tail, extra_networks }
 }
 
 pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
@@ -6456,31 +6681,69 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
         local_path.clone()
     };
 
-    // Load the image from the (legacy or new-format) tarball.
-    let output = Command::new("sh")
-        .args(["-c", &format!("gunzip -c '{}' | docker load", image_load_path.display())])
-        .output()
-        .map_err(|e| {
-            let _ = fs::remove_dir_all(&work_dir);
-            let _ = fs::remove_file(&local_path);
-            format!("Failed to load Docker image: {}", e)
-        })?;
+    // The image's registry origin (v25.44+ archives). Absent from older
+    // backups, which then restore exactly as before.
+    let origin: DockerImageOrigin = if new_format {
+        fs::read_to_string(work_dir.join("image.json")).ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    } else {
+        DockerImageOrigin::default()
+    };
+    let mounts_only_archive = new_format && !image_load_path.exists();
 
-    // Tarball + work dir done. Clean up.
-    let _ = fs::remove_dir_all(&work_dir);
-    let _ = fs::remove_file(&local_path);
+    let mut notes: Vec<String> = Vec::new();
+    let image_name = if mounts_only_archive {
+        // Mounts-only backup: pull the pinned image back.
+        let _ = fs::remove_dir_all(&work_dir);
+        let _ = fs::remove_file(&local_path);
+        if origin.pinned.is_empty() && origin.image.is_empty() {
+            return Err("This backup holds no container image and records no image to pull — it cannot be restored as a container. Its mount data was restored.".into());
+        }
+        match (!origin.pinned.is_empty()).then(|| crate::containers::docker_pull(&origin.pinned)) {
+            Some(Ok(_)) => origin.pinned.clone(),
+            pin_result => {
+                // The exact digest is gone from the registry (or was never
+                // recorded): the tag is the closest available image. Said
+                // loudly — it may be a newer version than was backed up.
+                let why = match pin_result { Some(Err(e)) => e, _ => "no digest recorded".into() };
+                if origin.image.is_empty() {
+                    return Err(format!("Could not pull the backed-up image {}: {}. Check this server can reach the registry (and is logged in to it if the image is private), then restore again.", origin.pinned, why));
+                }
+                crate::containers::docker_pull(&origin.image).map_err(|e| format!(
+                    "Could not pull the backed-up image ({}: {}; fallback {}: {}). Check this server can reach the registry (and is logged in to it if the image is private), then restore again.",
+                    origin.pinned, why, origin.image, e))?;
+                notes.push(format!("the pinned image {} could not be pulled ({}), so {} was used — it may be a newer version than the one backed up", origin.pinned, why, origin.image));
+                origin.image.clone()
+            }
+        }
+    } else {
+        // Load the image from the (legacy or new-format) tarball.
+        let output = Command::new("sh")
+            .args(["-c", &format!("gunzip -c '{}' | docker load", image_load_path.display())])
+            .output()
+            .map_err(|e| {
+                let _ = fs::remove_dir_all(&work_dir);
+                let _ = fs::remove_file(&local_path);
+                format!("Failed to load Docker image: {}", e)
+            })?;
 
-    if !output.status.success() {
-        return Err(format!("Docker load failed: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-    let load_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Tarball + work dir done. Clean up.
+        let _ = fs::remove_dir_all(&work_dir);
+        let _ = fs::remove_file(&local_path);
 
-    // Extract the loaded image name from "Loaded image: <name>".
-    let image_name = load_result
-        .lines()
-        .find_map(|line| line.strip_prefix("Loaded image: "))
-        .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
-        .to_string();
+        if !output.status.success() {
+            return Err(format!("Docker load failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        let load_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Extract the loaded image name from "Loaded image: <name>".
+        load_result
+            .lines()
+            .find_map(|line| line.strip_prefix("Loaded image: "))
+            .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
+            .to_string()
+    };
 
     // If overwriting, stop and remove the existing container.
     if exists {
@@ -6489,18 +6752,30 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
     }
 
     // Build docker run args from inspect config, or use defaults.
-    let extra_args = inspect_json.as_ref()
-        .map(docker_run_args_from_inspect)
-        .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
+    let plan = inspect_json.as_ref()
+        .map(docker_run_plan_from_inspect)
+        .unwrap_or_else(|| DockerRunPlan { args: vec!["--restart".to_string(), "unless-stopped".to_string()], ..Default::default() });
 
     let mut run_args = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), container_name.to_string()];
-    run_args.extend(extra_args);
+    run_args.extend(plan.args);
+    // Origin provenance, so a full-image restore (running the local
+    // `wolfstack-backup/…` image) stays traceable to its registry image —
+    // for the update checker and for a later mounts-only backup.
+    if !origin.image.is_empty() {
+        run_args.push("--label".into());
+        run_args.push(format!("{}={}", crate::containers::ORIGIN_IMAGE_LABEL, origin.image));
+        if let Some((_, digest)) = origin.pinned.rsplit_once('@') {
+            run_args.push("--label".into());
+            run_args.push(format!("{}={}", crate::containers::ORIGIN_DIGEST_LABEL, digest));
+        }
+    }
     run_args.push(image_name.clone());
+    run_args.extend(plan.tail);
 
     let create = Command::new("docker")
         .args(&run_args)
         .output()
-        .map_err(|e| format!("Image loaded but failed to create container: {}", e))?;
+        .map_err(|e| format!("Image ready but failed to create container: {}", e))?;
 
     if !create.status.success() {
         let err = String::from_utf8_lossy(&create.stderr);
@@ -6508,13 +6783,28 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
             image_name, err.trim()));
     }
 
+    // Networks beyond the first can only be attached after creation.
+    for net in &plan.extra_networks {
+        match Command::new("docker").args(["network", "connect", net, container_name]).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => notes.push(format!("network '{}' not attached: {}", net, String::from_utf8_lossy(&o.stderr).trim())),
+            Err(e) => notes.push(format!("network '{}' not attached: {}", net, e)),
+        }
+    }
+
     let config_note = if inspect_json.is_some() { " (with original config)" } else { " (default config)" };
     let mut msg = format!("Docker container '{}' restored and started{}", container_name, config_note);
+    if mounts_only_archive {
+        msg.push_str(&format!(" — image pulled: {}", image_name));
+    }
     if !restored_mounts.is_empty() {
         msg.push_str(&format!(" — restored data: {}", restored_mounts.join(", ")));
     }
     if !skipped_mounts.is_empty() {
         msg.push_str(&format!(" (skipped: {})", skipped_mounts.join(", ")));
+    }
+    if !notes.is_empty() {
+        msg.push_str(&format!(" ⚠ {}", notes.join("; ")));
     }
     Ok(msg)
 }
@@ -7873,7 +8163,7 @@ pub fn create_backup(target: Option<BackupTarget>, storage: BackupStorage) -> Ve
         // On-demand "everything" from the UI: live (crash-consistent) container
         // archives, as it always has been — cold backups are a scheduling
         // decision, made per schedule.
-        None => backup_all(&storage, false, false, &[]),
+        None => backup_all(&storage, false, false, false, &[]),
     };
 
     config.entries.extend(new_entries.clone());
@@ -7964,17 +8254,31 @@ pub fn create_backup_with_log(
 
         // Run the backup with line-by-line output for vzdump
         // `tar_warning`: see the same binding in `create_backup_entry`.
+        // What a Docker backup actually did (see create_backup_entry).
+        let mut docker_mode: Option<(bool, String)> = None;
         let (result, docker_config, mounts, tar_warning) = match t.target_type {
             BackupTargetType::Docker => {
-                let _ = log.send(format!("  Exporting Docker container '{}'{}...",
+                let _ = log.send(format!("  Exporting Docker container '{}'{}{}...",
                     t.name,
+                    if t.mounts_only { " — mounts only, image to be pulled on restore" } else { "" },
                     if t.stop_for_backup { " — stopping for a cold backup" } else { " while it runs" }));
                 if !t.exclude_mounts.is_empty() {
                     let _ = log.send(format!("  Excluding {} mount(s): {}",
                         t.exclude_mounts.len(), t.exclude_mounts.join(", ")));
                 }
-                match backup_docker(&t.name, &t.exclude_mounts, t.stop_for_backup) {
-                    Ok((path, size, config, m)) => {
+                match backup_docker(&t.name, &t.exclude_mounts, t.stop_for_backup, t.mounts_only) {
+                    Ok(out) => {
+                        let m = out.mounts;
+                        if out.mounts_only {
+                            let _ = log.send(format!("  Image not archived — restore will pull {}", out.origin.pinned));
+                        } else if !out.origin.pinned.is_empty() {
+                            let _ = log.send(format!("  Image archived (registry origin {})", out.origin.pinned));
+                        }
+                        if !out.fallback_reason.is_empty() {
+                            let _ = log.send(format!("  ⚠ {}", out.fallback_reason));
+                        }
+                        docker_mode = Some((out.mounts_only, out.fallback_reason));
+                        let (path, size, config) = (out.path, out.size, out.docker_config);
                         if !m.is_empty() {
                             let archived = m.iter().filter(|x| !x.archive_path.is_empty()).count();
                             let skipped  = m.iter().filter(|x|  x.archive_path.is_empty()).count();
@@ -8043,6 +8347,16 @@ pub fn create_backup_with_log(
                 }
             }
         };
+
+        // The stored entry records what was actually done.
+        let mut t_rec = t.clone();
+        if let Some((applied, reason)) = docker_mode {
+            t_rec.mounts_only = applied;
+            if !reason.is_empty() {
+                comments = format!("{} | {}", comments, reason);
+            }
+        }
+        let t = &t_rec;
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -9157,7 +9471,7 @@ fn execute_schedule_run(schedule: &BackupSchedule) -> (Vec<BackupEntry>, Schedul
         let mut storage = schedule.storage.clone();
         merge_pbs_secrets(&mut storage);
         let backups: Vec<BackupEntry> = if schedule.backup_all {
-            backup_all(&storage, schedule.stop_containers, schedule.keep_vms_running, &schedule.targets)
+            backup_all(&storage, schedule.stop_containers, schedule.keep_vms_running, schedule.docker_mounts_only, &schedule.targets)
         } else {
             schedule.targets.iter()
                 .map(|t| create_backup_entry(t.clone(), &storage))
@@ -11440,6 +11754,7 @@ mod schedule_hook_tests {
             day_of_month: None,
             stop_containers: false,
             keep_vms_running: false,
+            docker_mounts_only: false,
         }
     }
 
@@ -11749,6 +12064,7 @@ mod schedule_day_tests {
             day_of_month: None,
             stop_containers: false,
             keep_vms_running: false,
+            docker_mounts_only: false,
         }
     }
 
@@ -12167,3 +12483,185 @@ mod vzdump_output_tests {
         ]);
     }
 }
+
+#[cfg(test)]
+mod docker_mounts_only_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn inspect() -> serde_json::Value {
+        // Shape of a real `docker inspect` (Docker 29) for a compose service.
+        json!([{
+            "Image": "sha256:abc",
+            "Config": {
+                "Image": "postgres:16",
+                "Env": ["POSTGRES_PASSWORD=x", "PATH=/usr/bin"],
+                "Cmd": ["postgres", "-c", "max_connections=200"],
+                "Entrypoint": ["docker-entrypoint.sh", "--verbose"],
+                "User": "999:999",
+                "WorkingDir": "/srv",
+                "Hostname": "db",
+                "StopSignal": "SIGINT",
+                "Labels": {
+                    "com.docker.compose.project": "app",
+                    "com.docker.compose.service": "db",
+                    "wolfstack.origin-image": "stale:old"
+                }
+            },
+            "HostConfig": {
+                "Binds": ["/srv/conf:/etc/postgresql:ro"],
+                "PortBindings": {"5432/tcp": [{"HostIp": "", "HostPort": "5432"}]},
+                "RestartPolicy": {"Name": "always", "MaximumRetryCount": 0},
+                "NetworkMode": "app_default",
+                "CapAdd": ["SYS_NICE"],
+                "CapDrop": ["MKNOD"],
+                "Devices": [{"PathOnHost": "/dev/fuse", "PathInContainer": "/dev/fuse", "CgroupPermissions": "rwm"}],
+                "ExtraHosts": ["gw:10.0.0.1"],
+                "Tmpfs": {"/run": "size=64m"},
+                "Init": true
+            },
+            "Mounts": [
+                {"Type": "bind", "Source": "/srv/conf", "Destination": "/etc/postgresql", "RW": false},
+                {"Type": "volume", "Name": "app_pgdata", "Source": "/var/lib/docker/volumes/app_pgdata/_data", "Destination": "/var/lib/postgresql/data", "RW": true}
+            ],
+            "NetworkSettings": {"Networks": {"app_default": {}, "monitoring": {}, "bridge": {}}}
+        }])
+    }
+
+    fn pairs(args: &[String], flag: &str) -> Vec<String> {
+        args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect()
+    }
+
+    #[test]
+    fn run_plan_reproduces_cmd_and_full_entrypoint() {
+        let p = docker_run_plan_from_inspect(&inspect());
+        assert_eq!(pairs(&p.args, "--entrypoint"), vec!["docker-entrypoint.sh"]);
+        // Rest of the entrypoint, then Cmd — Docker's exec form.
+        assert_eq!(p.tail, vec!["--verbose", "postgres", "-c", "max_connections=200"]);
+    }
+
+    #[test]
+    fn run_plan_attaches_compose_volumes_and_keeps_binds_once() {
+        let p = docker_run_plan_from_inspect(&inspect());
+        let v = pairs(&p.args, "-v");
+        assert!(v.contains(&"/srv/conf:/etc/postgresql:ro".to_string()));
+        assert!(v.contains(&"app_pgdata:/var/lib/postgresql/data".to_string()), "named volume from .Mounts missing: {:?}", v);
+        assert_eq!(v.iter().filter(|x| x.ends_with(":/etc/postgresql:ro")).count(), 1, "bind emitted twice");
+        assert_eq!(pairs(&p.args, "--tmpfs"), vec!["/run:size=64m"]);
+    }
+
+    #[test]
+    fn run_plan_carries_security_devices_user_labels_networks() {
+        let p = docker_run_plan_from_inspect(&inspect());
+        assert_eq!(pairs(&p.args, "--user"), vec!["999:999"]);
+        assert_eq!(pairs(&p.args, "--cap-add"), vec!["SYS_NICE"]);
+        assert_eq!(pairs(&p.args, "--cap-drop"), vec!["MKNOD"]);
+        assert_eq!(pairs(&p.args, "--device"), vec!["/dev/fuse:/dev/fuse:rwm"]);
+        assert_eq!(pairs(&p.args, "--add-host"), vec!["gw:10.0.0.1"]);
+        assert_eq!(pairs(&p.args, "--stop-signal"), vec!["SIGINT"]);
+        assert!(p.args.contains(&"--init".to_string()));
+        let labels = pairs(&p.args, "--label");
+        assert!(labels.contains(&"com.docker.compose.project=app".to_string()));
+        assert!(!labels.iter().any(|l| l.starts_with("wolfstack.origin-image=")), "stale origin label copied");
+        assert_eq!(pairs(&p.args, "--network"), vec!["app_default"]);
+        assert_eq!(p.extra_networks, vec!["monitoring"]);
+        // Env from the image's PATH is not re-pinned; the app's is.
+        let env = pairs(&p.args, "-e");
+        assert!(env.contains(&"POSTGRES_PASSWORD=x".to_string()) && !env.iter().any(|e| e.starts_with("PATH=")));
+    }
+
+    #[test]
+    fn run_plan_without_entrypoint_puts_cmd_after_image() {
+        let mut i = inspect();
+        i[0]["Config"]["Entrypoint"] = serde_json::Value::Null;
+        let p = docker_run_plan_from_inspect(&i);
+        assert!(pairs(&p.args, "--entrypoint").is_empty());
+        assert_eq!(p.tail, vec!["postgres", "-c", "max_connections=200"]);
+    }
+
+    #[test]
+    fn repo_without_tag() {
+        assert_eq!(image_repo_without_tag("nginx:1.27"), "nginx");
+        assert_eq!(image_repo_without_tag("ghcr.io/org/app:v2"), "ghcr.io/org/app");
+        assert_eq!(image_repo_without_tag("registry:5000/app"), "registry:5000/app");
+        assert_eq!(image_repo_without_tag("registry:5000/app:1"), "registry:5000/app");
+        assert_eq!(image_repo_without_tag("redis@sha256:aa"), "redis");
+    }
+
+    #[test]
+    fn origin_of_a_restored_snapshot_comes_from_its_labels() {
+        let c = json!({
+            "Image": "sha256:local",
+            "Config": {
+                "Image": "wolfstack-backup/web",
+                "Labels": {"wolfstack.origin-image": "nginx:1.27", "wolfstack.origin-digest": "sha256:feed"}
+            }
+        });
+        let o = resolve_docker_image_origin(&c);
+        assert_eq!(o, DockerImageOrigin { image: "nginx:1.27".into(), pinned: "nginx@sha256:feed".into() });
+        // No labels → nothing pullable, so a mounts-only request falls back.
+        let bare = json!({"Image": "sha256:x", "Config": {"Image": "wolfstack-backup/web"}});
+        assert!(resolve_docker_image_origin(&bare).pinned.is_empty());
+    }
+
+    #[test]
+    fn mounts_only_flags_round_trip_and_default_off() {
+        let t: BackupTarget = serde_json::from_str(r#"{"type":"docker","name":"web"}"#).unwrap();
+        assert!(!t.mounts_only, "an existing config must keep full-image backups");
+        let mut t2 = t.clone();
+        t2.mounts_only = true;
+        let back: BackupTarget = serde_json::from_str(&serde_json::to_string(&t2).unwrap()).unwrap();
+        assert!(back.mounts_only);
+        let s: BackupSchedule = serde_json::from_str(r#"{"id":"a","name":"a","frequency":"daily","time":"02:00","retention":7,"backup_all":true,"storage":{"type":"local"},"enabled":true}"#).unwrap();
+        assert!(!s.docker_mounts_only);
+    }
+
+    #[test]
+    fn backup_all_mounts_only_by_schedule_or_override() {
+        let ov = vec![BackupTarget { target_type: BackupTargetType::Docker, name: "big".into(), mounts_only: true, ..Default::default() }];
+        assert!(docker_mounts_only_for(&ov, "big", false));
+        assert!(!docker_mounts_only_for(&ov, "other", false));
+        assert!(docker_mounts_only_for(&ov, "other", true));
+        assert!(!docker_mounts_only_for(&[], "x", false));
+    }
+
+    /// Real-Docker check of the run plan (needs a local docker + debian:trixie-slim;
+    /// `cargo test -- --ignored run_plan_round_trips_on_real_docker`).
+    #[test]
+    #[ignore]
+    fn run_plan_round_trips_on_real_docker() {
+        let d = |a: &[&str]| std::process::Command::new("docker").args(a).output().unwrap();
+        let (src, dst, net, vol) = ("wsbk-plan-src", "wsbk-plan-dst", "wsbk-plan-net", "wsbk-plan-vol");
+        for c in [src, dst] { let _ = d(&["rm", "-f", c]); }
+        let _ = d(&["network", "create", net]);
+        let _ = d(&["volume", "create", vol]);
+        let o = d(&["create", "--name", src, "--label", "app=demo", "--cap-add", "SYS_NICE",
+            "--user", "1000:1000", "--mount", &format!("type=volume,source={},target=/data", vol),
+            "--entrypoint", "sleep", "debian:trixie-slim", "3600"]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let _ = d(&["network", "connect", net, src]);
+        let insp: serde_json::Value = serde_json::from_slice(&d(&["inspect", src]).stdout).unwrap();
+        let plan = docker_run_plan_from_inspect(&insp);
+        let mut args: Vec<String> = vec!["create".into(), "--name".into(), dst.into()];
+        args.extend(plan.args.clone());
+        args.push("debian:trixie-slim".into());
+        args.extend(plan.tail.clone());
+        let o = std::process::Command::new("docker").args(&args).output().unwrap();
+        assert!(o.status.success(), "docker create from plan failed: {}", String::from_utf8_lossy(&o.stderr));
+        for n in &plan.extra_networks { let _ = d(&["network", "connect", n, dst]); }
+        let got: serde_json::Value = serde_json::from_slice(&d(&["inspect", dst]).stdout).unwrap();
+        let (a, b) = (&insp[0], &got[0]);
+        for ptr in ["/Config/Entrypoint", "/Config/Cmd", "/Config/User", "/Config/Labels/app", "/HostConfig/CapAdd"] {
+            assert_eq!(a.pointer(ptr), b.pointer(ptr), "{} differs", ptr);
+        }
+        let vols = |c: &serde_json::Value| c["Mounts"].as_array().unwrap().iter()
+            .map(|m| (m["Name"].as_str().unwrap_or("").to_string(), m["Destination"].as_str().unwrap_or("").to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(vols(a), vols(b), "mounts differ");
+        assert!(b["NetworkSettings"]["Networks"].get(net).is_some(), "extra network not attached");
+        for c in [src, dst] { let _ = d(&["rm", "-f", c]); }
+        let _ = d(&["network", "rm", net]);
+        let _ = d(&["volume", "rm", vol]);
+    }
+}
+

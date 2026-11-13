@@ -247,6 +247,8 @@ pub struct ReencryptReport {
     pub dns_providers: usize,
     pub cloud_providers: usize,
     pub xo_tokens: usize,
+    /// Stalwart mail cluster credentials (stalwart.json).
+    pub mail_secrets: usize,
     /// Human-readable per-store errors, e.g. "oidc: parse failed". Empty
     /// on a fully-clean pass. A non-empty list is NOT fatal: rotation
     /// already committed the new secret; the affected store's blobs are
@@ -264,6 +266,7 @@ impl ReencryptReport {
             dns_providers: 0,
             cloud_providers: 0,
             xo_tokens: 0,
+            mail_secrets: 0,
             errors: Vec::new(),
         }
     }
@@ -276,6 +279,7 @@ impl ReencryptReport {
             + self.dns_providers
             + self.cloud_providers
             + self.xo_tokens
+            + self.mail_secrets
     }
 }
 
@@ -342,14 +346,19 @@ pub fn reencrypt_all_at_rest(old: &str, new: &str) -> ReencryptReport {
             Err(e) => report.errors.push(format!("xo-tokens: {}", e)),
         }
     }
+    match crate::stalwart::reencrypt_at_rest(old, new) {
+        Ok(n) => report.mail_secrets = n,
+        Err(e) => report.errors.push(format!("stalwart-mail: {}", e)),
+    }
 
     if report.errors.is_empty() {
         tracing::info!(target: "secret_rotation",
             "at-rest re-encrypt complete: re-keyed {} SQL password(s), {} OIDC secret(s), \
              {} integration credential(s), {} DNS provider(s), {} cloud provider(s), \
-             {} XO token(s) — total {}",
+             {} XO token(s), {} mail cluster secret(s) — total {}",
             report.sql_passwords, report.oidc_secrets, report.integration_credentials,
-            report.dns_providers, report.cloud_providers, report.xo_tokens, report.total());
+            report.dns_providers, report.cloud_providers, report.xo_tokens,
+            report.mail_secrets, report.total());
     } else {
         // A partial failure is non-fatal but must be loud — the operator
         // may need to re-enter a credential for the failed store(s).
