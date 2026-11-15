@@ -1199,6 +1199,67 @@ fn install_onacc_launch_config(prof: &OnAccessProfile) -> Result<(String, bool),
     Ok((unit, changed))
 }
 
+/// The file a distro clamonacc unit's own `ExecStart` logs to, if it sets one.
+/// Source: Debian clamav-daemon 1.4.3+dfsg-1
+/// /usr/lib/systemd/system/clamav-clamonacc.service —
+/// `ExecStart=/usr/sbin/clamonacc -F --log=/var/log/clamav/clamonacc.log --move=/root/quarantine`.
+/// Flag spellings from `clamonacc --help`: `--log=FILE` / `-l FILE`
+/// (getopt also accepts `--log FILE` and `-lFILE`).
+fn unit_onacc_log_path(unit_text: &str) -> Option<String> {
+    for line in unit_text.lines() {
+        let Some(cmd) = line.trim().strip_prefix("ExecStart=") else { continue };
+        let mut tokens = cmd.split_whitespace().map(|t| t.trim_matches(|c| c == '"' || c == '\''));
+        while let Some(tok) = tokens.next() {
+            let path = if let Some(p) = tok.strip_prefix("--log=") {
+                Some(p.to_string())
+            } else if tok == "--log" || tok == "-l" {
+                tokens.next().map(str::to_string)
+            } else {
+                tok.strip_prefix("-l").filter(|_| !tok.starts_with("--")).map(str::to_string)
+            };
+            if let Some(p) = path.filter(|p| p.starts_with('/')) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Empty the log a distro clamonacc unit wrote before WolfStack took over its
+/// launch command. Hosts that enabled on-access scanning before v25.42.7 ran
+/// Debian's unit as shipped, which logs to /var/log/clamav/clamonacc.log —
+/// a file Debian's logrotate does not cover, and which grew by up to ~2 GB/day
+/// of fd-permission failures. Our drop-in drops `--log=`, so the file stops
+/// growing but keeps whatever it reached (1.1 GB on one production host).
+///
+/// Call only once clamonacc is running with WolfStack's command line, so no
+/// process still writes to the file. The generated-unit path never had a log
+/// file, so there is nothing to clear there. Truncated rather than deleted so
+/// a distro unit started later can still write to it. Returns the path and
+/// the bytes freed, or None when there was nothing to clear.
+fn clear_legacy_onacc_log(prof: &OnAccessProfile) -> Result<Option<(String, u64)>, String> {
+    let Some(svc) = prof.svc_onacc else { return Ok(None) };
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "FragmentPath", "--value", svc])
+        .output()
+        .map_err(|e| format!("systemctl show {}: {}", svc, e))?;
+    let fragment = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if fragment.is_empty() { return Ok(None); }
+    let unit_text = std::fs::read_to_string(&fragment)
+        .map_err(|e| format!("read {}: {}", fragment, e))?;
+    let Some(log) = unit_onacc_log_path(&unit_text) else { return Ok(None) };
+    // Regular files only: never follow a symlink the unit's log path may be.
+    let meta = match std::fs::symlink_metadata(&log) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat {}: {}", log, e)),
+    };
+    if !meta.file_type().is_file() || meta.len() == 0 { return Ok(None); }
+    std::fs::OpenOptions::new().write(true).truncate(true).open(&log)
+        .map_err(|e| format!("truncate {}: {}", log, e))?;
+    Ok(Some((log, meta.len())))
+}
+
 /// Undo `install_onacc_launch_config`: stop the service, then remove our
 /// generated unit or our drop-in (handing a distro unit back untouched).
 fn remove_onacc_launch_config(state: &AntivirusState, prof: &OnAccessProfile) {
@@ -1382,6 +1443,14 @@ pub fn apply_on_access(state: std::sync::Arc<AntivirusState>, target: bool) {
             finalize_install(&state, false, Some(err));
             return;
         }
+        match clear_legacy_onacc_log(&prof) {
+            Ok(Some((log, bytes))) => state.push_install_line(format!(
+                "==> Emptied {} ({} bytes) — written by the distro's clamonacc command line, which no longer runs",
+                log, bytes)),
+            Ok(None) => {}
+            Err(e) => state.push_install_line(format!(
+                "[on-access] WARN: could not empty the old clamonacc log: {}", e)),
+        }
 
         // 5. Start the findings tailer.
         start_on_access_tailer(state.clone(), prof.clamd_log.to_string());
@@ -1461,7 +1530,9 @@ pub fn resume_on_access_tailer_if_enabled(state: std::sync::Arc<AntivirusState>)
             return;
         }
 
-        match install_onacc_launch_config(&prof) {
+        // Only once clamonacc is confirmed running our command line may the
+        // distro's old log be emptied — otherwise something may still write it.
+        let running_ours = match install_onacc_launch_config(&prof) {
             Ok((unit, true)) => {
                 tracing::info!("antivirus: updated the {} launch command; restarting it", unit);
                 let restarted = Command::new("systemctl").args(["restart", &unit])
@@ -1469,9 +1540,21 @@ pub fn resume_on_access_tailer_if_enabled(state: std::sync::Arc<AntivirusState>)
                 if !restarted {
                     tracing::warn!("antivirus: `systemctl restart {}` failed — see `journalctl -u {}`", unit, unit);
                 }
+                restarted
             }
-            Ok((_, false)) => {}
-            Err(e) => tracing::warn!("antivirus: could not update the clamonacc launch command: {}", e),
+            Ok((_, false)) => true,
+            Err(e) => {
+                tracing::warn!("antivirus: could not update the clamonacc launch command: {}", e);
+                false
+            }
+        };
+        if running_ours {
+            match clear_legacy_onacc_log(&prof) {
+                Ok(Some((log, bytes))) => tracing::info!(
+                    "antivirus: emptied {} ({} bytes) left by the distro clamonacc command line", log, bytes),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("antivirus: could not empty the old clamonacc log: {}", e),
+            }
         }
 
         tracing::info!("antivirus: resuming on-access log tailer (log={})", prof.clamd_log);
@@ -3432,6 +3515,29 @@ mod tests {
         assert!(!tcp.contains("--fdpass"));
         // An unrotated --log file is how Debian's unit filled the disk.
         assert!(!cmd.contains("--log"));
+    }
+
+    #[test]
+    fn distro_unit_log_path_is_read_from_its_execstart() {
+        // Source: Debian clamav-daemon 1.4.3+dfsg-1 clamav-clamonacc.service, verbatim.
+        let debian = "[Service]\nType=simple\nUser=root\n\
+            ExecStartPre=/bin/bash -c \"while [ ! -S /run/clamav/clamd.ctl ]; do sleep 1; done\"\n\
+            ExecStart=/usr/sbin/clamonacc -F --log=/var/log/clamav/clamonacc.log --move=/root/quarantine\n\
+            ExecStop=/bin/kill -SIGKILL $MAINPID\n";
+        assert_eq!(unit_onacc_log_path(debian).as_deref(), Some("/var/log/clamav/clamonacc.log"));
+        // The other spellings clamonacc's getopt accepts.
+        assert_eq!(unit_onacc_log_path("ExecStart=/usr/sbin/clamonacc -F -l /var/log/a.log").as_deref(),
+                   Some("/var/log/a.log"));
+        assert_eq!(unit_onacc_log_path("ExecStart=/usr/sbin/clamonacc --log /var/log/b.log -F").as_deref(),
+                   Some("/var/log/b.log"));
+        assert_eq!(unit_onacc_log_path("ExecStart=/usr/sbin/clamonacc -l/var/log/c.log").as_deref(),
+                   Some("/var/log/c.log"));
+        // Our own command line, a cleared ExecStart= and ExecStartPre never yield a path.
+        let ours = onacc_exec_start(Path::new("/usr/sbin/clamonacc"), "/etc/clamav/clamd.conf", true);
+        assert_eq!(unit_onacc_log_path(&format!("ExecStart=\nExecStart={}", ours)), None);
+        assert_eq!(unit_onacc_log_path("ExecStartPre=/bin/x --log=/var/log/x.log"), None);
+        // A relative path is never acted on.
+        assert_eq!(unit_onacc_log_path("ExecStart=/usr/sbin/clamonacc --log=clamonacc.log"), None);
     }
 
     #[test]
