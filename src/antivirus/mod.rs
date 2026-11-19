@@ -130,6 +130,22 @@ fn is_skippable_fstype(t: &str) -> bool {
 /// — `/proc/mounts` uses `\nnn` octal for spaces / tabs / newlines and
 /// we restore those so the path matches what clamscan sees on disk.
 fn discover_skippable_mountpoints() -> Vec<String> {
+    mountpoints_where(is_skippable_fstype)
+}
+
+/// Network and FUSE filesystems — the subset of [`is_skippable_fstype`]
+/// that real-time scanning must never watch or walk (a dead mount hangs the
+/// walk; the files belong to another machine). Unlike the full skippable
+/// list this leaves tmpfs in, so `/dev/shm` can be watched.
+fn is_remote_or_fuse_fstype(t: &str) -> bool {
+    t.starts_with("fuse") || matches!(t,
+        "nfs" | "nfs4" | "cifs" | "smb" | "smbfs" |
+        "ceph" | "9p" | "gfs2" | "ocfs2" | "lustre" | "afs" | "coda")
+}
+
+/// Every mountpoint in `/proc/mounts` whose fs type matches `keep`,
+/// un-escaped, sorted, without `/`.
+fn mountpoints_where(keep: fn(&str) -> bool) -> Vec<String> {
     let text = match std::fs::read_to_string("/proc/mounts") {
         Ok(t) => t, Err(_) => return Vec::new(),
     };
@@ -139,7 +155,7 @@ fn discover_skippable_mountpoints() -> Vec<String> {
         if parts.len() < 3 { continue; }
         let mp = parts[1];
         let ty = parts[2];
-        if !is_skippable_fstype(ty) { continue; }
+        if !keep(ty) { continue; }
         let unescaped = unescape_mount_path(mp);
         // Never exclude "/" — that would silently skip the whole scan.
         // (Shouldn't happen in practice; tmpfs is sometimes mounted at
@@ -983,11 +999,92 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
 // On-access (real-time) scanning — clamonacc + clamd
 // ══════════════════════════════════════════════════════════
 
-/// Build the managed clamd.conf block. Lists every excludable path
-/// we know about (static defaults + non-local mounts discovered at
-/// apply time) so fanotify doesn't loop on /proc, /sys, or eat S3FS
-/// shares.
-fn build_on_access_clamd_block() -> String {
+/// Directories clamonacc watches in real time: where an intruder drops or
+/// persists a file on the host — home directories, web roots, add-on
+/// software, the world-writable scratch dirs, and the cron / systemd /
+/// login-script persistence points. Everything else (container rootfs under
+/// /var/lib/lxc, Docker, database data, VM images) is left to the scheduled
+/// scans.
+///
+/// Why not the whole filesystem (`OnAccessMountPath /`, which WolfStack used
+/// before v25.45.0)? Three facts from ClamAV 1.4.3's own source:
+///
+/// - Source: clamonacc/fanotif/fanotif.c:92 — clamonacc subscribes to
+///   `FAN_ACCESS | FAN_OPEN`, i.e. an event for every read(), not just every
+///   open. A mount mark on `/` of a container host means every database and
+///   log read in every container on that filesystem.
+/// - Source: clamonacc/clamonacc.c:349 — `fanotify_init(... FAN_UNLIMITED_QUEUE
+///   ...)`: the kernel queue is unbounded, and every queued event holds an open
+///   reference to its file. When clamd can't keep up, deleted files can't be
+///   freed. On wolfstack-2 (2026-11-19) that pinned ~285 GB of deleted files,
+///   invisible to lsof, and filled the root filesystem.
+/// - Source: etc/clamd.conf.sample:756-759 — OnAccessMountPath "will preempt
+///   (disable and ignore all options related to) the DDD system", and
+///   OnAccessExcludePath is only read by DDD (clamonacc/inotif/inotif.c:532).
+///   So in mount mode every exclusion below was silently ignored.
+///
+/// `/tmp` is deliberately absent: clamonacc refuses to watch clamd's temp
+/// directory, which defaults to /tmp (Source: clamonacc/inotif/inotif.c:469).
+const ON_ACCESS_WATCH_DIRS: &[&str] = &[
+    "/root", "/home", "/srv", "/var/www", "/opt", "/usr/local",
+    "/var/tmp", "/dev/shm",
+    "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
+    "/etc/cron.weekly", "/etc/cron.monthly", "/var/spool/cron",
+    "/etc/systemd/system", "/etc/profile.d",
+];
+
+/// Paths never scanned on access, even when they sit inside a watched dir.
+const ON_ACCESS_STATIC_EXCLUDES: &[&str] = &[
+    "/proc", "/sys", "/dev", "/run",
+    QUARANTINE_ROOT,
+    "/var/lib/wolfstack",
+    "/var/lib/vz/images",
+    "/var/lib/libvirt/images",
+    "/var/log/clamav",
+];
+
+/// True when `child` is strictly below `parent` (not equal to it).
+fn path_is_strictly_inside(child: &str, parent: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
+    child.len() > parent.len() + 1
+        && child.starts_with(parent)
+        && child.as_bytes()[parent.len()] == b'/'
+}
+
+/// Reduce candidate watch dirs to what clamonacc can use: canonical, existing
+/// directories, no duplicates, none nested inside another, none on (or under)
+/// a network / FUSE mount in `remote_mounts`. A path that does not exist must
+/// never reach the config — clamonacc's DDD thread gives up on the first
+/// include it can't add and then watches nothing
+/// (Source: clamonacc/inotif/inotif.c:478-480).
+fn usable_watch_dirs(candidates: &[&str], remote_mounts: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for c in candidates {
+        let Ok(canon) = std::fs::canonicalize(c) else { continue };
+        if !canon.is_dir() { continue; }
+        let s = canon.to_string_lossy().to_string();
+        if s == "/" || dirs.contains(&s) { continue; }
+        if remote_mounts.iter().any(|m| *m == s || path_is_strictly_inside(&s, m)) { continue; }
+        dirs.push(s);
+    }
+    let all = dirs.clone();
+    dirs.retain(|d| !all.iter().any(|other| path_is_strictly_inside(d, other)));
+    dirs.sort();
+    dirs
+}
+
+fn on_access_watch_dirs() -> Vec<String> {
+    usable_watch_dirs(ON_ACCESS_WATCH_DIRS, &mountpoints_where(is_remote_or_fuse_fstype))
+}
+
+/// Render the managed clamd.conf block for the given watch dirs and exclude
+/// candidates. Pure, so the shape is unit-tested.
+///
+/// Only excludes strictly inside a watched dir are written: an exclude equal
+/// to (or above) a watch dir would remove that whole watch — DDD applies
+/// OnAccessExcludePath after the includes (Source: clamonacc/inotif/
+/// inotif.c:531-544) — and one outside every watch dir is meaningless.
+fn render_on_access_block(watch_dirs: &[String], exclude_candidates: &[String]) -> String {
     let mut out = String::new();
     out.push_str(ON_ACCESS_BLOCK_BEGIN);
     out.push('\n');
@@ -995,44 +1092,120 @@ fn build_on_access_clamd_block() -> String {
     // No `ScanOnAccess yes`: clamd dropped that directive when on-access
     // moved into the separate clamonacc client, and every clamd/clamonacc
     // start now logs "Ignoring deprecated option ScanOnAccess" for it.
-    out.push_str("OnAccessMountPath /\n");
-    // Default exclusions matching the scheduled-scan filter.
-    let static_excludes = [
-        "/proc", "/sys", "/dev", "/run",
-        "/var/quarantine/wolfstack",
-        "/var/lib/wolfstack",
-        "/var/lib/vz/images",
-        "/var/lib/libvirt/images",
-        "/var/log/clamav",
-    ];
-    for p in &static_excludes {
-        out.push_str(&format!("OnAccessExcludePath {}\n", p));
+    // No `OnAccessMountPath` either — see ON_ACCESS_WATCH_DIRS.
+    for d in watch_dirs {
+        out.push_str(&format!("OnAccessIncludePath {}\n", d));
     }
-    // Discovered non-local mounts (NFS, S3FS, sshfs, overlay, tmpfs, etc.).
-    for mp in discover_skippable_mountpoints() {
-        if mp == "/" { continue; }
-        out.push_str(&format!("OnAccessExcludePath {}\n", mp));
+    let mut excludes: Vec<&String> = exclude_candidates.iter()
+        .filter(|e| watch_dirs.iter().any(|w| path_is_strictly_inside(e, w)))
+        .collect();
+    excludes.sort();
+    excludes.dedup();
+    for e in excludes {
+        out.push_str(&format!("OnAccessExcludePath {}\n", e));
     }
     // Don't trigger on our own scanner reading files (prevents the
     // file-A-was-just-scanned-which-reads-file-B feedback loop).
     out.push_str("OnAccessExcludeUname clamav\n");
     // Conservative: alert + (clamonacc --move) quarantine, no read-block.
     out.push_str("OnAccessPrevention no\n");
+    // DDD (dynamic directory determination) is what makes the include
+    // paths recursive and is the only mode that honours the excludes.
     out.push_str("OnAccessDisableDDD no\n");
-    // Scan directory metadata changes too — catches malware moving
-    // files into a watched dir.
+    // Scan files created in / moved into a watched dir — needs DDD.
     out.push_str("OnAccessExtraScanning yes\n");
     out.push_str(ON_ACCESS_BLOCK_END);
     out.push('\n');
     out
 }
 
+/// The managed block for this host, right now.
+fn build_on_access_clamd_block(watch_dirs: &[String]) -> String {
+    let mut excludes: Vec<String> = ON_ACCESS_STATIC_EXCLUDES.iter().map(|s| s.to_string()).collect();
+    // Discovered non-local mounts (NFS, S3FS, sshfs, overlay, tmpfs, etc.)
+    // that happen to live under a watched dir, e.g. an rclone mount in /srv.
+    excludes.extend(discover_skippable_mountpoints());
+    render_on_access_block(watch_dirs, &excludes)
+}
+
+// ─── inotify budget for DDD ───────────────────────────────────
+
+const INOTIFY_MAX_WATCHES_PATH: &str = "/proc/sys/fs/inotify/max_user_watches";
+/// Persists the raised limit across reboots. `99-` so it sorts after the
+/// distro's own sysctl.d files (later files win).
+const INOTIFY_SYSCTL_DROPIN: &str = "/etc/sysctl.d/99-wolfstack-onaccess.conf";
+/// Watches left for everything else running as root on the host — the limit
+/// is per-user, and privileged containers' systemd/journald are host root too.
+const INOTIFY_HEADROOM: u64 = 65_536;
+/// ClamAV's own recommended value (Source: clamonacc/inotif/inotif.c:602).
+const INOTIFY_FLOOR: u64 = 524_288;
+/// Refuse rather than ask the kernel for millions of watches.
+const ON_ACCESS_MAX_WATCHED_DIRS: u64 = 1_000_000;
+
+/// Count directories under `roots` without following symlinks or descending
+/// into `skip` (non-local mounts — walking a dead NFS/FUSE mount hangs).
+/// Stops early once `cap` is exceeded.
+fn count_dirs_under(roots: &[String], skip: &[String], cap: u64) -> u64 {
+    let mut count: u64 = 0;
+    let mut stack: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+    while let Some(dir) = stack.pop() {
+        count += 1;
+        if count > cap { return count; }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            // file_type() does not follow symlinks.
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            let p = entry.path();
+            if skip.iter().any(|s| Path::new(s) == p) { continue; }
+            stack.push(p);
+        }
+    }
+    count
+}
+
+fn required_inotify_watches(dirs: u64) -> u64 {
+    (dirs + INOTIFY_HEADROOM).max(INOTIFY_FLOOR)
+}
+
+/// DDD puts one inotify watch on every directory it follows, and clamonacc
+/// SIGTERMs itself on ENOSPC (Source: clamonacc/inotif/inotif.c:599-604). Make
+/// sure the budget covers the watch dirs before switching the config, raising
+/// `fs.inotify.max_user_watches` (live and persisted) when it doesn't. Never
+/// lowers it. Returns a line for the install log.
+fn ensure_inotify_watch_budget(watch_dirs: &[String]) -> Result<String, String> {
+    let dirs = count_dirs_under(watch_dirs, &discover_skippable_mountpoints(),
+        ON_ACCESS_MAX_WATCHED_DIRS);
+    if dirs > ON_ACCESS_MAX_WATCHED_DIRS {
+        return Err(format!(
+            "the watched directories hold more than {} sub-directories — real-time \
+             scanning would need that many inotify watches. Scheduled scans still \
+             cover this host.", ON_ACCESS_MAX_WATCHED_DIRS));
+    }
+    let required = required_inotify_watches(dirs);
+    let current: u64 = std::fs::read_to_string(INOTIFY_MAX_WATCHES_PATH)
+        .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    if current >= required {
+        return Ok(format!(
+            "==> inotify: {} director(ies) to watch, limit {} is enough", dirs, current));
+    }
+    write_if_changed(Path::new(INOTIFY_SYSCTL_DROPIN), &format!(
+        "# Managed by WolfStack: real-time virus scanning puts one inotify watch\n\
+         # on every watched directory.\nfs.inotify.max_user_watches = {}\n", required))
+        .map_err(|e| format!("write {}: {}", INOTIFY_SYSCTL_DROPIN, e))?;
+    // The drop-in only applies at boot; set the live value too.
+    std::fs::write(INOTIFY_MAX_WATCHES_PATH, required.to_string())
+        .map_err(|e| format!("set {}: {}", INOTIFY_MAX_WATCHES_PATH, e))?;
+    Ok(format!(
+        "==> inotify: {} director(ies) to watch — raised fs.inotify.max_user_watches {} → {} \
+         (persisted in {})", dirs, current, required, INOTIFY_SYSCTL_DROPIN))
+}
+
 /// Inject or update the managed block in clamd.conf. Idempotent — if
 /// the markers are already present, the block between them is
 /// replaced. Existing settings outside the markers are untouched.
-fn install_clamd_conf_block(conf_path: &str) -> std::io::Result<()> {
+/// Returns whether the file changed.
+fn install_clamd_conf_block(conf_path: &str, block: &str) -> std::io::Result<bool> {
     let existing = std::fs::read_to_string(conf_path).unwrap_or_default();
-    let block = build_on_access_clamd_block();
     let updated = if existing.contains(ON_ACCESS_BLOCK_BEGIN)
         && existing.contains(ON_ACCESS_BLOCK_END)
     {
@@ -1048,13 +1221,10 @@ fn install_clamd_conf_block(conf_path: &str) -> std::io::Result<()> {
         let mut s = existing;
         if !s.ends_with('\n') { s.push('\n'); }
         s.push('\n');
-        s.push_str(&block);
+        s.push_str(block);
         s
     };
-    if let Some(parent) = Path::new(conf_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(conf_path, updated)
+    write_if_changed(Path::new(conf_path), &updated)
 }
 
 /// Remove the managed block but leave any other lines alone.
@@ -1391,17 +1561,34 @@ pub fn apply_on_access(state: std::sync::Arc<AntivirusState>, target: bool) {
             }
         }
 
-        // 2. Write managed clamd.conf block.
+        // 2. Work out what to watch, make sure the kernel can follow it,
+        //    then write the managed clamd.conf block.
+        let watch_dirs = on_access_watch_dirs();
+        if watch_dirs.is_empty() {
+            let err = "none of the directories real-time scanning watches exist on this host".to_string();
+            state.push_install_line(format!("==> ERROR: {}", err));
+            finalize_install(&state, false, Some(err));
+            return;
+        }
+        state.push_install_line(format!("==> Watching: {}", watch_dirs.join(", ")));
+        match ensure_inotify_watch_budget(&watch_dirs) {
+            Ok(line) => state.push_install_line(line),
+            Err(err) => {
+                state.push_install_line(format!("==> ERROR: {}", err));
+                finalize_install(&state, false, Some(err));
+                return;
+            }
+        }
         state.push_install_line(format!("==> Injecting managed block into {}", prof.clamd_conf));
-        if let Err(e) = install_clamd_conf_block(prof.clamd_conf) {
+        if let Err(e) = install_clamd_conf_block(prof.clamd_conf, &build_on_access_clamd_block(&watch_dirs)) {
             let err = format!("write {}: {}", prof.clamd_conf, e);
             state.push_install_line(format!("==> ERROR: {}", err));
             finalize_install(&state, false, Some(err));
             return;
         }
-        state.push_install_line(format!(
-            "==> clamd.conf updated. Managed block lists {} non-local mount(s) to exclude.",
-            discover_skippable_mountpoints().len()));
+        state.push_install_line(
+            "==> clamd.conf updated. Container storage, Docker, databases and VM images are \
+             covered by the scheduled scans, not in real time.".into());
 
         // 3. Restart clamd to pick up the new config. enable --now is
         //    idempotent; restart is required because the unit may
@@ -1530,11 +1717,18 @@ pub fn resume_on_access_tailer_if_enabled(state: std::sync::Arc<AntivirusState>)
             return;
         }
 
+        // Bring the managed clamd.conf block up to date. This is what moves a
+        // host enabled by an older WolfStack off `OnAccessMountPath /` (see
+        // ON_ACCESS_WATCH_DIRS) without the operator re-enabling anything.
+        let block_changed = refresh_managed_clamd_block(&prof);
+
         // Only once clamonacc is confirmed running our command line may the
         // distro's old log be emptied — otherwise something may still write it.
         let running_ours = match install_onacc_launch_config(&prof) {
-            Ok((unit, true)) => {
-                tracing::info!("antivirus: updated the {} launch command; restarting it", unit);
+            Ok((unit, launch_changed)) if launch_changed || block_changed => {
+                tracing::info!(
+                    "antivirus: on-access config changed (launch command: {}, clamd.conf block: {}); restarting {}",
+                    launch_changed, block_changed, unit);
                 let restarted = Command::new("systemctl").args(["restart", &unit])
                     .status().map(|s| s.success()).unwrap_or(false);
                 if !restarted {
@@ -1542,7 +1736,7 @@ pub fn resume_on_access_tailer_if_enabled(state: std::sync::Arc<AntivirusState>)
                 }
                 restarted
             }
-            Ok((_, false)) => true,
+            Ok(_) => true,
             Err(e) => {
                 tracing::warn!("antivirus: could not update the clamonacc launch command: {}", e);
                 false
@@ -1560,6 +1754,127 @@ pub fn resume_on_access_tailer_if_enabled(state: std::sync::Arc<AntivirusState>)
         tracing::info!("antivirus: resuming on-access log tailer (log={})", prof.clamd_log);
         start_on_access_tailer(state, prof.clamd_log.to_string());
     });
+}
+
+/// Rewrite WolfStack's clamd.conf block for this host's current watch dirs
+/// and mounts. Leaves a clamd.conf without our markers alone — that host's
+/// on-access setup is the admin's own. Returns whether the file changed (the
+/// caller restarts clamonacc, which reads its options from clamd.conf).
+fn refresh_managed_clamd_block(prof: &OnAccessProfile) -> bool {
+    if !clamd_conf_has_managed_block(prof.clamd_conf) { return false; }
+    let watch_dirs = on_access_watch_dirs();
+    if watch_dirs.is_empty() {
+        tracing::warn!("antivirus: none of the on-access watch dirs exist; clamd.conf block left as is");
+        return false;
+    }
+    // Check the budget BEFORE switching: DDD on too few inotify watches
+    // makes clamonacc kill itself.
+    match ensure_inotify_watch_budget(&watch_dirs) {
+        Ok(line) => tracing::info!("antivirus: {}", line.trim_start_matches("==> ")),
+        Err(e) => {
+            tracing::warn!("antivirus: on-access clamd.conf block not updated: {}", e);
+            return false;
+        }
+    }
+    match install_clamd_conf_block(prof.clamd_conf, &build_on_access_clamd_block(&watch_dirs)) {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::warn!("antivirus: could not update {}: {}", prof.clamd_conf, e);
+            false
+        }
+    }
+}
+
+// ─── clamonacc stall watchdog ─────────────────────────────────
+
+/// How far back each health check looks in clamonacc's journal.
+const ONACC_HEALTH_WINDOW: &str = "-10min";
+/// clamd connection failures in one window that mean clamonacc is falling
+/// behind. Each failure is an event clamd turned away; while that goes on,
+/// events pile up in clamonacc's unbounded fanotify queue, each pinning its
+/// file. wolfstack-2 logged 789 in the 12 hours before its root filesystem
+/// filled (2026-11-19). 20 in 10 minutes is sustained refusal, not a blip.
+const ONACC_STALL_THRESHOLD: usize = 20;
+/// At most one automatic restart per hour, so a clamd that is down for good
+/// shows up as a finding rather than a restart loop.
+const ONACC_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+
+static LAST_ONACC_RESTART: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Count clamonacc's "could not reach clamd" lines.
+/// Source: clamonacc/client/client.c:556 —
+/// `logg(LOGG_ERROR, "ClamClient: Connection to clamd failed, %s.\n", ...)`.
+fn count_clamd_connect_failures(journal: &str) -> usize {
+    journal.lines().filter(|l| l.contains("ClamClient: Connection to clamd failed")).count()
+}
+
+/// Periodic health check, run from the main antivirus loop on a blocking
+/// thread. If clamonacc is falling behind clamd, restart it: closing its
+/// fanotify group drops the queued events and releases every file they pin
+/// (restarting it on wolfstack-2 freed 285 GB in seconds). Records a warning
+/// finding each time so the operator can see it happened and why.
+pub fn check_on_access_health(state: std::sync::Arc<AntivirusState>) {
+    if !state.config.read().map(|g| g.enable_on_access).unwrap_or(false) { return; }
+    let (distro, id_like) = parse_os_release();
+    let family = distro_family_with_idlike(&distro, &id_like);
+    let Some(prof) = resolve_on_access_profile(family) else { return };
+    let unit = prof.svc_onacc.unwrap_or(MANAGED_ONACC_UNIT);
+    if !systemd_is_active(unit) { return; }
+
+    let out = match Command::new("journalctl")
+        .args(["-u", unit, "--since", ONACC_HEALTH_WINDOW, "-o", "cat", "--no-pager"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("antivirus: on-access health check could not run journalctl: {}", e);
+            return;
+        }
+    };
+    let failures = count_clamd_connect_failures(&String::from_utf8_lossy(&out.stdout));
+    if failures < ONACC_STALL_THRESHOLD { return; }
+
+    {
+        let mut last = LAST_ONACC_RESTART.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|t| t.elapsed() < ONACC_RESTART_COOLDOWN) { return; }
+        *last = Some(std::time::Instant::now());
+    }
+    let restarted = Command::new("systemctl").args(["restart", unit])
+        .status().map(|s| s.success()).unwrap_or(false);
+    tracing::warn!(
+        "antivirus: clamonacc could not reach clamd {} times in the last 10 minutes — restart {}",
+        failures, if restarted { "done" } else { "FAILED" });
+    let detail = format!(
+        "clamonacc could not reach clamd {} times in the last 10 minutes, so it was falling \
+         behind. Files waiting in its queue are held open by the kernel, and deleted files \
+         can't be freed until it catches up — left alone this can fill the disk. {} \
+         If this keeps happening, clamd is overloaded: check `journalctl -u {}` and \
+         clamd's MaxThreads / MaxQueue.",
+        failures,
+        if restarted {
+            format!("WolfStack restarted {} to release them.", unit)
+        } else {
+            format!("WolfStack tried to restart {} and the restart FAILED.", unit)
+        },
+        unit);
+    append_findings(&state, vec![Finding {
+        id: new_id(),
+        scanner: "onaccess-health".into(),
+        severity: "warning".into(),
+        title: if restarted {
+            "Real-time scanning fell behind — scanner restarted".into()
+        } else {
+            "Real-time scanning fell behind — restart failed".into()
+        },
+        detail,
+        path: None,
+        threat_name: None,
+        detected_at: now_rfc3339(),
+        action_taken: "alert_only".into(),
+        quarantine_id: None,
+        killed_pids: Vec::new(),
+    }]);
 }
 
 /// Spawn the on-access log tailer thread. Replaces any existing
@@ -2187,7 +2502,8 @@ fn shell_split(s: &str) -> Option<Vec<String>> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub id: String,
-    /// "clamav" | "rkhunter" | "chkrootkit"
+    /// "clamav" | "rkhunter" | "chkrootkit" | "clamonacc" (on-access hit) |
+    /// "onaccess-health" (real-time scanner fell behind and was restarted)
     pub scanner: String,
     /// "critical" | "warning" | "info"
     pub severity: String,
@@ -3502,6 +3818,128 @@ fn chmod_path(path: &Path, mode: u32) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn s(v: &[&str]) -> Vec<String> { v.iter().map(|x| x.to_string()).collect() }
+
+    /// A unique scratch dir under the system temp dir, removed on drop.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "wolfstack-av-{}-{}-{}", tag, std::process::id(), new_id()));
+            std::fs::create_dir_all(&p).unwrap();
+            Scratch(std::fs::canonicalize(&p).unwrap())
+        }
+        fn sub(&self, rel: &str) -> String {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            p.to_string_lossy().to_string()
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn on_access_block_watches_dirs_not_the_whole_mount() {
+        // The regression this guards: `OnAccessMountPath /` subscribes to every
+        // read on the root filesystem through an unbounded fanotify queue, and
+        // disables DDD so none of the excludes apply (wolfstack-2, 2026-11-19).
+        let block = render_on_access_block(&s(&["/home", "/srv"]), &[]);
+        assert!(!block.contains("OnAccessMountPath"), "{}", block);
+        assert!(block.contains("OnAccessIncludePath /home\n"));
+        assert!(block.contains("OnAccessIncludePath /srv\n"));
+        assert!(block.contains("OnAccessDisableDDD no\n"));
+        assert!(block.contains("OnAccessPrevention no\n"));
+        assert!(!block.contains("ScanOnAccess"));
+        assert!(block.starts_with(ON_ACCESS_BLOCK_BEGIN));
+        assert!(block.trim_end().ends_with(ON_ACCESS_BLOCK_END));
+    }
+
+    #[test]
+    fn on_access_block_keeps_only_excludes_inside_a_watch_dir() {
+        let block = render_on_access_block(
+            &s(&["/srv", "/dev/shm"]),
+            &s(&["/srv/s3", "/dev", "/dev/shm", "/var/lib/wolfstack", "/srv", "/srv/s3"]),
+        );
+        // Inside a watch dir: kept, once.
+        assert_eq!(block.matches("OnAccessExcludePath /srv/s3\n").count(), 1);
+        // Equal to or above a watch dir would delete the watch: dropped.
+        assert!(!block.contains("OnAccessExcludePath /dev\n"));
+        assert!(!block.contains("OnAccessExcludePath /dev/shm\n"));
+        assert!(!block.contains("OnAccessExcludePath /srv\n"));
+        // Outside every watch dir is meaningless: dropped.
+        assert!(!block.contains("/var/lib/wolfstack"));
+    }
+
+    #[test]
+    fn strictly_inside_is_component_aware() {
+        assert!(path_is_strictly_inside("/srv/a", "/srv"));
+        assert!(path_is_strictly_inside("/srv/a/b", "/srv/"));
+        assert!(!path_is_strictly_inside("/srv", "/srv"));
+        assert!(!path_is_strictly_inside("/srvx", "/srv"));
+        assert!(!path_is_strictly_inside("/sr", "/srv"));
+    }
+
+    #[test]
+    fn watch_dirs_drop_missing_nested_and_duplicate_paths() {
+        let t = Scratch::new("watch");
+        let a = t.sub("a");
+        let nested = t.sub("a/inner");
+        let b = t.sub("b");
+        let link = t.0.join("link-to-b");
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        let missing = t.0.join("missing").to_string_lossy().to_string();
+        let link_s = link.to_string_lossy().to_string();
+        let got = usable_watch_dirs(&[&a, &nested, &b, &link_s, &missing], &[]);
+        // nested folds into a; the symlink resolves to b and dedups; missing goes.
+        assert_eq!(got, vec![a.clone(), b.clone()]);
+        // A dir that is, or sits under, a network/FUSE mount is never watched.
+        let nfs = t.sub("nfs");
+        let under_nfs = t.sub("nfs/home");
+        let got = usable_watch_dirs(&[&a, &under_nfs, &nfs], std::slice::from_ref(&nfs));
+        assert_eq!(got, vec![a]);
+    }
+
+    #[test]
+    fn remote_fstypes_exclude_tmpfs_so_dev_shm_stays_watchable() {
+        assert!(is_remote_or_fuse_fstype("nfs4"));
+        assert!(is_remote_or_fuse_fstype("fuse.rclone"));
+        assert!(is_remote_or_fuse_fstype("fuse.glusterfs"));
+        assert!(!is_remote_or_fuse_fstype("tmpfs"));
+        assert!(!is_remote_or_fuse_fstype("ext4"));
+        assert!(!is_remote_or_fuse_fstype("xfs"));
+    }
+
+    #[test]
+    fn dir_count_skips_mounts_and_stops_at_cap() {
+        let t = Scratch::new("count");
+        let root = t.sub("r");
+        t.sub("r/x/y");
+        let skip = t.sub("r/mnt");
+        t.sub("r/mnt/deep/deeper");
+        // r, x, y — mnt and everything under it skipped.
+        assert_eq!(count_dirs_under(std::slice::from_ref(&root), std::slice::from_ref(&skip), 100), 3);
+        // Cap: stops as soon as it is exceeded.
+        assert_eq!(count_dirs_under(std::slice::from_ref(&root), &[], 1), 2);
+    }
+
+    #[test]
+    fn inotify_budget_has_floor_and_headroom() {
+        assert_eq!(required_inotify_watches(0), INOTIFY_FLOOR);
+        assert_eq!(required_inotify_watches(600_000), 600_000 + INOTIFY_HEADROOM);
+    }
+
+    #[test]
+    fn counts_clamd_connection_failures_from_the_journal() {
+        // Verbatim lines from wolfstack-2's clamonacc journal, 2026-11-19.
+        let j = "ERROR: ClamClient: Connection to clamd failed, Could not connect to server.\n\
+                 ClamClient: Connection to clamd re-established.\n\
+                 ClamMisc: Unexpected issue; Daemon failed to scan: /usr/share/zoneinfo/Etc/GMT-4\n\
+                 ERROR: ClamClient: Connection to clamd failed, Could not connect to server.\n";
+        assert_eq!(count_clamd_connect_failures(j), 2);
+        assert_eq!(count_clamd_connect_failures(""), 0);
+    }
+
     #[test]
     fn onacc_passes_descriptors_over_a_local_socket() {
         // The regression this guards: clamonacc (root) handing clamd (user
@@ -3562,7 +4000,8 @@ mod tests {
 
     #[test]
     fn on_access_block_omits_deprecated_directive() {
-        assert!(!build_on_access_clamd_block().contains("ScanOnAccess"));
+        let block = render_on_access_block(&["/home".to_string()], &[]);
+        assert!(!block.contains("ScanOnAccess"));
     }
 
     #[test]
@@ -3740,16 +4179,18 @@ mod tests {
         // Start with a user's existing config.
         let initial = "# User settings\nLogVerbose yes\nUser clamav\n";
         std::fs::write(&path, initial).unwrap();
+        let block = render_on_access_block(&["/srv".to_string()], &["/srv/s3".to_string()]);
         // First injection appends the block.
-        install_clamd_conf_block(&path).unwrap();
+        assert!(install_clamd_conf_block(&path, &block).unwrap(), "first injection writes");
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.starts_with("# User settings"), "user content must be preserved at the top");
         assert!(after.contains(ON_ACCESS_BLOCK_BEGIN));
         assert!(after.contains(ON_ACCESS_BLOCK_END));
-        assert!(after.contains("OnAccessMountPath /"));
-        assert!(after.contains("OnAccessExcludePath /proc"));
-        // Re-injection must replace the block in place (no duplicate markers).
-        install_clamd_conf_block(&path).unwrap();
+        assert!(after.contains("OnAccessIncludePath /srv\n"));
+        assert!(after.contains("OnAccessExcludePath /srv/s3\n"));
+        assert!(!after.contains("OnAccessMountPath"));
+        // Re-injection of the same block replaces it in place and reports no change.
+        assert!(!install_clamd_conf_block(&path, &block).unwrap(), "identical block is not rewritten");
         let after2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after2.matches(ON_ACCESS_BLOCK_BEGIN).count(), 1, "begin marker must appear exactly once");
         assert_eq!(after2.matches(ON_ACCESS_BLOCK_END).count(), 1, "end marker must appear exactly once");

@@ -1336,7 +1336,7 @@
                             <button class="btn btn-sm" onclick="fleetAntivirusOnAccess(false)" style="font-size:11px;">Disable on every node</button>
                         </div>
                         <div style="margin-top:6px; font-size:11px; color:var(--text-muted);">
-                            Runs nodes one at a time in the install terminal so you can watch each one. Installs <code>clamav-daemon</code>/<code>clamd</code>, injects the managed <code>clamd.conf</code> block (excludes /proc, /sys, /dev, network/FUSE/overlay mounts), starts <code>clamd</code> + <code>clamonacc --move=/var/quarantine/wolfstack</code>, and starts tailing the clamd log for FOUND events that show up in the per-node finding list. <strong style="color:#fbbf24;">Performance impact:</strong> every file open is scanned. Don't enable on database/log-heavy hosts without checking.
+                            Runs nodes one at a time in the install terminal so you can watch each one. Installs <code>clamav-daemon</code>/<code>clamd</code>, injects the managed <code>clamd.conf</code> block, starts <code>clamd</code> + <code>clamonacc --move=/var/quarantine/wolfstack</code>, and starts tailing the clamd log for FOUND events that show up in the per-node finding list. Watches the places intruders drop or persist files (<code>/root</code>, <code>/home</code>, <code>/srv</code>, <code>/var/www</code>, <code>/opt</code>, <code>/usr/local</code>, <code>/var/tmp</code>, <code>/dev/shm</code>, cron / systemd / profile.d); container storage, databases and VM images are left to the scheduled scans. If a node's scanner falls behind clamd, WolfStack restarts it and records a finding.
                         </div>
                     </div>
 
@@ -1646,7 +1646,7 @@
                             <button class="btn btn-sm" onclick="nodeAntivirusOnAccess(false)" id="node-av-onacc-off" style="font-size:11px;">Disable</button>
                         </div>
                         <div style="margin-top:6px; font-size:11px; color:var(--text-muted);">
-                            Scans every file on open via the Linux fanotify API. Matches are auto-moved to <code>/var/quarantine/wolfstack/</code> by clamonacc (alert + quarantine mode — process reads are NOT blocked). Adds latency to file opens and requires the <code>clamav-daemon</code>/<code>clamd</code> package; the toggle handles install + config + service start. Click Enable to watch the install terminal stream the work.
+                            Scans files as they are opened in the places intruders drop or persist files (<code>/root</code>, <code>/home</code>, <code>/srv</code>, <code>/var/www</code>, <code>/opt</code>, <code>/usr/local</code>, <code>/var/tmp</code>, <code>/dev/shm</code>, cron / systemd / profile.d) via the Linux fanotify API; container storage, databases and VM images are left to the scheduled scans. Matches are auto-moved to <code>/var/quarantine/wolfstack/</code> by clamonacc (alert + quarantine mode — process reads are NOT blocked). If the scanner falls behind clamd, WolfStack restarts it and records a finding. Requires the <code>clamav-daemon</code>/<code>clamd</code> package; the toggle handles install + config + service start. Click Enable to watch the install terminal stream the work.
                         </div>
                     </div>
 
