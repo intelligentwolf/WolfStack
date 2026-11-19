@@ -2195,6 +2195,12 @@ async fn main() -> std::io::Result<()> {
             loop {
                 tick.tick().await;
                 crate::antivirus::maybe_run_scheduled_scan(av_state.clone());
+                // Real-time scanning stall watchdog (shells out to journalctl
+                // and systemctl, so off the async runtime).
+                let health_state = av_state.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::antivirus::check_on_access_health(health_state)
+                }).await;
             }
         });
 

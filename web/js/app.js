@@ -28006,7 +28006,7 @@ window.nodeAntivirusDelete = nodeAntivirusDelete;
 async function nodeAntivirusOnAccess(enable) {
     const verb = enable ? 'Enable' : 'Disable';
     if (!await wolfConfirm(
-        `${verb} real-time on-access scanning on THIS node?\n\nClamonacc scans every file open via fanotify. Findings are auto-moved to /var/quarantine/wolfstack/. ${enable ? "Adds latency to every file open and loads the full ClamAV signature DB into memory (~300 MB resident). Don't enable on database or log-heavy hosts without testing." : "Stops the clamd + clamonacc services and strips the managed clamd.conf block."}`,
+        `${verb} real-time on-access scanning on THIS node?\n\nclamonacc scans files as they are opened in the places intruders drop or persist files: /root, /home, /srv, /var/www, /opt, /usr/local, /var/tmp, /dev/shm and the cron / systemd / profile.d directories. Container storage, Docker, databases and VM images are left to the scheduled scans. Findings are auto-moved to /var/quarantine/wolfstack/. ${enable ? "Loads the full ClamAV signature DB into memory (~300 MB resident) and may raise fs.inotify.max_user_watches so every watched directory can be followed." : "Stops clamonacc and strips the managed clamd.conf block. clamd keeps running for scheduled scans."}`,
         `${verb} on-access scanning`
     )) return;
     // Reuse the install terminal modal to show the live work.
@@ -28075,7 +28075,7 @@ async function fleetAntivirusOnAccess(enable) {
         return;
     }
     if (!await wolfConfirm(
-        `${verb} real-time on-access scanning on ${nodes.length} node(s)?\n\nNodes are processed one at a time in the install terminal. ${enable ? "Will install clamav-daemon/clamd if missing. Adds file-open latency on every node and loads ~300MB signature DB into memory per node. NOT recommended for database or log-heavy hosts." : "Stops clamd + clamonacc and removes the managed clamd.conf block."}\n\nContinue?`,
+        `${verb} real-time on-access scanning on ${nodes.length} node(s)?\n\nNodes are processed one at a time in the install terminal. ${enable ? "Will install clamav-daemon/clamd if missing and loads the ~300 MB signature DB into memory per node. Watches /root, /home, /srv, /var/www, /opt, /usr/local, /var/tmp, /dev/shm and the cron / systemd / profile.d directories; container storage, databases and VM images stay with the scheduled scans." : "Stops clamonacc and removes the managed clamd.conf block. clamd keeps running for scheduled scans."}\n\nContinue?`,
         `Fleet on-access ${verb.toLowerCase()}`
     )) return;
     runAvOnAccessSequence(nodes, statusResp.self_id || null, enable);
