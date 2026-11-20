@@ -106,6 +106,68 @@ pub async fn sample_disks_now_async(timeout: Duration) -> Vec<DiskFact> {
     }
 }
 
+/// Every mount point that exists in this process's mount namespace — the
+/// existence listing behind [`crate::predictive::proposal::gone_scopes`] for
+/// disk-fill findings, so an unmounted filesystem's finding is retired on the
+/// next tick rather than after the orphan fuse.
+///
+/// Read from `/proc/self/mounts`, not from `df`: `df` exits non-zero when any
+/// one mount is unreachable (a dead FUSE mount) and de-duplicates bind mounts
+/// of the same device, so its output can't prove a mount is gone. The procfs
+/// read never touches the filesystems themselves and so can't hang on a stuck
+/// NFS server. It is the same namespace `df` runs in (a child of this process).
+/// `None` = unreadable or empty, which retires nothing.
+pub async fn mounted_targets_now() -> Option<std::collections::HashSet<String>> {
+    let text = tokio::fs::read_to_string("/proc/self/mounts").await.ok()?;
+    let set = parse_proc_mounts(&text);
+    if set.is_empty() { None } else { Some(set) }
+}
+
+/// Finding types whose resource_id is a host mount point and so can be retired
+/// by [`mounted_targets_now`]. Both the trend analyzer here (paths from `df`)
+/// and the point-in-time free-space check in `threshold` (paths from sysinfo,
+/// which reads `/proc/mounts` and decodes the same four escapes) key on the
+/// mount path. Leaving the threshold one out is what kept wolfstack-2's
+/// "/root/rootpeek has 0.0 GB free" Critical pending for a day after that
+/// temporary bind mount was removed.
+pub const MOUNT_RETIRABLE: &[&str] = &[
+    FINDING_TYPE,
+    crate::predictive::threshold::FINDING_HOST_DISK_FREE,
+];
+
+/// Second field of each `/proc/self/mounts` line, with the kernel's octal
+/// escapes (`\040` space, `\011` tab, `\012` newline, `\134` backslash)
+/// decoded so it compares equal to the path `df` prints.
+fn parse_proc_mounts(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|l| l.split(' ').nth(1))
+        .map(unescape_mount_field)
+        .collect()
+}
+
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let oct = &bytes[i + 1..i + 4];
+            if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                // Three octal digits: at most 0o777 = 511, so fold in u16.
+                let v = oct.iter().fold(0u16, |acc, b| acc * 8 + (b - b'0') as u16);
+                if let Ok(v) = u8::try_from(v) {
+                    out.push(v);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn parse_df_output(text: &str) -> Vec<DiskFact> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
@@ -337,6 +399,28 @@ mod tests {
     use crate::predictive::NetworkSnapshot;
     use crate::predictive::proposal::{ProposalStore, Severity};
     use crate::predictive::disk_verdict::{CRITICAL_HOURS, HIGH_HOURS};
+
+    #[test]
+    fn proc_mounts_targets_are_decoded() {
+        let text = "/dev/md2 / ext4 rw,relatime 0 0\n\
+                    proc /proc proc rw 0 0\n\
+                    //nas/share /mnt/my\\040share cifs rw 0 0\n\
+                    /dev/sdb1 /mnt/back\\134slash ext4 rw 0 0\n";
+        let got = parse_proc_mounts(text);
+        assert!(got.contains("/"));
+        assert!(got.contains("/proc"));
+        assert!(got.contains("/mnt/my share"), "\\040 must decode to a space: {:?}", got);
+        assert!(got.contains("/mnt/back\\slash"));
+        assert!(!got.contains("/root/rootpeek"));
+    }
+
+    #[test]
+    fn unescape_leaves_non_octal_and_trailing_backslashes_alone() {
+        assert_eq!(unescape_mount_field("/a\\9zz"), "/a\\9zz");
+        assert_eq!(unescape_mount_field("/a\\04"), "/a\\04");
+        assert_eq!(unescape_mount_field("/a\\"), "/a\\");
+        assert_eq!(unescape_mount_field("/ü\\040x"), "/ü x");
+    }
 
     fn ctx() -> Context {
         Context {
