@@ -27,13 +27,13 @@ use std::time::Duration;
 
 use crate::predictive::{
     AckStore, Context, MetricsHistory, ProposalStore,
-    disk_fill, container_disk, container_restart, container_memory,
+    disk_fill, disk_roles, container_disk, container_restart, container_memory,
     threshold, cert_expiry, backup_freshness, vm_disk, security_posture,
     vulnerability, osv, port_conflict, wolfnet_dhcp, wolfnet_reachability,
     docker_wolfnet_collision, missing_subnet_route, compromise_indicators,
     tamper_detection, threat_intel,
     unused_packages, notify, container_boot, boot_partition, boot_health, wolfnet_ip_conflict,
-    ups_battery,
+    ups_battery, alert_delivery,
 };
 
 /// Cadence between ticks once the loop is running.
@@ -57,6 +57,11 @@ const CONTAINER_SAMPLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Hard timeout for `systemctl --failed` — stuck systemd is rare
 /// but a hung dbus could otherwise stall the tick.
 const SYSTEMD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Budget for working out what lives on each mount (a stat per mount
+/// and per LXC container). Local metadata only — generous so a busy
+/// host never drops the "holds" line.
+const DISK_ROLES_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Hard timeout for the container-boot sweep. Sized ABOVE the
 /// sampler's own 45s internal budget (10s per container, serial) so
@@ -139,7 +144,7 @@ pub async fn tick(
     // 1. Sample data sources concurrently with hard timeouts. Each
     //    sampler kills its child process on timeout — stuck NFS or
     //    a wedged docker daemon can no longer hang the orchestrator.
-    let (host_facts, container_facts, restart_facts, failed_units, cert_facts, mem_facts, backup_facts, vm_facts, sshd_cfg, vuln_facts, osv_facts, port_facts, wolfnet_dhcp_facts, wolfnet_reach_facts, docker_wn_collision_facts, missing_route_facts, compromise_facts, tamper_facts, threat_intel_facts, unused_pkg_facts, container_boot_facts, boot_facts, boot_health_facts, wn_conflict_facts, ups_facts) = tokio::join!(
+    let (host_facts, container_facts, restart_facts, failed_units, cert_facts, mem_facts, backup_facts, vm_facts, sshd_cfg, vuln_facts, osv_facts, port_facts, wolfnet_dhcp_facts, wolfnet_reach_facts, docker_wn_collision_facts, missing_route_facts, compromise_facts, tamper_facts, threat_intel_facts, unused_pkg_facts, container_boot_facts, boot_facts, boot_health_facts, wn_conflict_facts, ups_facts, alert_delivery_facts) = tokio::join!(
         disk_fill::sample_disks_now_async(DF_TIMEOUT),
         container_disk::sample_containers_now_async(CONTAINER_SAMPLE_TIMEOUT),
         container_restart::sample_docker_restarts_now_async(CONTAINER_SAMPLE_TIMEOUT),
@@ -174,6 +179,7 @@ pub async fn tick(
         wolfnet_ip_conflict::sample_now_async(SYSTEMD_TIMEOUT),
         // One `upsc` read of the configured UPS target, if any.
         ups_battery::sample_now_async(UPS_SAMPLE_TIMEOUT),
+        alert_delivery::sample_now_async(SYSTEMD_TIMEOUT),
     );
     // Sample current SystemMetrics off the shared monitor — same
     // sysinfo source as the live UI, so threshold findings line up
@@ -287,6 +293,15 @@ pub async fn tick(
     // 3. Snapshot the read-side stores under their own short locks.
     //    Each clone happens under one lock; the lock drops at the
     //    end of the let binding's scope.
+    // What lives on each mount df answered for — drives the "holds"
+    // line in disk findings and lifts slow fills of critical disks to a
+    // notifying severity. Only df-answered mounts are stat'ed, so a hung
+    // network mount (df timed out → absent) is never touched here.
+    let disk_roles = disk_roles::sample_now_async(
+        host_facts.iter().map(|f| f.mount.clone()).collect(),
+        DISK_ROLES_TIMEOUT,
+    ).await;
+
     let history_snap: MetricsHistory = lock_read(metrics, "metrics").clone();
     let acks_snap: AckStore = lock_read(acks, "acks").clone();
     let proposals_snap: ProposalStore = lock_read(proposals, "proposals").clone();
@@ -321,7 +336,7 @@ pub async fn tick(
     //    new analyzer without touching any other code path.
     let mut new_proposals: Vec<crate::predictive::Proposal> = Vec::new();
     new_proposals.extend(disk_fill::analyze(
-        &ctx, &history_snap, &host_facts, &acks_snap, &proposals_snap,
+        &ctx, &history_snap, &host_facts, &disk_roles, &acks_snap, &proposals_snap,
     ));
     new_proposals.extend(container_disk::analyze(
         &ctx, &history_snap, &container_facts, &acks_snap, &proposals_snap,
@@ -331,7 +346,7 @@ pub async fn tick(
     ));
     if let Some(ref sys) = sys_metrics_opt {
         new_proposals.extend(threshold::analyze(
-            &ctx, sys, &failed_units, &acks_snap, &proposals_snap,
+            &ctx, sys, &disk_roles, &failed_units, &acks_snap, &proposals_snap,
         ));
     }
     new_proposals.extend(cert_expiry::analyze(
@@ -404,6 +419,9 @@ pub async fn tick(
     new_proposals.extend(ups_battery::analyze(
         &ctx, &ups_facts, &acks_snap, &proposals_snap,
     ));
+    new_proposals.extend(alert_delivery::analyze(
+        &ctx, &alert_delivery_facts, &acks_snap, &proposals_snap,
+    ));
 
     // 5b. Build the "covered" set — every (finding_type, scope) the
     //     analyzers had data for this tick. Auto-resolve uses this
@@ -436,6 +454,7 @@ pub async fn tick(
     covered.extend(boot_health::covered_scopes(&ctx, &boot_health_facts, &proposals_snap));
     covered.extend(wolfnet_ip_conflict::covered_scopes(&ctx, &wn_conflict_facts, &proposals_snap));
     covered.extend(ups_battery::covered_scopes(&ctx, &ups_facts));
+    covered.extend(alert_delivery::covered_scopes(&ctx, &alert_delivery_facts));
     // Mark every PRIOR pending OSV proposal whose target was scanned
     // this tick as covered, even if its CVE didn't re-emit. That's
     // what closes the loop when a package gets upgraded — the CVE
@@ -523,24 +542,71 @@ pub async fn tick(
             "predictive tick: refreshed {} standing proposal(s)", upserted,
         );
     }
-    if (upserted > 0 || resolved > 0)
+    // 7. Notification dispatch — first appearance, or escalation past
+    //    the severity last notified at. Compares the post-upsert state
+    //    with the pre-tick snapshot so an already-pending finding at the
+    //    same tier doesn't re-page. Severity gated to Critical/High
+    //    inside `find_alerts_to_dispatch`.
+    let alerts: Vec<crate::predictive::Proposal> = notify::find_alerts_to_dispatch(
+        &proposals_snap.proposals, &s.proposals,
+    ).into_iter().cloned().collect();
+    // Record what each alert was sent at, so the same escalation isn't
+    // re-sent next tick. Also backfill the marker on findings that were
+    // already pending at Critical/High before `notified_severity`
+    // existed — they were notified on first appearance under the old
+    // code, and without a marker a later escalation would stay silent.
+    let mut marked = false;
+    {
+        use crate::predictive::proposal::ProposalStatus;
+        let alert_ids: std::collections::HashSet<&str> =
+            alerts.iter().map(|a| a.id.as_str()).collect();
+        for p in s.proposals.iter_mut() {
+            if !matches!(p.status, ProposalStatus::Pending) { continue; }
+            let notifiable = matches!(
+                p.severity,
+                crate::predictive::proposal::Severity::Critical
+                    | crate::predictive::proposal::Severity::High
+            );
+            if (alert_ids.contains(p.id.as_str())
+                || (notifiable && p.notified_severity.is_none()))
+                && p.notified_severity != Some(p.severity)
+            {
+                p.notified_severity = Some(p.severity);
+                marked = true;
+            }
+        }
+    }
+    // Capacity findings the operator was told about and that cleared
+    // this tick → "recovered" message, with the mount's current space
+    // when df answered for it.
+    let recoveries: Vec<(crate::predictive::Proposal, Option<String>)> =
+        notify::find_capacity_recoveries(&proposals_snap.proposals, &s.proposals)
+            .into_iter()
+            .map(|p| {
+                let now = p.scope.resource_id.as_deref()
+                    .and_then(|m| host_facts.iter().find(|f| f.mount == m))
+                    .map(|f| format!(
+                        "{:.1} GB free of {:.1} GB ({:.0}% used)",
+                        f.avail_bytes as f64 / 1_073_741_824.0,
+                        f.total_bytes as f64 / 1_073_741_824.0,
+                        f.used_pct,
+                    ));
+                (p.clone(), now)
+            })
+            .collect();
+
+    if (upserted > 0 || resolved > 0 || marked)
         && let Err(e) = s.save() {
             tracing::warn!("predictive: failed to save proposals: {}", e);
         }
-
-    // 7. Notification dispatch — first appearance only. Compares
-    //    the post-upsert state vs the pre-tick snapshot so a
-    //    proposal that was already pending doesn't re-page the
-    //    operator. Severity gated to Critical/High inside
-    //    `find_first_appearance_alerts`. Spawned async so a slow
-    //    Discord webhook doesn't stall the orchestrator's loop.
-    let alerts: Vec<crate::predictive::Proposal> = notify::find_first_appearance_alerts(
-        &proposals_snap.proposals, &s.proposals,
-    ).into_iter().cloned().collect();
     drop(s);  // release the write lock before spawning dispatch tasks
     if !alerts.is_empty() {
-        tracing::info!("predictive tick: dispatching {} first-appearance alert(s)", alerts.len());
+        tracing::info!("predictive tick: dispatching {} alert(s) (new or escalated)", alerts.len());
         notify::dispatch_alerts(alerts);
+    }
+    if !recoveries.is_empty() {
+        tracing::info!("predictive tick: dispatching {} capacity recovery notice(s)", recoveries.len());
+        notify::dispatch_recoveries(recoveries);
     }
 }
 

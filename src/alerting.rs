@@ -80,6 +80,8 @@ pub struct HistoryRow {
 fn category_to_severity(c: AlertCategory) -> &'static str {
     match c {
         AlertCategory::Compromise => "critical",
+        AlertCategory::Capacity { urgent: true } => "critical",
+        AlertCategory::Capacity { urgent: false } => "warning",
         AlertCategory::BruteForce | AlertCategory::Posture => "warning",
         AlertCategory::Threshold | AlertCategory::Lifecycle => "info",
     }
@@ -491,6 +493,19 @@ pub enum AlertCategory {
     /// Node offline/restored, reboot detection. Lifecycle noise visible
     /// on the dashboard.
     Lifecycle,
+    /// A filesystem is about to run out of space (or already has). Not
+    /// noise: a full disk stops databases and containers, and the
+    /// dashboard is no help when nobody is looking at it — wolfstack-2
+    /// filled on 2026-11-19 with every warning confined to the inbox,
+    /// because disk findings were `Threshold` and Simple mode drops
+    /// those. So Capacity fires under Simple too.
+    ///
+    /// `urgent` = the finding is `Critical` (hours, not days). Urgent
+    /// capacity alerts also ignore quiet hours and the hourly rate cap,
+    /// like `Compromise`: "the database disk fills in 40 minutes" is a
+    /// wake-me-up signal. Non-urgent ones respect quiet hours when the
+    /// operator lists "capacity" there.
+    Capacity { urgent: bool },
 }
 
 fn default_cpu_threshold() -> f32 { 90.0 }
@@ -509,6 +524,13 @@ impl AlertCategory {
     /// `Vec<AlertCategory>` because the frontend stores it as plain
     /// strings already (`"threshold"`, `"lifecycle"`, ...), so we
     /// translate at the gate.
+    /// Wake-me-up categories: never silenced by quiet hours and never
+    /// dropped by the hourly rate cap. Host compromise, and a disk that
+    /// fills within hours.
+    pub fn bypasses_quiet_hours(self) -> bool {
+        matches!(self, AlertCategory::Compromise | AlertCategory::Capacity { urgent: true })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             AlertCategory::Compromise => "compromise",
@@ -516,6 +538,7 @@ impl AlertCategory {
             AlertCategory::Posture    => "posture",
             AlertCategory::Threshold  => "threshold",
             AlertCategory::Lifecycle  => "lifecycle",
+            AlertCategory::Capacity { .. } => "capacity",
         }
     }
 }
@@ -594,13 +617,45 @@ impl AlertConfig {
         Ok(())
     }
 
+    /// Adopt another node's alert settings, keeping this node's INBOUND
+    /// receivers (Discord bot, Telegram receiver, Twilio/WhatsApp).
+    ///
+    /// Used by "copy alert settings to every node in this cluster".
+    /// Outbound delivery (webhooks, ntfy, channel selection) and the
+    /// rules (verbosity, quiet hours, toggles, rate limits) are what an
+    /// operator wants identical everywhere. Receivers are the opposite:
+    /// a bot token logged in from several nodes means several gateway
+    /// sessions answering the same message, and Telegram rejects
+    /// concurrent long-polls on one token outright. So those stay
+    /// whatever this node already had.
+    ///
+    /// Written as "take everything, then restore the receivers" so a
+    /// future outbound field is copied by default rather than silently
+    /// left behind.
+    pub fn adopt_shared_settings(&mut self, src: &AlertConfig) {
+        let discord_bot_token = std::mem::take(&mut self.discord_bot_token);
+        let telegram_receiver_enabled = self.telegram_receiver_enabled;
+        let twilio_account_sid = std::mem::take(&mut self.twilio_account_sid);
+        let twilio_auth_token = std::mem::take(&mut self.twilio_auth_token);
+        let twilio_whatsapp_from = std::mem::take(&mut self.twilio_whatsapp_from);
+        *self = src.clone();
+        self.discord_bot_token = discord_bot_token;
+        self.telegram_receiver_enabled = telegram_receiver_enabled;
+        self.twilio_account_sid = twilio_account_sid;
+        self.twilio_auth_token = twilio_auth_token;
+        self.twilio_whatsapp_from = twilio_whatsapp_from;
+    }
+
     /// Whether an alert of the given category should be dispatched
-    /// under the current verbosity setting. Simple mode only allows
-    /// `Compromise`; Verbose allows everything.
+    /// under the current verbosity setting. Simple mode allows
+    /// `Compromise` and `Capacity`; Verbose allows everything.
     pub fn allows(&self, category: AlertCategory) -> bool {
         match self.alert_verbosity {
             AlertVerbosity::Verbose => true,
-            AlertVerbosity::Simple => matches!(category, AlertCategory::Compromise),
+            AlertVerbosity::Simple => matches!(
+                category,
+                AlertCategory::Compromise | AlertCategory::Capacity { .. }
+            ),
         }
     }
 
@@ -619,7 +674,7 @@ impl AlertConfig {
         if !self.allows(category) { return false; }
         // Compromise is never suppressed even when explicitly listed —
         // belt and suspenders.
-        if category == AlertCategory::Compromise { return true; }
+        if category.bypasses_quiet_hours() { return true; }
         let Some(q) = self.quiet_hours.as_ref() else { return true; };
         if !q.enabled { return true; }
         if !q.suppress_categories.iter().any(|s| s == category.as_str()) {
@@ -1003,7 +1058,7 @@ pub async fn send_alert(config: &AlertConfig, category: AlertCategory, title: &s
     // want a flood of failed-auth events to silence a "miner running"
     // signal. Same invariant as Simple verbosity + quiet-hours
     // suppression.
-    if category != AlertCategory::Compromise
+    if !category.bypasses_quiet_hours()
         && !try_acquire_hourly_slot(config.max_alerts_per_hour)
     {
         warn!(
@@ -1013,7 +1068,11 @@ pub async fn send_alert(config: &AlertConfig, category: AlertCategory, title: &s
         return;
     }
 
-    let priority: u8 = if category == AlertCategory::Compromise { 5 } else { 3 };
+    let priority: u8 = match category {
+        AlertCategory::Compromise | AlertCategory::Capacity { urgent: true } => 5,
+        AlertCategory::Capacity { urgent: false } => 4,
+        _ => 3,
+    };
     dispatch_to_channels(config, title, message, priority).await;
 }
 
@@ -1675,6 +1734,8 @@ mod tests {
             AlertCategory::Posture,
             AlertCategory::Threshold,
             AlertCategory::Lifecycle,
+            AlertCategory::Capacity { urgent: false },
+            AlertCategory::Capacity { urgent: true },
         ] {
             assert!(!cat.as_str().is_empty());
             assert!(cat.as_str().chars().next().unwrap().is_lowercase());
@@ -1785,6 +1846,66 @@ mod tests {
             .unwrap().with_timezone(&chrono::Utc);
         assert!(cfg.allows_at(AlertCategory::Threshold, outside));
         assert!(cfg.allows_at(AlertCategory::Lifecycle, outside));
+    }
+
+    /// Disk capacity alerts must reach the operator under the DEFAULT
+    /// (Simple) verbosity — wolfstack-2 filled on 2026-11-19 with the
+    /// warning stuck in the inbox. Urgent ones also beat quiet hours;
+    /// non-urgent ones respect them when the operator lists "capacity".
+    #[test]
+    fn capacity_fires_in_simple_and_urgent_beats_quiet_hours() {
+        let simple = AlertConfig { enabled: true, ..Default::default() };
+        assert_eq!(simple.alert_verbosity, AlertVerbosity::Simple);
+        assert!(simple.allows(AlertCategory::Capacity { urgent: false }));
+        assert!(simple.allows(AlertCategory::Capacity { urgent: true }));
+        assert!(!simple.allows(AlertCategory::Threshold));
+
+        let cfg = AlertConfig {
+            enabled: true,
+            quiet_hours: Some(QuietHours {
+                enabled: true,
+                start_hhmm: "09:00".into(),
+                end_hhmm: "17:00".into(),
+                timezone: "Europe/Berlin".into(),
+                days_of_week: 0x1F,
+                suppress_categories: vec!["capacity".into()],
+            }),
+            ..Default::default()
+        };
+        let inside = chrono::DateTime::parse_from_rfc3339("2026-05-19T11:00:00Z")
+            .unwrap().with_timezone(&chrono::Utc);
+        assert!(!cfg.allows_at(AlertCategory::Capacity { urgent: false }, inside),
+            "non-urgent capacity honours quiet hours when listed");
+        assert!(cfg.allows_at(AlertCategory::Capacity { urgent: true }, inside),
+            "urgent capacity must fire inside quiet hours");
+    }
+
+    #[test]
+    fn adopt_shared_settings_copies_delivery_keeps_receivers() {
+        let mut peer = AlertConfig {
+            discord_bot_token: "peer-bot".into(),
+            telegram_receiver_enabled: false,
+            twilio_auth_token: "peer-twilio".into(),
+            ..Default::default()
+        };
+        let src = AlertConfig {
+            enabled: true,
+            ntfy_topic: "ops-alerts".into(),
+            discord_webhook: "https://example.invalid/hook".into(),
+            alert_verbosity: AlertVerbosity::Verbose,
+            discord_bot_token: "source-bot".into(),
+            telegram_receiver_enabled: true,
+            twilio_auth_token: "source-twilio".into(),
+            ..Default::default()
+        };
+        peer.adopt_shared_settings(&src);
+        assert!(peer.enabled);
+        assert_eq!(peer.ntfy_topic, "ops-alerts");
+        assert_eq!(peer.discord_webhook, "https://example.invalid/hook");
+        assert_eq!(peer.alert_verbosity, AlertVerbosity::Verbose);
+        assert_eq!(peer.discord_bot_token, "peer-bot", "receiver bot token stays node-local");
+        assert!(!peer.telegram_receiver_enabled, "telegram receiver stays node-local");
+        assert_eq!(peer.twilio_auth_token, "peer-twilio");
     }
 
     /// `is_in_cooldown_secs` uses the supplied duration — locking

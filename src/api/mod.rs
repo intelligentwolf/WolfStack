@@ -34936,14 +34936,20 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
         let size_detail = format!("{} — {:.1} GB used / {:.1} GB total ({:.1} GB free, {:.1}%)",
             disk.mount_point, used_gb, total_gb, free_gb, disk.usage_percent);
 
-        if free_gb < 2.0 {
+        // Same size-scaled floor as the predictive disk finding, so the
+        // Issues page and the alerts never disagree about whether a disk
+        // is in trouble (the old flat 10 GB / 2 GB said nothing about a
+        // 436 GB database disk until minutes before it filled).
+        let (warn_floor, crit_floor) =
+            crate::predictive::disk_verdict::free_space_floor_bytes(disk.total_bytes);
+        if disk.available_bytes < crit_floor {
             issues.push(Issue {
                 severity: "critical".into(),
                 category: "disk".into(),
                 title: format!("Disk {} almost full ({:.1} GB free)", disk.mount_point, free_gb),
                 detail: size_detail,
             });
-        } else if free_gb < 10.0 {
+        } else if disk.available_bytes < warn_floor {
             issues.push(Issue {
                 severity: "warning".into(),
                 category: "disk".into(),
@@ -35943,6 +35949,147 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
     match config.save() {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// Alert settings as carried between nodes by "copy to every node in
+/// this cluster". `email` is present only when the source node has
+/// alert email switched on — copying a disabled email setup would turn
+/// email OFF on a peer that has its own, which is never what pressing
+/// "copy" means.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AlertSettingsBundle {
+    pub alert_config: crate::alerting::AlertConfig,
+    #[serde(default)]
+    pub email: Option<crate::ai::EmailTransport>,
+}
+
+/// POST /api/alerts/config/copy-to-cluster — push this node's alert
+/// settings (and alert email, when on) to every other WolfStack node in
+/// the same cluster, and report per node.
+///
+/// Why: alert settings live per node, and nothing propagated them, so
+/// wolfstack-1/2/3 all ended up with alerting off (2026-11-19 — a disk
+/// filled with nobody told). Configuring one node and copying is the
+/// fix an operator can do in one click.
+///
+/// Secrets travel only over HTTPS or the encrypted WolfNet link — the
+/// plain-HTTP fallback `build_node_urls` offers for ordinary peer calls
+/// is deliberately not used here, because this payload carries webhook
+/// URLs and the SMTP password.
+pub async fn alerts_config_copy_to_cluster(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let bundle = match web::block(|| {
+        let alert_config = crate::alerting::AlertConfig::load();
+        let ai = crate::ai::AiConfig::load();
+        let email = (ai.email_enabled && !ai.email_to.trim().is_empty())
+            .then(|| ai.email_transport());
+        AlertSettingsBundle { alert_config, email }
+    }).await {
+        Ok(b) => b,
+        Err(e) => return HttpResponse::InternalServerError()
+            .json(serde_json::json!({ "error": format!("could not read local settings: {}", e) })),
+    };
+    let email_copied = bundle.email.is_some();
+
+    let my_cluster = local_cluster_name(&state.cluster);
+    let peers: Vec<_> = state.cluster.get_all_nodes().into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack")
+        .filter(|n| n.cluster_name.clone().unwrap_or_else(|| "WolfStack".to_string()) == my_cluster)
+        .collect();
+
+    let secret = state.cluster_secret.clone();
+    let client = (*API_HTTP_CLIENT).clone();
+    let mut results = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let label = if peer.hostname.is_empty() { peer.address.clone() } else { peer.hostname.clone() };
+        if !peer.online {
+            results.push(serde_json::json!({
+                "node_id": peer.id, "hostname": label, "ok": false,
+                "error": "offline — not updated; copy again once it is back",
+            }));
+            continue;
+        }
+        let path = "/api/alerts/config/peer-apply";
+        let mut urls = vec![format!(
+            "https://{}:{}{}", crate::netaddr::bracket_host(&peer.address), peer.port, path,
+        )];
+        if let Some(wn) = lookup_node_wolfnet_ip(&peer.address) {
+            urls.push(format!("http://{}:{}{}", wn, peer.port + 1, path));
+        }
+        let mut last_err = String::from("unreachable");
+        let mut ok = false;
+        for url in urls {
+            match client.post(&url)
+                .timeout(std::time::Duration::from_secs(10))
+                .peer_auth(&secret)
+                .json(&bundle)
+                .send().await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let _ = resp.bytes().await;
+                    ok = true;
+                    break;
+                }
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    // A 404 means the peer runs a WolfStack from before this
+                    // endpoint existed — say so instead of a bare status.
+                    last_err = if code == reqwest::StatusCode::NOT_FOUND {
+                        "peer's WolfStack is too old for this — upgrade it first".to_string()
+                    } else {
+                        format!("HTTP {}: {}", code.as_u16(), body.chars().take(200).collect::<String>())
+                    };
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        results.push(if ok {
+            serde_json::json!({ "node_id": peer.id, "hostname": label, "ok": true })
+        } else {
+            serde_json::json!({ "node_id": peer.id, "hostname": label, "ok": false, "error": last_err })
+        });
+    }
+    // Each peer's "alerts reach nobody" finding clears on that peer's
+    // next predictive tick (≤ 5 min), not here.
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "cluster": my_cluster,
+        "email_copied": email_copied,
+        "results": results,
+    }))
+}
+
+/// POST /api/alerts/config/peer-apply — receive alert settings from a
+/// cluster peer (see `alerts_config_copy_to_cluster`). Cluster-secret
+/// only: this writes webhook URLs and the SMTP password.
+pub async fn alerts_config_peer_apply(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<AlertSettingsBundle>,
+) -> HttpResponse {
+    if let Err(resp) = require_cluster_secret(&req, &state) { return resp; }
+    let bundle = body.into_inner();
+    let res = web::block(move || -> Result<(), String> {
+        let mut cfg = crate::alerting::AlertConfig::load();
+        cfg.adopt_shared_settings(&bundle.alert_config);
+        cfg.save()?;
+        if let Some(email) = bundle.email {
+            let mut ai = crate::ai::AiConfig::load();
+            ai.set_email_transport(email);
+            ai.save()?;
+        }
+        Ok(())
+    }).await;
+    match res {
+        Ok(Ok(())) => {
+            tracing::info!("alert settings updated from a cluster peer (copy to every node)");
+            HttpResponse::Ok().json(serde_json::json!({ "saved": true }))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
@@ -50086,6 +50233,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/alerts/config", web::get().to(alerts_config_get))
         .route("/api/alerts/config", web::post().to(alerts_config_save))
         .route("/api/alerts/test", web::post().to(alerts_test))
+        .route("/api/alerts/config/copy-to-cluster", web::post().to(alerts_config_copy_to_cluster))
+        .route("/api/alerts/config/peer-apply", web::post().to(alerts_config_peer_apply))
         .route("/api/system/install-package", web::post().to(system_install_package))
         // Predictive ops — Inbox + Acks. Static segments before
         // {id} so actix doesn't swallow them as ids.

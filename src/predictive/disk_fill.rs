@@ -47,8 +47,9 @@ use crate::predictive::{
     },
     ack::AckStore,
     disk_verdict::{
-        compute_verdict, humanise_hours, FILL_TARGET_PCT, MIN_USED_PCT, Verdict,
+        compute_verdict, escalate_for_role, humanise_hours, FILL_TARGET_PCT, MIN_USED_PCT, Verdict,
     },
+    disk_roles::DiskRoles,
 };
 
 /// Stable identifier for this finding type. Used as the dedup key in
@@ -143,6 +144,7 @@ pub fn analyze(
     ctx: &Context,
     history: &MetricsHistory,
     current: &[DiskFact],
+    roles: &DiskRoles,
     acks: &AckStore,
     proposals: &crate::predictive::proposal::ProposalStore,
 ) -> Vec<Proposal> {
@@ -160,9 +162,12 @@ pub fn analyze(
         if proposals.is_suppressed(FINDING_TYPE, &scope) { continue; }
 
         let Some(samples) = history.samples(&fact.mount, METRIC) else { continue; };
-        let Some(verdict) = compute_verdict(samples, fact.used_pct, FILL_TARGET_PCT) else { continue; };
+        let Some(mut verdict) = compute_verdict(samples, fact.used_pct, FILL_TARGET_PCT) else { continue; };
+        // A slow fill of the disk holding the OS, containers or database
+        // data still ends in an outage — notify instead of inbox-only.
+        verdict.severity = escalate_for_role(verdict.severity, roles.holds_critical_data(&fact.mount));
 
-        out.push(build_proposal(fact, &scope, &verdict));
+        out.push(build_proposal(fact, &scope, &verdict, roles.summary(&fact.mount)));
     }
     out
 }
@@ -173,32 +178,43 @@ fn is_already_alarming(fact: &DiskFact) -> bool {
     fact.used_pct >= FILL_TARGET_PCT
 }
 
-fn build_proposal(fact: &DiskFact, scope: &ProposalScope, v: &Verdict) -> Proposal {
+fn build_proposal(fact: &DiskFact, scope: &ProposalScope, v: &Verdict, holds: Option<String>) -> Proposal {
+    let free_gb = fact.avail_bytes as f64 / 1_073_741_824.0;
+    let total_gb = fact.total_bytes as f64 / 1_073_741_824.0;
+    // Lead with what's LEFT, not the percentage: "38 GB left" means the
+    // same thing on any size of disk, "91 %" doesn't.
     let title = match v.eta_hours {
-        Some(h) if h < 1.0 => format!("{} fills within the hour", fact.mount),
-        Some(h) if h < 24.0 => format!("{} fills in ~{:.0}h", fact.mount, h),
-        Some(h) => format!("{} fills in ~{:.1}d", fact.mount, h / 24.0),
-        None => format!("{} is at {:.0}% and not filling further", fact.mount, fact.used_pct),
+        Some(h) if h < 1.0 => format!("{} fills within the hour — {:.1} GB left", fact.mount, free_gb),
+        Some(h) if h < 24.0 => format!("{} fills in ~{:.0}h — {:.1} GB left", fact.mount, h, free_gb),
+        Some(h) => format!("{} fills in ~{:.1}d — {:.1} GB left", fact.mount, h / 24.0, free_gb),
+        None => format!("{} is at {:.0}% ({:.1} GB left) and not filling further", fact.mount, fact.used_pct, free_gb),
     };
 
-    let why = match v.eta_hours {
+    // Growth in GB/h is what an operator can reason about; %/h of an
+    // unknown-size disk isn't.
+    let gb_per_hour = v.slope_pct_per_hour / 100.0 * total_gb;
+    let mut why = match v.eta_hours {
         Some(h) => format!(
-            "Currently {:.0}% used, growing at {:.2}%/h — projected to hit \
-             {:.0}% in ~{}. Based on {} samples spanning {} min.",
-            fact.used_pct,
-            v.slope_pct_per_hour,
-            FILL_TARGET_PCT,
+            "{:.1} GB free of {:.1} GB ({:.0}% used), growing ~{:.2} GB/h \
+             ({:.2}%/h) — projected to hit {:.0}% in ~{}. Based on {} \
+             samples spanning {} min.",
+            free_gb, total_gb, fact.used_pct,
+            gb_per_hour, v.slope_pct_per_hour,
+            if fact.used_pct >= FILL_TARGET_PCT { 100.0 } else { FILL_TARGET_PCT },
             humanise_hours(h),
             v.samples_used,
             v.span_minutes,
         ),
         None => format!(
-            "Currently {:.0}% used and not growing over the last {} min \
-             (slope {:.2}%/h). Already past {:.0}% — surface for awareness \
-             even though there's no ETA.",
-            fact.used_pct, v.span_minutes, v.slope_pct_per_hour, FILL_TARGET_PCT,
+            "{:.1} GB free of {:.1} GB ({:.0}% used) and not growing over \
+             the last {} min (slope {:.2}%/h). Already past {:.0}% — surface \
+             for awareness even though there's no ETA.",
+            free_gb, total_gb, fact.used_pct, v.span_minutes, v.slope_pct_per_hour, FILL_TARGET_PCT,
         ),
     };
+    if let Some(h) = &holds {
+        why.push_str(&format!(" This filesystem holds: {}.", h));
+    }
 
     let evidence = vec![
         Evidence {
@@ -213,7 +229,7 @@ fn build_proposal(fact: &DiskFact, scope: &ProposalScope, v: &Verdict) -> Propos
         },
         Evidence {
             label: "Growth rate".into(),
-            value: format!("{:+.2} %/h", v.slope_pct_per_hour),
+            value: format!("{:+.2} GB/h ({:+.2} %/h)", gb_per_hour, v.slope_pct_per_hour),
             detail: Some(format!(
                 "Linear fit over {} samples spanning {} min",
                 v.samples_used, v.span_minutes,
@@ -221,6 +237,16 @@ fn build_proposal(fact: &DiskFact, scope: &ProposalScope, v: &Verdict) -> Propos
             links: Vec::new(),
         },
     ];
+
+    let mut evidence = evidence;
+    if let Some(h) = holds {
+        evidence.push(Evidence {
+            label: "Holds".into(),
+            value: h,
+            detail: Some("Filling this filesystem stops what's on it".into()),
+            links: Vec::new(),
+        });
+    }
 
     let remediation = build_remediation(fact);
 
@@ -508,7 +534,7 @@ mod tests {
         let facts = vec![fact("/data", 35.0)];
         let acks = AckStore::default();
         let store = ProposalStore::default();
-        let proposals = analyze(&ctx(), &h, &facts, &acks, &store);
+        let proposals = analyze(&ctx(), &h, &facts, &DiskRoles::default(), &acks, &store);
         assert!(proposals.is_empty(),
             "disks below MIN_USED_PCT shouldn't fire even with steep growth");
     }
@@ -520,7 +546,7 @@ mod tests {
         let facts = vec![fact("/var/lib/docker", 76.0)];
         let acks = AckStore::default();
         let store = ProposalStore::default();
-        let proposals = analyze(&ctx(), &h, &facts, &acks, &store);
+        let proposals = analyze(&ctx(), &h, &facts, &DiskRoles::default(), &acks, &store);
         assert_eq!(proposals.len(), 1);
         let p = &proposals[0];
         assert_eq!(p.finding_type, FINDING_TYPE);
@@ -552,7 +578,7 @@ mod tests {
         ));
 
         let store = ProposalStore::default();
-        let proposals = analyze(&ctx(), &h, &facts, &acks, &store);
+        let proposals = analyze(&ctx(), &h, &facts, &DiskRoles::default(), &acks, &store);
         assert!(proposals.is_empty(),
             "resource-scoped ack must suppress this finding");
     }
@@ -575,7 +601,7 @@ mod tests {
         let id = store.proposals[0].id.clone();
         store.dismiss(&id, "false positive").unwrap();
 
-        let proposals = analyze(&ctx(), &h, &facts, &acks, &store);
+        let proposals = analyze(&ctx(), &h, &facts, &DiskRoles::default(), &acks, &store);
         assert!(proposals.is_empty(),
             "dismissed proposal must keep analyzer quiet");
     }
@@ -595,6 +621,7 @@ mod tests {
         let facts = vec![fact("/data", 35.0)];
         let proposals = analyze(
             &ctx(), &h, &facts,
+            &DiskRoles::default(),
             &AckStore::default(),
             &ProposalStore::default(),
         );

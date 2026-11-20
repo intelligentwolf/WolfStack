@@ -235,7 +235,50 @@ impl Default for AiConfig {
     }
 }
 
+/// The SMTP half of `AiConfig` — the part alert email needs. Split out
+/// so "copy alert settings to every node" can carry email delivery
+/// without also copying this node's AI provider keys and model choice,
+/// which are a separate decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailTransport {
+    pub email_enabled: bool,
+    pub email_to: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_user: String,
+    pub smtp_pass: String,
+    pub smtp_from: String,
+    pub smtp_tls: String,
+}
+
 impl AiConfig {
+    /// This node's alert-email settings.
+    pub fn email_transport(&self) -> EmailTransport {
+        EmailTransport {
+            email_enabled: self.email_enabled,
+            email_to: self.email_to.clone(),
+            smtp_host: self.smtp_host.clone(),
+            smtp_port: self.smtp_port,
+            smtp_user: self.smtp_user.clone(),
+            smtp_pass: self.smtp_pass.clone(),
+            smtp_from: self.smtp_from.clone(),
+            smtp_tls: self.smtp_tls.clone(),
+        }
+    }
+
+    /// Replace this node's alert-email settings, leaving every AI
+    /// field untouched.
+    pub fn set_email_transport(&mut self, t: EmailTransport) {
+        self.email_enabled = t.email_enabled;
+        self.email_to = t.email_to;
+        self.smtp_host = t.smtp_host;
+        self.smtp_port = t.smtp_port;
+        self.smtp_user = t.smtp_user;
+        self.smtp_pass = t.smtp_pass;
+        self.smtp_from = t.smtp_from;
+        self.smtp_tls = t.smtp_tls;
+    }
+
     pub fn load() -> Self {
         match std::fs::read_to_string(ai_config_path()) {
             Ok(content) => Self::parse_with_migrations(&content),
