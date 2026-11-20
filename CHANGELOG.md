@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.46.0: a filling disk now reaches you — by email under default settings, and loudly in the browser** _(2026-11-20 — [`826a4921`](https://github.com/intelligentwolf/WolfStack/commit/826a4921a20ad3cf0a8e68877ef0a45f3015e274))_
 - **v25.45.0: real-time virus scanning no longer fills the disk by pinning deleted files** _(2026-11-19 — [`4a7e3c20`](https://github.com/intelligentwolf/WolfStack/commit/4a7e3c209638c61a39732761bbdfcf6c27684adf))_
 - **v25.44.1: clear the stale clamonacc log left behind by the old on-access setup** _(2026-11-15 — [`557fb8a7`](https://github.com/intelligentwolf/WolfStack/commit/557fb8a70afc3266aa6ab763b2a5199f884dac5e))_
 - **v25.44.0: run your own mail with Stalwart, and WolfHA stops rewriting unchanged files** _(2026-11-13 — [`a286f75a`](https://github.com/intelligentwolf/WolfStack/commit/a286f75ac96f188ed3e6ee09371b8411130c910a))_
