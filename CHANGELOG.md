@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.46.1: a disk alert for a mount that's been removed now clears instead of paging for a week** _(2026-11-20 — [`f487c915`](https://github.com/intelligentwolf/WolfStack/commit/f487c915f640a637a3fd7647a9d269233e37e4dd))_
 - **v25.46.0: a filling disk now reaches you — by email under default settings, and loudly in the browser** _(2026-11-20 — [`826a4921`](https://github.com/intelligentwolf/WolfStack/commit/826a4921a20ad3cf0a8e68877ef0a45f3015e274))_
 - **v25.45.0: real-time virus scanning no longer fills the disk by pinning deleted files** _(2026-11-19 — [`4a7e3c20`](https://github.com/intelligentwolf/WolfStack/commit/4a7e3c209638c61a39732761bbdfcf6c27684adf))_
 - **v25.44.1: clear the stale clamonacc log left behind by the old on-access setup** _(2026-11-15 — [`557fb8a7`](https://github.com/intelligentwolf/WolfStack/commit/557fb8a70afc3266aa6ab763b2a5199f884dac5e))_
