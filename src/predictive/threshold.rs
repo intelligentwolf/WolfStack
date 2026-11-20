@@ -34,19 +34,26 @@
 //! |----------------|--------|----------|
 //! | CPU usage      | 75 %   | 90 %     |
 //! | Memory usage   | 80 %   | 90 %     |
-//! | Disk free      | <10 GB | <2 GB    |
+//! | Disk free      | < floor | < floor/4 (see below) |
 //! | Swap usage     | 50 %   | —        |
 //! | Load × CPU     | 1.0×   | 2.0×     |
 //! | Failed systemd | warn   | —        |
 //!
-//! Disk uses *free GB* not percent because a 10 TB disk at 95 % is
-//! "500 GB free, fine for hours" while a 32 GB root at 95 % is
-//! "1.6 GB free, urgent".
+//! Disk uses *free space* not percent because a 10 TB disk at 95 % is
+//! "500 GB free, fine for days" while a 32 GB root at 95 % is
+//! "1.6 GB free, urgent". The floor scales with the disk — 10 % of
+//! its size, clamped to 5–100 GB, never more than 20 % of a small
+//! disk (`disk_verdict::free_space_floor_bytes`). The old flat
+//! 10 GB / 2 GB floor warned a 436 GB database disk only minutes
+//! before it filled (wolfstack-2, 2026-11-19). Below the floor is
+//! `High` (notifies), below a quarter of it is `Critical`.
 
 use std::time::Duration;
 
 use crate::predictive::{
     Context,
+    disk_roles::DiskRoles,
+    disk_verdict::free_space_floor_bytes,
     proposal::{
         Evidence, Proposal, ProposalScope, RemediationPlan, Severity,
     },
@@ -64,8 +71,6 @@ const CPU_WARN: f32 = 75.0;
 const CPU_CRITICAL: f32 = 90.0;
 const MEM_WARN: f32 = 80.0;
 const MEM_CRITICAL: f32 = 90.0;
-const DISK_FREE_WARN_GB: f64 = 10.0;
-const DISK_FREE_CRITICAL_GB: f64 = 2.0;
 const SWAP_WARN_PCT: f64 = 50.0;
 const LOAD_WARN_MULT: f64 = 1.0;     // load > cpu_count
 const LOAD_CRITICAL_MULT: f64 = 2.0; // load > 2 × cpu_count
@@ -124,6 +129,7 @@ pub async fn sample_failed_systemd_units_now_async(timeout: Duration) -> FailedU
 pub fn analyze(
     ctx: &Context,
     metrics: &crate::monitoring::SystemMetrics,
+    roles: &DiskRoles,
     failed_units: &FailedUnitsFacts,
     acks: &AckStore,
     proposals: &crate::predictive::proposal::ProposalStore,
@@ -147,7 +153,7 @@ pub fn analyze(
         && let Some(p) = check_memory(ctx, metrics, acks, proposals) { out.push(p); }
     // ── Per-mount disk free space ──
     if acfg.alert_disk {
-        out.extend(check_disks(ctx, metrics, acks, proposals));
+        out.extend(check_disks(ctx, metrics, roles, acks, proposals));
     }
     // ── Swap ──
     if let Some(p) = check_swap(ctx, metrics, acks, proposals) { out.push(p); }
@@ -335,6 +341,7 @@ fn should_skip_disk(d: &crate::monitoring::DiskMetrics) -> bool {
 fn check_disks(
     ctx: &Context,
     metrics: &crate::monitoring::SystemMetrics,
+    roles: &DiskRoles,
     acks: &AckStore,
     proposals: &crate::predictive::proposal::ProposalStore,
 ) -> Vec<Proposal> {
@@ -342,9 +349,12 @@ fn check_disks(
     for d in &metrics.disks {
         if should_skip_disk(d) { continue; }
         let free_gb = d.available_bytes as f64 / 1_073_741_824.0;
-        let sev = if free_gb < DISK_FREE_CRITICAL_GB { Severity::Critical }
-            else if free_gb < DISK_FREE_WARN_GB { Severity::Warn }
+        let (warn_floor, crit_floor) = free_space_floor_bytes(d.total_bytes);
+        let sev = if d.available_bytes < crit_floor { Severity::Critical }
+            else if d.available_bytes < warn_floor { Severity::High }
             else { continue; };
+        let warn_floor_gb = warn_floor as f64 / 1_073_741_824.0;
+        let holds = roles.summary(&d.mount_point);
         let scope = ProposalScope {
             node_id: ctx.node_id.clone(),
             resource_id: Some(d.mount_point.clone()),
@@ -355,32 +365,46 @@ fn check_disks(
         let total_gb = d.total_bytes as f64 / 1_073_741_824.0;
         let used_gb = d.used_bytes as f64 / 1_073_741_824.0;
 
+        let mut why = format!(
+            "Only {:.1} GB free of {:.1} GB ({:.1}% used). A disk this \
+             size should keep at least {:.0} GB free; when it fills, \
+             writes fail — databases stop, containers on it crash, logs \
+             and package upgrades break.",
+            free_gb, total_gb, d.usage_percent, warn_floor_gb,
+        );
+        if let Some(h) = &holds {
+            why.push_str(&format!(" This filesystem holds: {}.", h));
+        }
+        let mut evidence = vec![
+        Evidence {
+            label: "Free".into(),
+            value: format!("{:.1} GB", free_gb),
+            detail: Some(format!(
+                "{:.1} GB used / {:.1} GB total ({:.1}%)",
+                used_gb, total_gb, d.usage_percent,
+            )),
+            links: Vec::new(),
+        },
+        Evidence {
+            label: "Filesystem".into(),
+            value: d.fs_type.clone(),
+            detail: Some(d.name.clone()),
+            links: Vec::new(),
+        },
+        ];
+        if let Some(h) = holds {
+            evidence.push(Evidence {
+                label: "Holds".into(),
+                value: h,
+                detail: Some("Filling this filesystem stops what's on it".into()),
+                links: Vec::new(),
+            });
+        }
         out.push(Proposal::new_rule(
             FINDING_HOST_DISK_FREE, sev,
-            format!("{} has {:.1} GB free", d.mount_point, free_gb),
-            format!(
-                "{} has {:.1} GB free of {:.1} GB total ({:.1}% used). \
-                 Below 2 GB free, services that buffer to disk may \
-                 fail unpredictably.",
-                d.mount_point, free_gb, total_gb, d.usage_percent,
-            ),
-            vec![
-                Evidence {
-                    label: "Free".into(),
-                    value: format!("{:.1} GB", free_gb),
-                    detail: Some(format!(
-                        "{:.1} GB used / {:.1} GB total ({:.1}%)",
-                        used_gb, total_gb, d.usage_percent,
-                    )),
-                    links: Vec::new(),
-                },
-                Evidence {
-                    label: "Filesystem".into(),
-                    value: d.fs_type.clone(),
-                    detail: Some(d.name.clone()),
-                    links: Vec::new(),
-                },
-            ],
+            format!("{} has only {:.1} GB left ({:.0}% full)", d.mount_point, free_gb, d.usage_percent),
+            why,
+            evidence,
             RemediationPlan::Manual {
                 instructions: format!(
                     "Find the largest consumers under {} and decide \
@@ -395,6 +419,9 @@ fn check_disks(
                 commands: vec![
                     format!("sudo du -h --max-depth=1 {} 2>/dev/null | sort -h | tail -20", d.mount_point),
                     format!("df -h {}", d.mount_point),
+                    // Space held by deleted-but-still-open files never
+                    // shows up in du — the usual reason du and df disagree.
+                    "sudo lsof -nP +L1 2>/dev/null | head -30".into(),
                 ],
             },
             scope,
@@ -597,14 +624,14 @@ mod tests {
     #[test]
     fn cpu_below_warn_silent() {
         let m = metrics(50.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         assert!(p.iter().all(|x| x.finding_type != FINDING_HOST_CPU));
     }
 
     #[test]
     fn cpu_warn_threshold() {
         let m = metrics(80.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let cpu = p.iter().find(|x| x.finding_type == FINDING_HOST_CPU).expect("cpu");
         assert_eq!(cpu.severity, Severity::Warn);
     }
@@ -612,7 +639,7 @@ mod tests {
     #[test]
     fn cpu_critical_threshold() {
         let m = metrics(95.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let cpu = p.iter().find(|x| x.finding_type == FINDING_HOST_CPU).expect("cpu");
         assert_eq!(cpu.severity, Severity::Critical);
     }
@@ -622,17 +649,54 @@ mod tests {
     #[test]
     fn disk_low_free_critical() {
         let m = metrics(10.0, 10.0, 1.0, 200.0); // 1 GB free
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
         assert_eq!(d.severity, Severity::Critical);
     }
 
     #[test]
-    fn disk_low_free_warn() {
-        let m = metrics(10.0, 10.0, 5.0, 200.0); // 5 GB free
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+    fn disk_low_free_notifies_at_high() {
+        // 200 GB disk: floor 20 GB, critical under 5 GB. 15 GB free is
+        // below the floor → High, which is the lowest notifying tier.
+        let m = metrics(10.0, 10.0, 15.0, 200.0);
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
-        assert_eq!(d.severity, Severity::Warn);
+        assert_eq!(d.severity, Severity::High);
+        assert!(d.title.contains("15.0 GB left"), "title leads with what's left: {}", d.title);
+    }
+
+    /// wolfstack-2, 2026-11-19: 436 GB root with 23 GB free. The old flat
+    /// 10 GB floor said nothing; the scaled floor (43.6 GB) must notify.
+    #[test]
+    fn disk_floor_scales_436gb_root() {
+        let m = metrics(10.0, 10.0, 23.0, 436.0);
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
+        assert_eq!(d.severity, Severity::High);
+        let m = metrics(10.0, 10.0, 9.0, 436.0);
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
+        assert_eq!(d.severity, Severity::Critical);
+    }
+
+    /// A 4 TB disk at 96 % has 160 GB left — above the 100 GB cap, no alert.
+    #[test]
+    fn disk_floor_quiet_on_big_disk_with_room() {
+        let m = metrics(10.0, 10.0, 160.0, 4096.0);
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        assert!(p.iter().all(|x| x.finding_type != FINDING_HOST_DISK_FREE));
+    }
+
+    #[test]
+    fn disk_finding_names_what_the_mount_holds() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("/".to_string(), vec!["LXC containers: iw-db-2".to_string()]);
+        let roles = DiskRoles::from_map(map);
+        let m = metrics(10.0, 10.0, 23.0, 436.0);
+        let p = analyze(&ctx(), &m, &roles, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let d = p.iter().find(|x| x.finding_type == FINDING_HOST_DISK_FREE).expect("disk");
+        assert!(d.why.contains("iw-db-2"), "{}", d.why);
+        assert!(d.evidence.iter().any(|e| e.label == "Holds"));
     }
 
     #[test]
@@ -647,7 +711,7 @@ mod tests {
             available_bytes: 100_000_000,
             usage_percent: 90.0,
         });
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         // /boot never fires from the GENERIC check — the dedicated
         // boot_partition analyzer owns it.
         assert!(p.iter().all(|x|
@@ -671,7 +735,7 @@ mod tests {
             available_bytes: 0,
             usage_percent: 100.0,
         });
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         assert!(p.iter().all(|x|
             x.scope.resource_id.as_deref() != Some("/boot")
         ));
@@ -683,7 +747,7 @@ mod tests {
     fn load_critical_at_2x_cpus() {
         let mut m = metrics(10.0, 10.0, 100.0, 200.0);
         m.load_avg = LoadAverage { one: 9.0, five: 8.0, fifteen: 7.0 }; // 2.25× 4 CPUs
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         let l = p.iter().find(|x| x.finding_type == FINDING_HOST_LOAD).expect("load");
         assert_eq!(l.severity, Severity::Critical);
     }
@@ -703,7 +767,7 @@ mod tests {
             "compile box, expected to peg CPU",
             "paul", None,
         ));
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &acks, &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &acks, &ProposalStore::default());
         assert!(p.iter().all(|x| x.finding_type != FINDING_HOST_CPU),
             "ack must silence the CPU finding");
     }
@@ -716,7 +780,7 @@ mod tests {
             units: vec!["wolfstack.service".to_string(), "broken.timer".to_string()],
             scanned: true,
         };
-        let p = analyze(&ctx(), &m, &units, &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &units, &AckStore::default(), &ProposalStore::default());
         let failed: Vec<_> = p.iter().filter(|x| x.finding_type == FINDING_SYSTEMD_FAILED).collect();
         assert_eq!(failed.len(), 2);
     }
@@ -741,7 +805,7 @@ mod tests {
     #[test]
     fn analyzer_can_stay_quiet() {
         let m = metrics(10.0, 10.0, 100.0, 200.0);
-        let p = analyze(&ctx(), &m, &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
+        let p = analyze(&ctx(), &m, &DiskRoles::default(), &FailedUnitsFacts::default(), &AckStore::default(), &ProposalStore::default());
         assert!(p.is_empty());
     }
     /// A unit the operator has fixed must stop being reported. It drops out of

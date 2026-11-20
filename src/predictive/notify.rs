@@ -26,6 +26,11 @@
 //! - `Critical` and `High` → notify
 //! - `Warn` and `Info` → inbox only (operator pulls when ready)
 //!
+//! A pending finding that ESCALATES to a higher tier than it was last
+//! notified at notifies again (see [`find_alerts_to_dispatch`]), and a
+//! capacity finding that was notified gets a recovery message when it
+//! clears (see [`find_capacity_recoveries`]).
+//!
 //! ## Async-fire-and-forget
 //!
 //! Notification I/O can be slow (Discord webhooks, SMTP). We don't
@@ -35,11 +40,38 @@
 use crate::predictive::Proposal;
 use crate::predictive::proposal::{ProposalScope, Severity};
 
-/// Find proposals that are *new this tick* — present in `current`
-/// (the post-upsert state) at Pending status but absent from
-/// `previous` (the pre-tick snapshot). Only Critical and High are
-/// notification-worthy; anything else is inbox-only.
-pub fn find_first_appearance_alerts<'a>(
+/// Finding types that describe a filesystem running out of space.
+/// They dispatch as [`crate::alerting::AlertCategory::Capacity`] (which
+/// fires under Simple verbosity) instead of `Threshold`, and get a
+/// recovery notification when they clear.
+pub const CAPACITY_FINDINGS: &[&str] = &[
+    crate::predictive::threshold::FINDING_HOST_DISK_FREE,
+    crate::predictive::disk_fill::FINDING_TYPE,
+    "docker_storage_fill_eta",
+    "lxc_storage_fill_eta",
+    crate::predictive::vm_disk::FINDING_TYPE,
+    crate::predictive::boot_partition::FINDING_BOOT_SPACE,
+];
+
+pub fn is_capacity_finding(finding_type: &str) -> bool {
+    CAPACITY_FINDINGS.contains(&finding_type)
+}
+
+/// Proposals to notify about this tick. Two cases, both Pending and
+/// Critical/High only:
+///
+/// 1. **First appearance** — the `(finding_type, scope)` was not
+///    pending in `previous` (the pre-tick snapshot). A refresh of an
+///    already-pending finding does not re-notify.
+/// 2. **Escalation** — already pending and notified, but now at a
+///    higher severity than it was last notified at. Without this a
+///    disk that went "fills in 2 days" (High, notified) → "fills in 40
+///    minutes" (Critical) said nothing new.
+///
+/// The caller must record the dispatched severity back onto each
+/// proposal (`notified_severity`) so the same escalation is not sent
+/// twice.
+pub fn find_alerts_to_dispatch<'a>(
     previous: &[Proposal],
     current: &'a [Proposal],
 ) -> Vec<&'a Proposal> {
@@ -52,7 +84,35 @@ pub fn find_first_appearance_alerts<'a>(
     current.iter()
         .filter(|p| matches!(p.status, crate::predictive::proposal::ProposalStatus::Pending))
         .filter(|p| matches!(p.severity, Severity::Critical | Severity::High))
-        .filter(|p| !prev_pending.contains(&(p.finding_type.as_str(), &p.scope)))
+        .filter(|p| {
+            let first_appearance = !prev_pending.contains(&(p.finding_type.as_str(), &p.scope));
+            // Lower rank = more severe (Critical 0 … Info 3).
+            let escalated = p.notified_severity
+                .is_some_and(|n| p.severity.rank() < n.rank());
+            first_appearance || escalated
+        })
+        .collect()
+}
+
+/// Capacity findings that were pending AND had been notified before
+/// this tick, and that auto-resolved this tick because the condition
+/// cleared. The operator was told the disk was filling; they should be
+/// told when it no longer is.
+pub fn find_capacity_recoveries<'a>(
+    previous: &'a [Proposal],
+    current: &[Proposal],
+) -> Vec<&'a Proposal> {
+    use crate::predictive::proposal::{ApprovalOutcome, ProposalStatus};
+    previous.iter()
+        .filter(|p| matches!(p.status, ProposalStatus::Pending))
+        .filter(|p| p.notified_severity.is_some())
+        .filter(|p| is_capacity_finding(&p.finding_type))
+        .filter(|prev| current.iter().any(|c|
+            c.id == prev.id
+                && matches!(c.status, ProposalStatus::Approved {
+                    outcome: ApprovalOutcome::ConditionCleared, ..
+                })
+        ))
         .collect()
 }
 
@@ -88,12 +148,53 @@ pub fn dispatch_alerts(proposals: Vec<Proposal>) {
             // the Predictive Inbox; Simple mode suppresses the push for those.
             let category = if p.finding_type.starts_with("compromise_indicator:") {
                 crate::alerting::AlertCategory::Compromise
+            } else if is_capacity_finding(&p.finding_type) {
+                // Disk running out: fires under Simple verbosity, and a
+                // Critical one (hours left) also beats quiet hours.
+                crate::alerting::AlertCategory::Capacity {
+                    urgent: p.severity == Severity::Critical,
+                }
             } else {
                 crate::alerting::AlertCategory::Threshold
             };
             crate::alerting::send_local_alert(category, &title, &message).await;
         });
     }
+}
+
+/// Tell the operator a capacity finding they were notified about has
+/// cleared. `current_state` is a one-line "now: 310 GB free of 436 GB"
+/// for the finding's resource when the caller has it.
+pub fn dispatch_recoveries(recoveries: Vec<(Proposal, Option<String>)>) {
+    if recoveries.is_empty() { return; }
+    let cfg = crate::alerting::AlertConfig::load();
+    if !cfg.enabled || !cfg.has_delivery() || !cfg.recovery_notifications {
+        return;
+    }
+    for (p, current_state) in recoveries {
+        tokio::spawn(async move {
+            let (title, message) = format_recovery(&p, current_state.as_deref());
+            crate::alerting::send_local_alert(
+                crate::alerting::AlertCategory::Capacity { urgent: false },
+                &title, &message,
+            ).await;
+        });
+    }
+}
+
+fn format_recovery(p: &Proposal, current_state: Option<&str>) -> (String, String) {
+    let resource = p.scope.resource_id.as_deref().unwrap_or("resource");
+    let what = if p.finding_type == crate::predictive::threshold::FINDING_HOST_DISK_FREE {
+        format!("{} is back above its free-space floor", resource)
+    } else {
+        format!("{} is no longer on course to fill", resource)
+    };
+    let title = format!("✅ RECOVERED — {}", what);
+    let mut message = format!("Earlier alert: {}", p.title);
+    if let Some(now) = current_state {
+        message.push_str(&format!("\n\nNow: {}", now));
+    }
+    (title, message)
 }
 
 fn format_for_channel(p: &Proposal) -> (String, String) {
@@ -103,7 +204,14 @@ fn format_for_channel(p: &Proposal) -> (String, String) {
         Severity::Warn     => "🟡 WARN",
         Severity::Info     => "ℹ INFO",
     };
-    let title = format!("{} — {}", sev_marker, p.title);
+    // An escalation re-notifies the same finding — say so, or the
+    // operator reads it as a duplicate of the earlier message.
+    let escalated = p.notified_severity.is_some_and(|n| p.severity.rank() < n.rank());
+    let title = if escalated {
+        format!("{} (WORSE) — {}", sev_marker, p.title)
+    } else {
+        format!("{} — {}", sev_marker, p.title)
+    };
 
     // Trim the why-text to a sensible length for chat embeds.
     let why_short = if p.why.len() > 480 {
@@ -157,7 +265,7 @@ mod tests {
     fn first_appearance_critical_returns_proposal() {
         let prev = vec![];
         let curr = vec![p("disk_fill_eta", Severity::Critical, ProposalStatus::Pending)];
-        let alerts = find_first_appearance_alerts(&prev, &curr);
+        let alerts = find_alerts_to_dispatch(&prev, &curr);
         assert_eq!(alerts.len(), 1);
     }
 
@@ -170,7 +278,7 @@ mod tests {
         // helper produces fresh proposals each call with different
         // ids — but identical scope. The set lookup matches on
         // (str, &ProposalScope), so this works.
-        let alerts = find_first_appearance_alerts(&prev, &curr);
+        let alerts = find_alerts_to_dispatch(&prev, &curr);
         assert_eq!(alerts.len(), 0,
             "a still-pending finding must not re-notify on every tick");
     }
@@ -182,7 +290,7 @@ mod tests {
             p("disk_fill_eta", Severity::Warn, ProposalStatus::Pending),
             p("disk_fill_eta", Severity::Info, ProposalStatus::Pending),
         ];
-        let alerts = find_first_appearance_alerts(&prev, &curr);
+        let alerts = find_alerts_to_dispatch(&prev, &curr);
         assert_eq!(alerts.len(), 0,
             "Warn/Info findings stay in the inbox, never page the operator");
     }
@@ -195,8 +303,63 @@ mod tests {
                 reason: "false positive".into(),
                 dismissed_at: chrono::Utc::now(),
             })];
-        let alerts = find_first_appearance_alerts(&prev, &curr);
+        let alerts = find_alerts_to_dispatch(&prev, &curr);
         assert_eq!(alerts.len(), 0);
+    }
+
+    #[test]
+    fn escalation_re_alerts_once() {
+        // Notified at High last tick; now Critical → notify again.
+        let mut prev_p = p("disk_fill_eta", Severity::High, ProposalStatus::Pending);
+        prev_p.notified_severity = Some(Severity::High);
+        let mut cur = prev_p.clone();
+        cur.severity = Severity::Critical;
+        let prev = vec![prev_p];
+        let curr = vec![cur.clone()];
+        assert_eq!(find_alerts_to_dispatch(&prev, &curr).len(), 1);
+
+        // After dispatch the caller records Critical; staying Critical
+        // (or dropping back to High) must not re-notify.
+        cur.notified_severity = Some(Severity::Critical);
+        let curr = vec![cur.clone()];
+        assert_eq!(find_alerts_to_dispatch(&curr, &curr).len(), 0);
+        cur.severity = Severity::High;
+        let curr2 = vec![cur];
+        assert_eq!(find_alerts_to_dispatch(&curr, &curr2).len(), 0);
+    }
+
+    #[test]
+    fn legacy_pending_without_marker_does_not_page_on_upgrade() {
+        // Persisted before notified_severity existed: still pending,
+        // marker None. An upgrade must not page the whole backlog.
+        let x = p("disk_fill_eta", Severity::Critical, ProposalStatus::Pending);
+        let prev = vec![x.clone()];
+        let curr = vec![x];
+        assert_eq!(find_alerts_to_dispatch(&prev, &curr).len(), 0);
+    }
+
+    #[test]
+    fn capacity_recovery_only_for_notified_and_cleared() {
+        let mut was = p("host_disk_low_free", Severity::High, ProposalStatus::Pending);
+        was.notified_severity = Some(Severity::High);
+        let mut now = was.clone();
+        now.status = ProposalStatus::Approved {
+            applied_at: chrono::Utc::now(),
+            outcome: ApprovalOutcome::ConditionCleared,
+        };
+        assert_eq!(find_capacity_recoveries(&[was.clone()], &[now.clone()]).len(), 1);
+
+        // Never notified (e.g. no delivery configured at the time): silent.
+        let mut quiet = was.clone();
+        quiet.notified_severity = None;
+        assert_eq!(find_capacity_recoveries(&[quiet], &[now.clone()]).len(), 0);
+
+        // Not a capacity finding: silent.
+        let mut cpu = was.clone();
+        cpu.finding_type = "host_cpu_high".into();
+        let mut cpu_now = now.clone();
+        cpu_now.finding_type = "host_cpu_high".into();
+        assert_eq!(find_capacity_recoveries(&[cpu], &[cpu_now]).len(), 0);
     }
 
     #[test]
@@ -209,7 +372,7 @@ mod tests {
                 applied_at: chrono::Utc::now(),
                 outcome: ApprovalOutcome::ConditionCleared,
             })];
-        let alerts = find_first_appearance_alerts(&prev, &curr);
+        let alerts = find_alerts_to_dispatch(&prev, &curr);
         assert_eq!(alerts.len(), 0);
     }
 }

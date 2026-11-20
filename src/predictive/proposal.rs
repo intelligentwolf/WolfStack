@@ -189,6 +189,15 @@ pub struct Proposal {
     /// this field existed (KO4BSR/Gary 2026-06-29).
     #[serde(default)]
     pub last_checked_at: Option<DateTime<Utc>>,
+    /// Highest severity the operator has been notified at for the
+    /// current pending episode. Lets a finding that ESCALATES (High →
+    /// Critical: "fills in 2 days" → "fills in 3 hours") notify again,
+    /// while a finding that wobbles back down and up does not re-page.
+    /// `None` on proposals persisted before this field existed and on
+    /// ones never dispatched; such a proposal only notifies on its next
+    /// first appearance, exactly as before.
+    #[serde(default)]
+    pub notified_severity: Option<Severity>,
 }
 
 impl Proposal {
@@ -218,6 +227,7 @@ impl Proposal {
             created_at: now,
             updated_at: now,
             last_checked_at: Some(now),
+            notified_severity: None,
         }
     }
 

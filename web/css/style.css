@@ -4506,6 +4506,16 @@ body.sidebar-collapsed #task-log-footer {
     background: color-mix(in srgb, var(--danger) 60%, #000);
     color: #fff;
 }
+/* Solid amber bar for fixed banners that must stay readable over page
+   content (disk alarm at High). #111 on --warning ≥ 5.9:1 on every theme
+   (see the note above). Links/buttons inherit the bar's text colour so
+   they meet the same contrast. */
+.ws-banner-warning-solid {
+    background: var(--warning);
+    color: #111;
+}
+.ws-banner-warning-solid a, .ws-banner-warning-solid button { color: #111; }
+.ws-banner-critical a, .ws-banner-critical button { color: #fff; }
 #update-banner {
     background: linear-gradient(180deg, color-mix(in srgb, var(--warning) 85%, #fff), var(--warning));
     border: 1px solid color-mix(in srgb, var(--warning) 70%, #000);

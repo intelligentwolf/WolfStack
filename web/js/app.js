@@ -22852,7 +22852,7 @@ async function renderAlertsOverview() {
             <div class="card"><div class="card-body" style="padding:14px;">
                 <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Verbosity</div>
                 <div style="font-size:14px; font-weight:600; text-transform:capitalize;">${escapeHtml(verbosity)}</div>
-                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">${verbosity === 'simple' ? 'Only compromise alerts fire' : 'All categories fire'}</div>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">${verbosity === 'simple' ? 'Compromise and disk-full alerts fire' : 'All categories fire'}</div>
             </div></div>
             <div class="card"><div class="card-body" style="padding:14px;">
                 <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Schedule</div>
@@ -23034,7 +23034,8 @@ async function renderAlertsSchedule() {
                 </div>
                 <div>
                     <label style="display:block; font-size:11px; color:var(--text-muted); margin-bottom:6px;">Suppress categories</label>
-                    <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-threshold" ${supprChecked('threshold')}> Threshold (CPU/mem/disk)</label>
+                    <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-threshold" ${supprChecked('threshold')}> Threshold (CPU/memory)</label>
+                    <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-capacity" ${supprChecked('capacity')}> Disk space warnings <span style="color:var(--text-muted);">(a disk that fills within hours always gets through)</span></label>
                     <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-lifecycle" ${supprChecked('lifecycle')}> Lifecycle (offline/restored/reboot)</label>
                     <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-posture" ${supprChecked('posture')}> Posture (config findings)</label>
                     <label style="display:block; font-size:12px;"><input type="checkbox" id="sched-supp-bruteforce" ${supprChecked('brute_force')}> Brute-force (failed-auth chatter)</label>
@@ -23117,6 +23118,7 @@ async function saveAlertsSchedule() {
     });
     const suppressCats = [];
     if (document.getElementById('sched-supp-threshold').checked) suppressCats.push('threshold');
+    if (document.getElementById('sched-supp-capacity').checked) suppressCats.push('capacity');
     if (document.getElementById('sched-supp-lifecycle').checked) suppressCats.push('lifecycle');
     if (document.getElementById('sched-supp-posture').checked) suppressCats.push('posture');
     if (document.getElementById('sched-supp-bruteforce').checked) suppressCats.push('brute_force');
@@ -57158,6 +57160,47 @@ async function testAlerting() {
     }
 }
 
+// Copy this node's alert settings to every other node in its cluster.
+// Alert settings are per node and never propagated, which is how
+// wolfstack-1/2/3 all ended up with alerting off when a disk filled
+// (2026-11-19). Saves first — the backend copies the SAVED config.
+async function copyAlertingToCluster() {
+    const out = document.getElementById('alerting-copy-result');
+    if (!(await saveAlertingConfig(true))) return;
+    if (!(await showDangerConfirm({
+        title: 'Copy alert settings to every node in this cluster?',
+        danger: 'Every other node in this cluster gets this node\u2019s alert settings: channels, delivery paths, verbosity, quiet hours and rules. Their current alert settings are replaced.',
+        detail: 'Alert email (SMTP) is copied too when it is switched on here. Inbound bots (Discord bot, Telegram receiver, WhatsApp) stay as each node has them.',
+        countdown: 2,
+        confirmLabel: 'Copy to every node',
+    }))) return;
+    if (out) { out.setAttribute('role', 'status'); out.textContent = 'Copying\u2026'; }
+    try {
+        const resp = await fetch('/api/alerts/config/copy-to-cluster', { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        const results = data.results || [];
+        const failed = results.filter(r => !r.ok);
+        if (results.length === 0) {
+            if (out) out.textContent = 'No other nodes in cluster \u201c' + (data.cluster || '') + '\u201d \u2014 nothing to copy to.';
+            return;
+        }
+        const lines = results.map(r => (r.ok ? '\u2705 ' : '\u274c ') + r.hostname + (r.ok ? '' : ' \u2014 ' + (r.error || 'failed')));
+        const head = failed.length === 0
+            ? 'Copied to all ' + results.length + ' node(s)' + (data.email_copied ? ', including alert email.' : '. Alert email is off here, so each node keeps its own email setting.')
+            : 'Copied to ' + (results.length - failed.length) + ' of ' + results.length + ' node(s). Not updated:';
+        if (out) {
+            // Failures must stay readable and copyable, so they go in an
+            // alert region that never auto-dismisses.
+            out.setAttribute('role', failed.length ? 'alert' : 'status');
+            out.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">' + escapeHtml(head) + '</div>'
+                + lines.map(l => '<div>' + escapeHtml(l) + '</div>').join('');
+        }
+    } catch (e) {
+        if (out) { out.setAttribute('role', 'alert'); out.textContent = 'Copy failed: ' + e.message; }
+    }
+}
+
 // Disconnect the ntfy channel. Topic/token are write-only (masked
 // server-side), so "clear the input and save" can't distinguish
 // "keep" from "remove" — this sends the explicit ntfy_clear flag
@@ -81308,6 +81351,222 @@ function predictiveBadgeUpdate() {
     }
 }
 
+// ─── Disk alarm: the browser has to SHOUT ─────────────────────────
+//
+// wolfstack-2's root disk filled on 2026-11-19 while the warning sat in
+// the Predictive Inbox behind a small badge. A disk about to fill now
+// takes over the top of every page, on whichever node the operator is
+// looking at, for the whole cluster:
+//   * fixed banner on every view (red = Critical, amber = High),
+//   * the tab title flashes while anything is Critical, so a background
+//     tab still shows it,
+//   * a desktop notification + three short beeps for each NEW finding or
+//     escalation (desktop notifications need one click to allow — the
+//     banner offers it),
+//   * a quieter amber line when nodes have no alert delivery set up, so
+//     "nobody would be emailed" is visible too.
+// Dismissing hides the banner until something NEW appears or a finding
+// gets worse; it never silences a later escalation.
+//
+// Fed by the 60 s cluster-inbox poll above — no extra requests.
+
+// Must match predictive::notify::CAPACITY_FINDINGS.
+const DISK_ALARM_FINDINGS = new Set([
+    'host_disk_low_free', 'disk_fill_eta', 'docker_storage_fill_eta',
+    'lxc_storage_fill_eta', 'vm_disk_fill', 'boot_partition_low_space',
+]);
+const DISK_ALARM_SEEN_KEY = 'wsDiskAlarmSeen';        // per-browser: what we already beeped/notified for
+const DISK_ALARM_DISMISS_KEY = 'wsDiskAlarmDismissed'; // per-tab: what the operator dismissed
+const NO_DELIVERY_DISMISS_KEY = 'wsNoDeliveryDismissedUntil';
+const NO_DELIVERY_SNOOZE_MS = 24 * 60 * 60 * 1000;
+let _diskAlarmTitleTimer = null;
+let _diskAlarmBaseTitle = '';
+
+function _diskAlarmStoreGet(store, key) {
+    try { return JSON.parse(store.getItem(key) || '[]'); } catch (_) { return []; }
+}
+function _diskAlarmStoreSet(store, key, val) {
+    try { store.setItem(key, JSON.stringify(val)); } catch (_) { /* private mode — banner still works */ }
+}
+
+function _diskAlarmHost(nodeId) {
+    const n = (predictiveState.nodes || []).find(x => x.node_id === nodeId);
+    return (n && n.hostname) ? n.hostname : nodeId;
+}
+
+function ensureDiskAlarmBanner() {
+    let b = document.getElementById('disk-alarm-banner');
+    if (b) return b;
+    b = document.createElement('div');
+    b.id = 'disk-alarm-banner';
+    b.setAttribute('role', 'alert');
+    b.setAttribute('aria-live', 'assertive');
+    b.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483643;display:none;'
+        + 'padding:10px 48px 10px 16px;font-size:14px;line-height:1.5;'
+        + 'box-shadow:0 2px 14px rgba(0,0,0,0.45);';
+    document.body.appendChild(b);
+    return b;
+}
+
+function _diskAlarmBeep() {
+    try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        const ctx = new Ctx();
+        // Browsers keep audio suspended until the page has had a click;
+        // resume() then fails quietly and the banner + title still shout.
+        if (ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(() => {});
+        [0, 0.35, 0.7].forEach(t => {
+            const o = ctx.createOscillator();
+            const g = ctx.createGain();
+            o.type = 'square';
+            o.frequency.value = 880;
+            g.gain.value = 0.08;
+            o.connect(g); g.connect(ctx.destination);
+            o.start(ctx.currentTime + t);
+            o.stop(ctx.currentTime + t + 0.2);
+        });
+        setTimeout(() => { try { ctx.close(); } catch (_) {} }, 1500);
+    } catch (_) { /* no audio — the banner is the alarm */ }
+}
+
+function _diskAlarmTitleFlash(on, text) {
+    if (!on) {
+        if (_diskAlarmTitleTimer) {
+            clearInterval(_diskAlarmTitleTimer);
+            _diskAlarmTitleTimer = null;
+            document.title = _diskAlarmBaseTitle;
+        }
+        return;
+    }
+    if (_diskAlarmTitleTimer) return;
+    // Captured when flashing starts, so a title the app set since the
+    // last alarm is what gets restored.
+    _diskAlarmBaseTitle = document.title;
+    let flip = false;
+    _diskAlarmTitleTimer = setInterval(() => {
+        flip = !flip;
+        document.title = flip ? text : _diskAlarmBaseTitle;
+    }, 1000);
+}
+
+// Only touch the live region when the text actually changed: re-setting
+// identical HTML every poll makes screen readers re-announce it each minute.
+function _diskAlarmSetHtml(b, html) {
+    if (b.dataset.html !== html) {
+        b.dataset.html = html;
+        b.innerHTML = html;
+    }
+}
+
+function diskAlarmEnableDesktop() {
+    if (!('Notification' in window)) return;
+    Notification.requestPermission().then(() => diskAlarmUpdate()).catch(() => {});
+}
+
+function diskAlarmDismiss() {
+    const b = document.getElementById('disk-alarm-banner');
+    const keys = (b && b.dataset.keys) ? b.dataset.keys.split('|') : [];
+    _diskAlarmStoreSet(sessionStorage, DISK_ALARM_DISMISS_KEY, keys);
+    // The disk banner repeats the "can't send alerts" line, so dismissing
+    // it counts as having seen that too — otherwise × would just swap in
+    // the amber no-delivery banner and look like it did nothing.
+    if (b && (b.dataset.mode === 'nodelivery' || b.dataset.nd === '1')) {
+        try { localStorage.setItem(NO_DELIVERY_DISMISS_KEY, String(Date.now() + NO_DELIVERY_SNOOZE_MS)); } catch (_) {}
+    }
+    diskAlarmUpdate();
+}
+
+function diskAlarmOpenInbox() {
+    selectView('inbox');
+}
+
+function diskAlarmUpdate() {
+    const all = (predictiveState.proposals || []).filter(p => p.status && p.status.kind === 'pending');
+    const alarms = all
+        .filter(p => DISK_ALARM_FINDINGS.has(p.finding_type)
+            && (p.severity === 'critical' || p.severity === 'high'))
+        .sort((a, b) => (a.severity === b.severity ? 0 : (a.severity === 'critical' ? -1 : 1)));
+    const noDelivery = all.filter(p => p.finding_type === 'alert_delivery_missing');
+    // A key changes when a finding escalates, so a dismissal never
+    // swallows "it got worse".
+    const keys = alarms.map(p => p.id + ':' + p.severity);
+    const b = ensureDiskAlarmBanner();
+
+    // New since last seen in this browser → desktop notification + beep.
+    const seen = new Set(_diskAlarmStoreGet(localStorage, DISK_ALARM_SEEN_KEY));
+    const fresh = alarms.filter(p => !seen.has(p.id + ':' + p.severity));
+    if (fresh.length > 0) {
+        _diskAlarmBeep();
+        if ('Notification' in window && Notification.permission === 'granted') {
+            fresh.forEach(p => {
+                try {
+                    new Notification((p.severity === 'critical' ? '🔴 ' : '🟠 ') + 'Disk: ' + _diskAlarmHost(p.scope.node_id), {
+                        body: p.title,
+                        tag: 'wolfstack-disk-' + p.id,
+                        requireInteraction: p.severity === 'critical',
+                    });
+                } catch (_) { /* some browsers forbid page-level Notification */ }
+            });
+        }
+    }
+    // Remember only what is still active, so a finding that clears and
+    // later returns alarms again.
+    _diskAlarmStoreSet(localStorage, DISK_ALARM_SEEN_KEY, keys);
+
+    const dismissed = new Set(_diskAlarmStoreGet(sessionStorage, DISK_ALARM_DISMISS_KEY));
+    const showAlarm = alarms.length > 0 && keys.some(k => !dismissed.has(k));
+    const anyCritical = alarms.some(p => p.severity === 'critical');
+    _diskAlarmTitleFlash(anyCritical && showAlarm, '🔴 DISK FILLING — WolfStack');
+
+    // Sit below the cluster-block banner when both are up.
+    const cnb = document.getElementById('cluster-block-banner');
+    b.style.top = (cnb && cnb.style.display !== 'none') ? (cnb.offsetHeight + 'px') : '0';
+
+    const desktopBtn = ('Notification' in window && Notification.permission === 'default')
+        ? ' <button type="button" onclick="diskAlarmEnableDesktop()" style="margin-left:10px;background:transparent;border:1px solid currentColor;border-radius:6px;padding:2px 8px;cursor:pointer;font:inherit;font-size:12px;">Enable desktop alerts</button>'
+        : '';
+    const closeBtn = '<button type="button" onclick="diskAlarmDismiss()" aria-label="Dismiss until something new or worse happens" '
+        + 'style="position:absolute;right:10px;top:8px;background:transparent;border:none;font-size:20px;cursor:pointer;line-height:1;">×</button>';
+
+    if (showAlarm) {
+        b.className = anyCritical ? 'ws-banner-critical' : 'ws-banner-warning-solid';
+        b.dataset.mode = 'disk';
+        b.dataset.keys = keys.join('|');
+        b.dataset.nd = noDelivery.length > 0 ? '1' : '';
+        const shown = alarms.slice(0, 3).map(p =>
+            '<div><strong>' + (p.severity === 'critical' ? '🔴 CRITICAL' : '🟠 WARNING')
+            + ' — ' + escapeHtml(_diskAlarmHost(p.scope.node_id)) + ':</strong> ' + escapeHtml(p.title) + '</div>');
+        const more = alarms.length > 3 ? '<div>+' + (alarms.length - 3) + ' more disk alert(s)</div>' : '';
+        const nd = noDelivery.length > 0
+            ? '<div style="margin-top:2px;">⚠ ' + noDelivery.length + ' node(s) can’t send alerts — nobody is being emailed about this.</div>'
+            : '';
+        _diskAlarmSetHtml(b, '<div style="font-weight:700;letter-spacing:0.02em;">DISK SPACE</div>' + shown.join('') + more + nd
+            + '<div style="margin-top:4px;"><a href="#" onclick="diskAlarmOpenInbox();return false;" style="text-decoration:underline;font-weight:600;">Open Predictive Inbox</a>'
+            + desktopBtn + '</div>' + closeBtn);
+        b.style.display = 'block';
+        return;
+    }
+
+    let ndSnoozedUntil = 0;
+    try { ndSnoozedUntil = parseInt(localStorage.getItem(NO_DELIVERY_DISMISS_KEY) || '0', 10) || 0; } catch (_) {}
+    if (noDelivery.length > 0 && Date.now() > ndSnoozedUntil) {
+        const hosts = [...new Set(noDelivery.map(p => _diskAlarmHost(p.scope.node_id)))];
+        const list = hosts.slice(0, 4).map(escapeHtml).join(', ') + (hosts.length > 4 ? ' +' + (hosts.length - 4) + ' more' : '');
+        b.className = 'ws-banner-warning-solid';
+        b.dataset.mode = 'nodelivery';
+        b.dataset.keys = '';
+        b.dataset.nd = '1';
+        _diskAlarmSetHtml(b, '<strong>⚠ Alerts reach nobody from:</strong> ' + list
+            + ' — disk-full and compromise warnings only show here. '
+            + '<a href="#" onclick="selectView(\'settings\');setTimeout(function(){switchSettingsTab(\'alerts\');switchAlertsSub(\'notifications\');},50);return false;" style="text-decoration:underline;font-weight:600;">Set up notifications</a>'
+            + closeBtn);
+        b.style.display = 'block';
+        return;
+    }
+    b.style.display = 'none';
+}
+
 // Background poll so the badge updates even when the user isn't on
 // the Inbox page. Keep cadence slow — 60s — so we don't burn the
 // orchestrator's read locks. The orchestrator itself runs the
@@ -81338,6 +81597,7 @@ function predictiveStartBadgePoll() {
                 }
                 predictiveState.nodes = body.nodes || [];
                 predictiveBadgeUpdate();
+                diskAlarmUpdate();
             }
         } catch (_) { /* network blips are silent — the next tick retries */ }
     };

@@ -6967,7 +6967,7 @@
                                             value="simple" checked style="margin-top:3px;width:16px;height:16px;cursor:pointer;">
                                         <span>
                                             <strong style="display:block;">Simple <span style="color:var(--text-muted);font-weight:400;">(recommended)</span></strong>
-                                            <span style="color:var(--text-muted);">Only push when something looks like a real compromise: crypto miner running, suspicious binary in /tmp or /dev/shm, outbound scan from this host. Internet-background noise (failed SSH logins, "we blocked another IP", threshold breaches, config recommendations) is suppressed — visible on the dashboard, no email/Discord/Slack/Telegram/ntfy push.</span>
+                                            <span style="color:var(--text-muted);">Only push when something looks like a real compromise (crypto miner running, suspicious binary in /tmp or /dev/shm, outbound scan from this host) or a disk is running out of space. Internet-background noise (failed SSH logins, "we blocked another IP", threshold breaches, config recommendations) is suppressed — visible on the dashboard, no email/Discord/Slack/Telegram/ntfy push.</span>
                                         </span>
                                     </label>
                                     <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;">
@@ -7019,7 +7019,9 @@
                         <div style="margin-top:20px;display:flex;gap:12px;">
                             <button class="btn btn-primary" onclick="saveAlertingConfig()"><span class="ws-icon-clean-wrap" data-icon="save"></span> Save Settings</button>
                             <button class="btn btn-sm" onclick="testAlerting()"><span class="ws-icon-clean-wrap" data-icon="lab"></span> Send Test Alert</button>
+                            <button class="btn btn-sm" onclick="copyAlertingToCluster()" title="Alert settings are per node — copy these to every other node in this cluster"><span class="ws-icon-clean-wrap" data-icon="upload"></span> Copy to every node in this cluster</button>
                         </div>
+                        <div id="alerting-copy-result" role="status" aria-live="polite" style="margin-top:10px;font-size:13px;line-height:1.6;"></div>
                     </div>
 
                     <!-- ─── Docker Updates Tab (v23.12.20) ─── -->
