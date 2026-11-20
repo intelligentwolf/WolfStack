@@ -295,6 +295,39 @@ pub fn vanished_scopes(
         .collect()
 }
 
+/// Pending findings whose resource is missing from a positive *existence*
+/// listing — the companion to [`vanished_scopes`] for analyzers whose covered
+/// set is narrower than "everything that exists". The container disk analyzer
+/// only covers RUNNING containers and the host disk analyzer only covers what
+/// `df` returned, so "not covered" can't mean "gone" for them: a stopped
+/// container, or a tick where `df` failed, would retire live findings. Instead
+/// the caller supplies `existing` — the resource_ids that are present on this
+/// node — from a listing that is independent of the analyzer's sampler and is
+/// `None` whenever that listing could not be completed. `None` retires nothing;
+/// the [`ORPHAN_FUSE_DAYS`] fuse stays the answer for those ticks.
+///
+/// Findings covered this tick are left alone (they re-emit or auto-resolve on
+/// their own), as are findings owned by other nodes and any whose scope has no
+/// resource_id.
+pub fn gone_scopes(
+    finding_types: &[&str],
+    existing: Option<&std::collections::HashSet<String>>,
+    covered: &[(String, ProposalScope)],
+    store: &ProposalStore,
+    node_id: &str,
+) -> Vec<(String, ProposalScope)> {
+    let Some(existing) = existing else { return Vec::new(); };
+    store.proposals.iter()
+        .filter(|p| matches!(p.status, ProposalStatus::Pending))
+        .filter(|p| p.scope.node_id == node_id)
+        .filter(|p| finding_types.contains(&p.finding_type.as_str()))
+        .filter(|p| p.scope.resource_id.as_ref().is_some_and(|r| !existing.contains(r)))
+        .filter(|p| !covered.iter()
+            .any(|(ft, sc)| ft == &p.finding_type && sc == &p.scope))
+        .map(|p| (p.finding_type.clone(), p.scope.clone()))
+        .collect()
+}
+
 /// File location for the proposal store. Top-level fn so tests can
 /// inject a temp path via the env var.
 pub fn proposals_file() -> PathBuf {
@@ -1207,6 +1240,76 @@ mod tests {
         // normal auto-resolve path owns it.
         let l = store.proposals.iter().find(|p| p.scope == live).unwrap();
         assert!(matches!(l.status, ProposalStatus::Pending));
+    }
+
+    #[test]
+    fn gone_scopes_retires_only_resources_missing_from_the_existence_list() {
+        // Deleted LXC container `opensimsocial`, a STOPPED container `web`
+        // (exists, not covered because the disk analyzer only samples running
+        // containers), and a running covered one `db`.
+        let mut store = ProposalStore::default();
+        let gone = scope("n", Some("lxc:opensimsocial"));
+        let stopped = scope("n", Some("lxc:web"));
+        let live = scope("n", Some("lxc:db"));
+        let foreign = scope("other", Some("lxc:ghost"));
+        for s in [&gone, &stopped, &live, &foreign] {
+            store.upsert(fake_proposal("lxc_storage_fill_eta", Severity::Critical, s.clone()));
+        }
+        let existing: std::collections::HashSet<String> =
+            ["lxc:web", "lxc:db"].iter().map(|s| s.to_string()).collect();
+        let covered = vec![("lxc_storage_fill_eta".to_string(), live.clone())];
+
+        let g = gone_scopes(&["lxc_storage_fill_eta"], Some(&existing), &covered, &store, "n");
+        assert_eq!(g, vec![("lxc_storage_fill_eta".to_string(), gone.clone())],
+            "only the deleted container goes — a stopped one still exists, and \
+             another node's finding is not ours to judge");
+    }
+
+    #[test]
+    fn gone_scopes_without_a_listing_retires_nothing() {
+        // The existence listing failed (pct list errored, a storage path was
+        // unreadable, /proc/self/mounts unreadable): nothing may be retired.
+        let mut store = ProposalStore::default();
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Critical,
+            scope("n", Some("/root/rootpeek"))));
+        assert!(gone_scopes(&["disk_fill_eta"], None, &[], &store, "n").is_empty());
+    }
+
+    #[test]
+    fn gone_scopes_ignores_other_finding_types_and_non_pending() {
+        let mut store = ProposalStore::default();
+        let s = scope("n", Some("/mnt/gone"));
+        store.upsert(fake_proposal("disk_fill_eta", Severity::Critical, s.clone()));
+        store.upsert(fake_proposal("something_else", Severity::Critical, s.clone()));
+        let id = store.proposals[0].id.clone();
+        store.dismiss(&id, "operator call").unwrap();
+        let empty = std::collections::HashSet::new();
+        assert!(gone_scopes(&["disk_fill_eta"], Some(&empty), &[], &store, "n").is_empty(),
+            "a dismissed finding is an operator decision and the other type isn't asked about");
+    }
+
+    #[test]
+    fn unmounted_filesystem_retires_both_disk_findings() {
+        // wolfstack-2, 2026-11-19: a temporary bind of / at /root/rootpeek
+        // raised the point-in-time `host_disk_low_free` Critical, then was
+        // unmounted. Only `disk_fill_eta` was mount-retirable, so the threshold
+        // finding stayed pending (and kept alerting) until the orphan fuse.
+        let mut store = ProposalStore::default();
+        let gone = scope("n", Some("/root/rootpeek"));
+        let root = scope("n", Some("/"));
+        for ft in crate::predictive::disk_fill::MOUNT_RETIRABLE {
+            store.upsert(fake_proposal(ft, Severity::Critical, gone.clone()));
+            store.upsert(fake_proposal(ft, Severity::Critical, root.clone()));
+        }
+        let mounted: std::collections::HashSet<String> =
+            ["/".to_string()].into_iter().collect();
+        let mut g = gone_scopes(crate::predictive::disk_fill::MOUNT_RETIRABLE,
+            Some(&mounted), &[], &store, "n");
+        g.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(g, vec![
+            ("disk_fill_eta".to_string(), gone.clone()),
+            ("host_disk_low_free".to_string(), gone.clone()),
+        ], "both findings on the removed mount retire; the still-mounted / stays");
     }
 
     #[test]

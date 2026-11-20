@@ -190,6 +190,14 @@ pub async fn tick(
             mon.lock().ok().map(|mut m| m.collect())
         }).await.ok().flatten()
     };
+    // Existence listings for retiring findings whose container or mount has
+    // been removed (step 5c). Taken after the samplers, so anything a sampler
+    // saw is already in the listing unless it was destroyed in between — in
+    // which case it really is gone.
+    let (presence, mounted) = tokio::join!(
+        container_disk::container_presence_now_async(CONTAINER_SAMPLE_TIMEOUT),
+        disk_fill::mounted_targets_now(),
+    );
     let no_vuln_data = vuln_facts.host_updates.is_empty()
         && vuln_facts.lxc_results.iter().all(|r| r.updates.is_empty() && r.error.is_some());
     let no_osv_data = osv_facts.findings.is_empty()
@@ -490,6 +498,22 @@ pub async fn tick(
         v.extend(vanished_scopes(
             &[threshold::FINDING_SYSTEMD_FAILED],
             failed_units.scanned, &covered, &proposals_snap, &ctx.node_id,
+        ));
+        // Destroyed containers and unmounted filesystems. These analyzers only
+        // cover running containers / what `df` returned, so "not covered" can't
+        // mean gone; a separate existence listing has to prove it.
+        use crate::predictive::proposal::gone_scopes;
+        v.extend(gone_scopes(
+            container_disk::PRESENCE_RETIRABLE_DOCKER,
+            presence.docker.as_ref(), &covered, &proposals_snap, &ctx.node_id,
+        ));
+        v.extend(gone_scopes(
+            container_disk::PRESENCE_RETIRABLE_LXC,
+            presence.lxc.as_ref(), &covered, &proposals_snap, &ctx.node_id,
+        ));
+        v.extend(gone_scopes(
+            disk_fill::MOUNT_RETIRABLE,
+            mounted.as_ref(), &covered, &proposals_snap, &ctx.node_id,
         ));
         v.retain(|key| !emitted.contains(key));
         v

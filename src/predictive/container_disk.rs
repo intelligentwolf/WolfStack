@@ -148,6 +148,112 @@ pub async fn sample_containers_now_async(timeout: Duration) -> Vec<ContainerDisk
     }
 }
 
+/// Every container that exists on this node in ANY state, as
+/// [`resource_id`]s, per runtime. `None` for a runtime means the listing could
+/// not be completed, which is not the same as "no containers". Feeds
+/// [`crate::predictive::proposal::gone_scopes`] so a finding for a destroyed
+/// container is retired on the next tick instead of after the orphan fuse.
+///
+/// Deliberately NOT derived from `lxc_list_all_cached` / `docker_list_all_cached`:
+/// those return an empty Vec on failure (and cache it), so they can't prove
+/// absence. Each branch below lists the same containers under the same names
+/// as those functions, but reports whether the listing succeeded.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ContainerPresence {
+    pub docker: Option<std::collections::HashSet<String>>,
+    pub lxc: Option<std::collections::HashSet<String>>,
+}
+
+/// Finding types whose resource_id is a container [`resource_id`] built from
+/// the container list name (the same name [`ContainerPresence`] lists), and so
+/// can be retired by it. Memory-pressure findings take their names from the
+/// stats listing instead, and `lxc_boot_degraded` uses an `lxc:boot:` prefix;
+/// neither is matched here, so neither can be retired by a name mismatch.
+pub const PRESENCE_RETIRABLE_DOCKER: &[&str] = &[
+    "docker_storage_fill_eta",
+    crate::predictive::container_restart::FINDING_TYPE,
+];
+pub const PRESENCE_RETIRABLE_LXC: &[&str] = &["lxc_storage_fill_eta"];
+
+pub fn container_presence_now() -> ContainerPresence {
+    ContainerPresence {
+        docker: if crate::containers::has_docker_cached() { docker_names() } else { None },
+        lxc: if crate::containers::has_lxc_cached() { lxc_names() } else { None },
+    }
+}
+
+/// Async, timeout-bounded [`container_presence_now`]; a timeout or a panicked
+/// task yields "couldn't tell" for both runtimes.
+pub async fn container_presence_now_async(timeout: Duration) -> ContainerPresence {
+    let fut = tokio::task::spawn_blocking(container_presence_now);
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            tracing::warn!("predictive: container presence task panicked: {}", e);
+            ContainerPresence::default()
+        }
+        Err(_) => {
+            tracing::warn!("predictive: container presence listing timed out after {}s",
+                timeout.as_secs());
+            ContainerPresence::default()
+        }
+    }
+}
+
+/// `docker ps -a` names. `Names` is the column `containers::docker_list` uses
+/// for `ContainerInfo.name`. A non-zero exit (daemon down, socket refused) is
+/// "couldn't tell".
+fn docker_names() -> Option<std::collections::HashSet<String>> {
+    let o = std::process::Command::new("docker")
+        .args(["ps", "-a", "--format", "{{.Names}}"])
+        .output().ok()?;
+    if !o.status.success() { return None; }
+    Some(parse_name_lines(&String::from_utf8_lossy(&o.stdout), Runtime::Docker))
+}
+
+fn parse_name_lines(text: &str, runtime: Runtime) -> std::collections::HashSet<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty())
+        .map(|n| resource_id(runtime, n))
+        .collect()
+}
+
+/// LXC names, matching `containers::lxc_list_all`: on Proxmox (`pct` on PATH)
+/// the name is the VMID from `pct list`; on native LXC it is every
+/// sub-directory holding a `config` file under every registered storage path.
+/// One unreadable storage path makes the whole listing "couldn't tell" — a
+/// container on an unmounted disk must not read as destroyed.
+fn lxc_names() -> Option<std::collections::HashSet<String>> {
+    let is_proxmox = std::process::Command::new("which").arg("pct").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    if is_proxmox {
+        let o = std::process::Command::new("pct").arg("list").output().ok()?;
+        if !o.status.success() { return None; }
+        return Some(parse_pct_list_vmids(&String::from_utf8_lossy(&o.stdout)));
+    }
+    let mut out = std::collections::HashSet::new();
+    for base in crate::containers::lxc_storage_paths() {
+        let dir = std::fs::read_dir(&base).ok()?;
+        for de in dir {
+            let de = de.ok()?;
+            let name = de.file_name().to_string_lossy().to_string();
+            if name.is_empty() { continue; }
+            if de.path().join("config").is_file() {
+                out.insert(resource_id(Runtime::Lxc, &name));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// First column of `pct list` after the `VMID Status Lock Name` header — the
+/// same column `containers::pct_list_all` uses as `ContainerInfo.name`.
+fn parse_pct_list_vmids(text: &str) -> std::collections::HashSet<String> {
+    text.lines().skip(1)
+        .filter_map(|l| l.split_whitespace().next())
+        .map(|vmid| resource_id(Runtime::Lxc, vmid))
+        .collect()
+}
+
 /// Convert a [`crate::containers::ContainerInfo`] into a
 /// [`ContainerDiskFact`] if the container is in a state we should
 /// analyze and has the disk fields populated. Returns `None` when:
@@ -458,6 +564,35 @@ mod tests {
         assert_eq!(fact_id_hash("a"), 0xe40c_292c);
         // Container-ID-shaped inputs also hash distinctly.
         assert_ne!(fact_id_hash("abc123"), fact_id_hash("def456"));
+    }
+
+    #[test]
+    fn pct_list_vmids_are_lxc_resource_ids_including_locked_rows() {
+        // Shape from `containers::pct_list_all`: header, then
+        // VMID Status [Lock] Name. The lock column must not shift the VMID.
+        let text = "VMID       Status     Lock         Name\n\
+                    101        running                 web\n\
+                    138        running    backup       myhost\n\n";
+        let got = parse_pct_list_vmids(text);
+        let want: std::collections::HashSet<String> =
+            ["lxc:101", "lxc:138"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn docker_name_lines_become_docker_resource_ids() {
+        let got = parse_name_lines("postgres\n  redis \n\n", Runtime::Docker);
+        let want: std::collections::HashSet<String> =
+            ["docker:postgres", "docker:redis"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn presence_retirable_types_match_the_analyzers() {
+        // If a finding type is renamed, presence-based retirement must not
+        // silently stop applying to it.
+        assert!(PRESENCE_RETIRABLE_DOCKER.contains(&Runtime::Docker.finding_type()));
+        assert!(PRESENCE_RETIRABLE_LXC.contains(&Runtime::Lxc.finding_type()));
     }
 
     #[test]
