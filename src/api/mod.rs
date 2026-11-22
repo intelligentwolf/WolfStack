@@ -36689,29 +36689,80 @@ pub async fn predictive_proposal_approve(
     }
 }
 
+/// The compiled-in one-click actions `POST /api/proposals/{id}/apply` can run.
+#[derive(Debug, Clone, PartialEq)]
+enum OneClickAction {
+    /// Stop and mask rpcbind (`predictive::rpcbind`).
+    LockDownRpcbind,
+    /// Quarantine the container a compromise finding is about.
+    Quarantine { target_key: String, kill: crate::quarantine::KillSpec },
+    /// Lift a container's quarantine.
+    ReleaseQuarantine { target_key: String },
+}
+
+/// Which one-click action, if any, a finding carries. Decided by finding
+/// type and scope only — never by text from the proposal or the request.
+fn one_click_action(p: &crate::predictive::Proposal) -> Option<OneClickAction> {
+    use crate::predictive::intrusion;
+    if crate::predictive::rpcbind::is_rpcbind_exposure(p) {
+        return Some(OneClickAction::LockDownRpcbind);
+    }
+    let (target_key, _) = intrusion::parse_resource(p.scope.resource_id.as_deref()?)?;
+    // The host is never a quarantine target.
+    if target_key == intrusion::targets::HOST_KEY { return None; }
+    if p.finding_type == intrusion::FT_QUARANTINED {
+        return Some(OneClickAction::ReleaseQuarantine { target_key: target_key.to_string() });
+    }
+    let kill = intrusion::quarantine_kill_spec(&p.finding_type)?;
+    Some(OneClickAction::Quarantine { target_key: target_key.to_string(), kill })
+}
+
 /// POST /api/proposals/{id}/apply — run the finding's one-click action.
 ///
-/// Only the `rpcbind-portmap` exposure has one today (see
-/// `predictive::rpcbind`): the analyzer has flagged an open portmapper on
-/// public-facing WolfStack hosts since it shipped, and the only way to act on it
-/// was to copy four commands into a terminal — which is how ours stayed open
-/// until a CERT-Bund notice arrived via the hosting provider's abuse desk.
+/// Three exist, each a fixed sequence chosen by finding type:
 ///
-/// Deliberately NOT a generic "run this proposal's commands" endpoint. The
-/// action is a fixed, compiled-in sequence chosen by finding type; nothing from
-/// the proposal store or the request body is ever executed. Every other finding
-/// is refused, so a new analyzer can't accidentally become executable and a
-/// direct API call can't turn an arbitrary remediation recipe into a shell.
+/// * the `rpcbind-portmap` exposure (`predictive::rpcbind`): the analyzer had
+///   flagged an open portmapper on public-facing hosts since it shipped, and
+///   ours stayed open until a CERT-Bund notice arrived via the hosting
+///   provider's abuse desk;
+/// * **Quarantine** on a container-scoped `compromise_indicator:*` finding
+///   (`crate::quarantine`) — what an operator would do by hand to a
+///   compromised container: cut its network from the host side,
+///   freeze/capture/kill the processes the finding names;
+/// * **Release** on that container's quarantine card.
+///
+/// Deliberately NOT a generic "run this proposal's commands" endpoint.
+/// Nothing from the proposal store or the request body is ever executed —
+/// the optional body only carries the operator's name when a peer forwards
+/// the action, for the security log. Every other finding is refused, so a
+/// new analyzer can't accidentally become executable and a direct API call
+/// can't turn an arbitrary remediation recipe into a shell.
 pub async fn predictive_proposal_apply(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
+    body: web::Bytes,
 ) -> HttpResponse {
     let caller = match require_auth(&req, &state) {
         Ok(c) => c,
         Err(resp) => return resp,
     };
     let id = path.into_inner();
+    // Who to attribute the action to. A forward from the origin node
+    // authenticates as "cluster-node"; the origin names its operator in
+    // the body. Informational only — the cluster secret is the authority.
+    let actor = if is_inter_node_forward(&caller) {
+        serde_json::from_slice::<serde_json::Value>(&body).ok()
+            .and_then(|v| v.get("actor").and_then(|a| a.as_str()).map(|a| {
+                // Persisted into the quarantine record and logged: printable,
+                // bounded, nothing that could forge a log line.
+                let clean: String = a.chars().filter(|c| !c.is_control()).take(64).collect();
+                format!("{} (via peer)", clean)
+            }))
+            .unwrap_or_else(|| caller.clone())
+    } else {
+        caller.clone()
+    };
 
     // The action must run on the node that owns the finding, so a proposal this
     // node doesn't have goes to the same peer/federation fan-out that approve,
@@ -36732,40 +36783,66 @@ pub async fn predictive_proposal_apply(
             }));
         }
         return forward_proposal_action_to_peers(&state, &id, "apply",
-            serde_json::json!({}), is_operator_request(&caller)).await;
+            serde_json::json!({ "actor": caller }), is_operator_request(&caller)).await;
     };
 
-    if !crate::predictive::rpcbind::is_rpcbind_exposure(&proposal) {
+    let Some(action) = one_click_action(&proposal) else {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": "this finding has no one-click action — follow its \
                       remediation steps, which the inbox shows in full",
         }));
-    }
+    };
 
-    // Host work (systemctl, rpcinfo, ss) off the async executor.
-    let outcome = web::block(crate::predictive::rpcbind::lock_down)
+    // Host work (systemctl, nft, nsenter, signals) off the async executor.
+    let reason = proposal.title.clone();
+    let actor_for_block = actor.clone();
+    let action_for_block = action.clone();
+    // (message, warning). A warning — quarantine left part of the container
+    // connected, or could not stop a process cleanly — is returned beside
+    // the success so the UI shows it in a dialog that must be read.
+    let outcome: Result<(String, Option<String>), String> = web::block(move || match action_for_block {
+        OneClickAction::LockDownRpcbind => crate::predictive::rpcbind::lock_down().map(|m| (m, None)),
+        OneClickAction::Quarantine { target_key, kill } =>
+            crate::quarantine::quarantine(&target_key, kill, &actor_for_block, &reason)
+                .map(|o| (o.message, o.warning)),
+        OneClickAction::ReleaseQuarantine { target_key } =>
+            crate::quarantine::release(&target_key, &actor_for_block).map(|m| (m, None)),
+    })
         .await
         .unwrap_or_else(|e| Err(format!("apply task failed to run: {}", e)));
 
     match outcome {
-        Ok(message) => {
-            let mut store = match state.predictive_proposals.write() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
+        Ok((message, warning)) => {
+            // What the action means for the card:
+            //  * rpcbind locked down → the finding is fixed (Applied);
+            //  * quarantine → the compromise is CONTAINED, not fixed: the card
+            //    stays pending (a separate "quarantined" card appears);
+            //  * release → the quarantine card's condition is gone. Recorded
+            //    as ConditionCleared, not Applied, because Applied suppresses
+            //    the finding for 12 h and would hide a re-quarantine.
+            let record = match &action {
+                OneClickAction::LockDownRpcbind => Some(crate::predictive::ApprovalOutcome::Applied),
+                OneClickAction::Quarantine { .. } => None,
+                OneClickAction::ReleaseQuarantine { .. } => Some(crate::predictive::ApprovalOutcome::ConditionCleared),
             };
-            let _ = store.record_approval(&id, crate::predictive::ApprovalOutcome::Applied);
-            let _ = store.save();
-            drop(store);
+            if let Some(outcome) = record {
+                let mut store = match state.predictive_proposals.write() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                let _ = store.record_approval(&id, outcome);
+                let _ = store.save();
+            }
             invalidate_cluster_cache(&state);
-            tracing::info!("proposal {} applied by {}: {}", id, caller, message);
-            HttpResponse::Ok().json(serde_json::json!({ "success": true, "message": message }))
+            tracing::info!("proposal {} applied by {}: {}", id, actor, message);
+            HttpResponse::Ok().json(serde_json::json!({ "success": true, "message": message, "warning": warning }))
         }
         Err(error) => {
             // Nothing is recorded on a refusal or a failure. `record_approval`
             // moves a proposal to Approved whatever the outcome, which would
             // take a STILL-EXPOSED port out of the inbox — the finding has to
             // stay pending until it is actually closed.
-            tracing::warn!("proposal {} apply refused for {}: {}", id, caller, error);
+            tracing::warn!("proposal {} apply refused for {}: {}", id, actor, error);
             HttpResponse::Conflict().json(serde_json::json!({ "error": error }))
         }
     }
@@ -37470,6 +37547,19 @@ fn resolve_console_target(p: &crate::predictive::Proposal) -> (String, String) {
 /// The `resource_id` → console mapping behind `resolve_console_target`,
 /// split out so it is unit-testable without building a `Proposal`.
 fn console_target_for_resource(rid: &str) -> (String, String) {
+    // Intrusion findings: `intrusion:<target>|<item>` (predictive/intrusion).
+    // Checked first — the item after `|` is a path or key, never part of a
+    // container name. Proxmox CTs are addressed by vmid, the same name
+    // lxc_list_all reports for them.
+    if let Some((target, _)) = crate::predictive::intrusion::parse_resource(rid) {
+        if let Some(id) = target.strip_prefix("lxc:").or_else(|| target.strip_prefix("pve:")) {
+            return ("lxc".into(), id.to_string());
+        }
+        if let Some(id) = target.strip_prefix("docker:") {
+            return ("docker".into(), id.to_string());
+        }
+        return ("host".into(), "host".into());
+    }
     if let Some(name) = rid.strip_prefix("docker:") {
         return ("docker".into(), name.to_string());
     }
@@ -51689,6 +51779,61 @@ mod predictive_forward_tests {
         // normal operator and may federate.
         assert!(is_operator_request("apikey"));
         assert!(is_operator_request("apikeys-admin"));
+    }
+}
+
+#[cfg(test)]
+mod intrusion_one_click_tests {
+    use super::{console_target_for_resource, one_click_action, OneClickAction};
+    use crate::predictive::intrusion::{self, resource_id};
+    use crate::predictive::proposal::{Proposal, ProposalScope, RemediationPlan, Severity};
+    use crate::quarantine::KillSpec;
+
+    fn card(ft: &str, rid: String) -> Proposal {
+        Proposal::new_rule(ft, Severity::Critical, "t", "w", vec![],
+            RemediationPlan::Manual { instructions: String::new(), commands: vec![] },
+            ProposalScope { node_id: "n".into(), resource_id: Some(rid) })
+    }
+
+    #[test]
+    fn container_compromise_cards_offer_quarantine() {
+        let p = card(intrusion::FT_MINER, resource_id("lxc:nodejs", "miner|xmrig"));
+        assert_eq!(one_click_action(&p), Some(OneClickAction::Quarantine {
+            target_key: "lxc:nodejs".into(), kill: KillSpec::Miners }));
+        let p = card(intrusion::FT_SSH_KEY, resource_id("pve:107", "key|root|key:ab"));
+        assert_eq!(one_click_action(&p), Some(OneClickAction::Quarantine {
+            target_key: "pve:107".into(), kill: KillSpec::None }));
+    }
+
+    #[test]
+    fn the_host_is_never_quarantined_and_exposure_has_no_action() {
+        let p = card(intrusion::FT_STAGING, resource_id("host", "exe|/tmp/x"));
+        assert_eq!(one_click_action(&p), None);
+        let p = card(intrusion::FT_DEV_SERVER, resource_id("lxc:nodejs", "dev|5373"));
+        assert_eq!(one_click_action(&p), None);
+        // A compromise-looking type without an intrusion resource id.
+        let p = card(intrusion::FT_MINER, "lxc:nodejs".into());
+        assert_eq!(one_click_action(&p), None);
+    }
+
+    #[test]
+    fn quarantine_card_offers_release() {
+        let p = card(intrusion::FT_QUARANTINED, resource_id("lxc:nodejs", "quarantine"));
+        assert_eq!(one_click_action(&p), Some(OneClickAction::ReleaseQuarantine { target_key: "lxc:nodejs".into() }));
+    }
+
+    #[test]
+    fn intrusion_resources_open_the_right_console() {
+        assert_eq!(console_target_for_resource(&resource_id("lxc:nodejs", "hook|/etc/profile|x")),
+            ("lxc".to_string(), "nodejs".to_string()));
+        assert_eq!(console_target_for_resource(&resource_id("pve:107", "dev|3000")),
+            ("lxc".to_string(), "107".to_string()));
+        assert_eq!(console_target_for_resource(&resource_id("docker:abcdef012345", "x")),
+            ("docker".to_string(), "abcdef012345".to_string()));
+        assert_eq!(console_target_for_resource(&resource_id("host", "file|/usr/bin/x|1")),
+            ("host".to_string(), "host".to_string()));
+        // Existing conventions unchanged.
+        assert_eq!(console_target_for_resource("lxc:boot:web"), ("lxc".to_string(), "web".to_string()));
     }
 }
 

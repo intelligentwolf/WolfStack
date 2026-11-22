@@ -90,6 +90,7 @@ mod mail_relay;
 mod ups;
 mod systemcheck;
 mod security;
+mod quarantine;
 mod ssh_keys;
 mod wol;
 mod secret_audit;
@@ -212,6 +213,31 @@ struct Cli {
     /// service restart needed.
     #[arg(long, value_name = "IP")]
     unblock: Option<String>,
+
+    /// Run the intrusion scan (host + every running container: loader
+    /// hooks in start-up files and process environments, unpackaged /
+    /// timestamp-forged system files, new SSH keys, processes running from
+    /// /tmp or memory, miners, published dev servers, npm packages that
+    /// differ from the registry) once, print every finding with its
+    /// evidence, and exit — status 2 if any finding is critical. The same
+    /// checks the Predictive Inbox runs every 5 minutes. Records first-seen
+    /// SSH key baselines exactly as the daemon would.
+    #[arg(long)]
+    intrusion_scan: bool,
+
+    /// Quarantine a running container from the command line: drop all of
+    /// its network traffic on the host side, then freeze, capture and kill
+    /// every suspicious process in it (miners, binaries running from /tmp
+    /// or memory, processes carrying an injected loader). TARGET is the key
+    /// `--intrusion-scan` prints, e.g. `lxc:web`, `pve:107`, `docker:abc123def456`.
+    /// Evidence goes to /var/lib/wolfstack/quarantine/. Persists across
+    /// container restarts until `--release-quarantine`.
+    #[arg(long, value_name = "TARGET")]
+    quarantine: Option<String>,
+
+    /// Lift a container's quarantine (restores its network; evidence kept).
+    #[arg(long, value_name = "TARGET")]
+    release_quarantine: Option<String>,
 
     /// Wipe this node's cluster membership state and exit. Deletes
     /// `self_cluster.json`, `nodes.json`, `deleted_nodes.json`, and
@@ -576,6 +602,45 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
         }
+    }
+
+    // --intrusion-scan / --quarantine / --release-quarantine: incident
+    // response from SSH, for when the dashboard is unreachable or not to be
+    // trusted. Same code paths as the inbox and its one-click actions.
+    if cli.intrusion_scan || cli.quarantine.is_some() || cli.release_quarantine.is_some() {
+        if !deps::is_root() {
+            eprintln!("This needs root: it reads every container's filesystem and processes, and quarantine edits nftables. Re-run with sudo.");
+            std::process::exit(1);
+        }
+        if let Some(target) = cli.quarantine.as_deref() {
+            match crate::quarantine::quarantine(target, crate::quarantine::KillSpec::All,
+                "root (command line)", "quarantined from the command line") {
+                Ok(o) => {
+                    println!("{}", o.message);
+                    if let Some(w) = o.warning {
+                        eprintln!("\nWARNING: {}", w);
+                        std::process::exit(3);
+                    }
+                    return Ok(());
+                }
+                Err(e) => { eprintln!("Quarantine failed: {}", e); std::process::exit(1); }
+            }
+        }
+        if let Some(target) = cli.release_quarantine.as_deref() {
+            match crate::quarantine::release(target, "root (command line)") {
+                Ok(m) => { println!("{}", m); return Ok(()); }
+                Err(e) => { eprintln!("Release failed: {}", e); std::process::exit(1); }
+            }
+        }
+        let facts = predictive::intrusion::scan_once().await;
+        if !facts.scanned {
+            eprintln!("The scan did not complete (timed out or failed) — see the log for why.");
+            std::process::exit(1);
+        }
+        let store = predictive::ProposalStore::load();
+        let facts = predictive::intrusion::finalize_ssh(facts, &store).await;
+        let critical = predictive::intrusion::print_report(&facts);
+        std::process::exit(if critical { 2 } else { 0 });
     }
 
     // --leave-cluster: wipe this node's cluster membership state and exit.
@@ -1961,6 +2026,22 @@ async fn main() -> std::io::Result<()> {
             let n = node_id.clone();
             tokio::spawn(predictive::orchestrator::run_loop(p, a, m, mon, n));
         }
+
+        // Container quarantine keeper. A quarantined container that is
+        // restarted comes back with a NEW host-side veth, so the drop
+        // rule has to follow it — every 3 s, re-bind the isolation table
+        // to the current devices. Measured on a live restart: the new veth
+        // passes traffic until the next pass, so the interval IS the
+        // exposure window (it was 15 s). A pass with nothing quarantined is
+        // one small file read; nft is only called when the device set
+        // changes. See src/quarantine.rs.
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                tick.tick().await;
+                let _ = tokio::task::spawn_blocking(crate::quarantine::reconcile).await;
+            }
+        });
 
         // One-shot PBS runtime-dir self-heal. Ensures every running PBS
         // LXC has the persistent /run/proxmox-backup ownership fix so it
