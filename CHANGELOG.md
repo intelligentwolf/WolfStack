@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.48.0: a WolfHA promotion is refused before anything stops if the standby can't run the container, and never starts a second copy** _(2026-11-22 — [`64a66cdb`](https://github.com/intelligentwolf/WolfStack/commit/64a66cdb4cdde128624c164b23b958708827f17d))_
 - **v25.47.0: find intruders inside containers, not just on the host, and quarantine one in a click** _(2026-11-22 — [`b75406ed`](https://github.com/intelligentwolf/WolfStack/commit/b75406edc9acb4431d48e5be99e014261d4e934e))_
 - **v25.46.1: a disk alert for a mount that's been removed now clears instead of paging for a week** _(2026-11-20 — [`f487c915`](https://github.com/intelligentwolf/WolfStack/commit/f487c915f640a637a3fd7647a9d269233e37e4dd))_
 - **v25.46.0: a filling disk now reaches you — by email under default settings, and loudly in the browser** _(2026-11-20 — [`826a4921`](https://github.com/intelligentwolf/WolfStack/commit/826a4921a20ad3cf0a8e68877ef0a45f3015e274))_
