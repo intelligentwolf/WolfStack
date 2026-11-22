@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.48.1: update the web server, email and URL libraries with known vulnerabilities** _(2026-11-22 — [`a80d57d8`](https://github.com/intelligentwolf/WolfStack/commit/a80d57d809030a0882f8ddc731938ee4a8a17312))_
 - **v25.48.0: a WolfHA promotion is refused before anything stops if the standby can't run the container, and never starts a second copy** _(2026-11-22 — [`64a66cdb`](https://github.com/intelligentwolf/WolfStack/commit/64a66cdb4cdde128624c164b23b958708827f17d))_
 - **v25.47.0: find intruders inside containers, not just on the host, and quarantine one in a click** _(2026-11-22 — [`b75406ed`](https://github.com/intelligentwolf/WolfStack/commit/b75406edc9acb4431d48e5be99e014261d4e934e))_
 - **v25.46.1: a disk alert for a mount that's been removed now clears instead of paging for a week** _(2026-11-20 — [`f487c915`](https://github.com/intelligentwolf/WolfStack/commit/f487c915f640a637a3fd7647a9d269233e37e4dd))_
