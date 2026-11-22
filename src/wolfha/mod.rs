@@ -33,6 +33,7 @@
 //! LVM-thin or directory storage are still out of scope: their rootfs is
 //! neither a stable host directory nor a ZFS dataset.
 
+pub mod binds;
 pub mod replication;
 
 use serde::{Deserialize, Serialize};
@@ -246,6 +247,14 @@ pub struct HaEntry {
     /// and destroy on drop; they arrive in HaMeta with every stream.
     #[serde(default)]
     pub zfs_datasets: Vec<String>,
+    /// Native container only: where each bind-mount source lives on the
+    /// PRIMARY (mount point + filesystem type, and whether that is the
+    /// primary's own disk). Recomputed by the primary every round and
+    /// carried in HaMeta, so a standby's preflight can check it would see
+    /// the same storage — see `binds`. Empty from older primaries: the
+    /// preflight then checks only that each source exists.
+    #[serde(default)]
+    pub bind_requirements: Vec<binds::BindRequirement>,
 }
 
 /// The HA settings a primary pushes to its replicas with every seed and
@@ -269,6 +278,9 @@ pub struct HaMeta {
     /// Proxmox container only — see `HaEntry::zfs_datasets`.
     #[serde(default)]
     pub zfs_datasets: Vec<String>,
+    /// Native container only — see `HaEntry::bind_requirements`.
+    #[serde(default)]
+    pub bind_requirements: Vec<binds::BindRequirement>,
 }
 
 impl HaMeta {
@@ -282,6 +294,7 @@ impl HaMeta {
             failover_after_secs: e.failover_after_secs,
             primary: e.self_identity.clone(),
             zfs_datasets: e.zfs_datasets.clone(),
+            bind_requirements: e.bind_requirements.clone(),
         }
     }
 
@@ -298,6 +311,9 @@ impl HaMeta {
         if !self.zfs_datasets.is_empty() {
             e.zfs_datasets = self.zfs_datasets.clone();
         }
+        // Always replaced, never merged: a bind the primary dropped must
+        // stop being required here.
+        e.bind_requirements = self.bind_requirements.clone();
         if e.role == HaRole::Replica
             && let Some(p) = &self.primary
         {
@@ -645,9 +661,13 @@ pub fn dedupe_replicas(container: &str, cluster: &crate::agent::ClusterState) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut kept: Vec<HaPeer> = Vec::new();
     for peer in entry.replicas.drain(..) {
-        let key = cluster.get_node(&peer.node_id)
-            .map(|n| n.id)
-            .unwrap_or_else(|| peer.address.clone());
+        let reg = cluster.get_node(&peer.node_id);
+        // A primary is never its own standby, whichever id the entry
+        // carries — the registry knows which one is this node.
+        if reg.as_ref().is_some_and(|n| n.is_self) {
+            continue;
+        }
+        let key = reg.map(|n| n.id).unwrap_or_else(|| peer.address.clone());
         if seen.insert(key) {
             kept.push(peer);
         }
@@ -725,6 +745,7 @@ pub fn install_seed(
         failover_after_secs: default_failover_after(),
         self_identity: None,
         zfs_datasets: Vec::new(),
+        bind_requirements: Vec::new(),
     };
     if let Some(m) = meta {
         m.apply_to(&mut entry);
@@ -739,6 +760,16 @@ pub fn install_seed(
 /// caller has already handled (or accepted the absence of) the old
 /// primary. `me` is this node's own peer identity — recorded so every
 /// future delta re-teaches the standbys who owns the container now.
+///
+/// Two guarantees added after the 2026-11-22 gateway failure, where the
+/// copy could not start (a bind-mount source was missing) and the node
+/// was left recorded as primary of a stopped container:
+/// - [`binds::preflight_start`] runs FIRST — nothing changes if this node
+///   cannot start its copy;
+/// - if anything after the role flip fails (the VM bitmap, the Proxmox
+///   dataset mounts, the start itself) this node's entry and replica
+///   marker are restored exactly as they were, so it is a replica again
+///   and the caller can hand the container back to the old primary.
 pub fn promote_local(container: &str, me: Option<HaPeer>) -> Result<(), String> {
     let mut store = HaStore::load();
     let entry = store
@@ -748,6 +779,10 @@ pub fn promote_local(container: &str, me: Option<HaPeer>) -> Result<(), String> 
     if entry.role == HaRole::Primary && !entry.stale {
         return Err(format!("'{}' is already the active primary here", container));
     }
+    binds::preflight_start(kind, container)
+        .map_err(|e| format!("promotion refused before anything was changed: {}", e))?;
+    let original = entry.clone();
+    let marker_before = std::fs::read_to_string(marker_path(container)).ok();
 
     let old_primary = entry.primary.take();
     entry.role = HaRole::Primary;
@@ -775,6 +810,43 @@ pub fn promote_local(container: &str, me: Option<HaPeer>) -> Result<(), String> 
     let _ = std::fs::remove_file(marker_path(container));
     store.save()?;
 
+    if let Err(e) = start_promoted(kind, container) {
+        // A start that reported failure can still leave the copy (partly)
+        // up; a replica must never be running, so stop it before the
+        // replica role is restored around it.
+        if subject_is_running(kind, container)
+            && let Err(se) = subject_stop(kind, container)
+        {
+            return Err(format!(
+                "{} — and the copy is still running here and could not be stopped ({}); this node is left as primary — stop it by hand before touching the old primary",
+                e, se));
+        }
+        return Err(match restore_entry(container, original, marker_before) {
+            Ok(()) => format!("{} — this node's copy is a replica again, nothing else was changed here", e),
+            Err(re) => format!("{} — AND restoring this node's replica state failed: {}", e, re),
+        });
+    }
+    Ok(())
+}
+
+/// Put a promotion's store entry and replica marker back as they were.
+fn restore_entry(container: &str, original: HaEntry, marker: Option<String>) -> Result<(), String> {
+    let mut store = HaStore::load();
+    match store.entries.iter_mut().find(|e| e.container == container) {
+        Some(e) => *e = original,
+        None => store.entries.push(original),
+    }
+    store.save()?;
+    if let Some(m) = marker {
+        std::fs::write(marker_path(container), m)
+            .map_err(|e| format!("rewrite replica marker: {}", e))?;
+    }
+    Ok(())
+}
+
+/// The part of a promotion after the role flip: prepare and start the
+/// copy. Any error here is rolled back by [`promote_local`].
+fn start_promoted(kind: SubjectKind, container: &str) -> Result<(), String> {
     // A promoted VM becomes the delta SOURCE, so its disk needs a fresh
     // recording bitmap BEFORE the guest boots — attached online this
     // would race the first guest writes, and writes made before the
@@ -904,6 +976,7 @@ pub fn demote_local(container: &str, new_primary: HaPeer) -> Result<(), String> 
                 failover_after_secs: default_failover_after(),
                 self_identity: None,
                 zfs_datasets: Vec::new(),
+                bind_requirements: Vec::new(),
             });
         }
     }
@@ -1451,6 +1524,7 @@ pub fn install_vm_seed(
         failover_after_secs: default_failover_after(),
         self_identity: None,
         zfs_datasets: Vec::new(),
+        bind_requirements: Vec::new(),
     };
     if let Some(m) = meta {
         m.apply_to(&mut entry);
@@ -2164,6 +2238,45 @@ pub async fn stream_archive_part(path: &str) -> Result<reqwest::multipart::Part,
     Ok(reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), len))
 }
 
+/// Set up `mounts` (WolfStack storage mounts a protected container binds
+/// into) on `peer`, through the same idempotent upsert-and-mount endpoint
+/// a global mount's cluster sync uses (`/api/agent/storage/apply` →
+/// `storage::apply_replicated_mount`).
+async fn push_storage_mounts(
+    mounts: &[crate::storage::StorageMount],
+    peer: &HaPeer,
+    secret: &str,
+) -> Result<(), String> {
+    let client = &*crate::api::API_HTTP_CLIENT;
+    let mut failed: Vec<String> = Vec::new();
+    for m in mounts {
+        let mut last_err = String::from("no address answered");
+        let mut ok = false;
+        for url in crate::api::build_node_urls(&peer.address, peer.port, "/api/agent/storage/apply") {
+            // A network mount can take a while to come up (NFS/SMB
+            // negotiation, an S3 FUSE start); the cluster sync's 20 s is
+            // tuned for a UI click, this runs in the background.
+            match client.post(&url).peer_auth(secret).json(m)
+                .timeout(std::time::Duration::from_secs(120)).send().await
+            {
+                Ok(r) if r.status().is_success() => { let _ = r.bytes().await; ok = true; break; }
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    last_err = serde_json::from_str::<serde_json::Value>(&body).ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_else(|| format!("HTTP {}", status));
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        if !ok {
+            failed.push(format!("{} ({}): {}", m.name, m.mount_point, last_err));
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
 /// Run a sync round for one primary entry: every replica, sequentially
 /// (replicas share the primary's disk bandwidth; parallel rounds
 /// double-read the rootfs for no wall-clock win on spinning disks).
@@ -2301,6 +2414,43 @@ pub async fn sync_container_now(container: &str) -> Result<(), String> {
     };
     let mut pve_all_ok = true;
 
+    // Native container: where each bind-mount source lives here, and the
+    // WolfStack storage mounts holding them. The requirements are saved
+    // on the entry so this round's HaMeta carries them to every standby;
+    // the mounts are pushed to each standby before its rootfs delta.
+    let (bind_reqs, storage_mounts) = if kind == SubjectKind::Container {
+        let c = container.to_string();
+        tokio::task::spawn_blocking(move || {
+            let cfg_path = format!("{}/{}/config", crate::containers::lxc_base_dir(&c), c);
+            let cfg = std::fs::read_to_string(cfg_path).unwrap_or_default();
+            let reqs = binds::plan_requirements_live(&cfg);
+            let mounts = binds::storage_mounts_for(&reqs);
+            (reqs, mounts)
+        })
+        .await
+        .map_err(|e| format!("bind-mount plan task: {}", e))?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let local_disk = binds::local_disk_summary(&bind_reqs);
+    if kind == SubjectKind::Container {
+        let mut st = HaStore::load();
+        if let Some(e) = st.get_mut(container)
+            && e.bind_requirements != bind_reqs
+        {
+            e.bind_requirements = bind_reqs.clone();
+            let _ = st.save();
+        }
+        // Once per condition, not every round; cleared when it is fixed.
+        let key = format!("wolfha-localbind:{}", container);
+        match &local_disk {
+            Some(why) => alert_once(&key,
+                &format!("WolfHA: '{}' cannot fail over", container),
+                &format!("{} — every standby would refuse to promote it. Replication of the rest of the container carries on.", why)).await,
+            None => alert_clear(&key),
+        }
+    }
+
     // One full seed image per round at most, shared by every replica that
     // turns out to need one; staged lazily, cleaned up after the loop.
     let mut staged_seed: Option<StagedVmSeed> = None;
@@ -2387,7 +2537,22 @@ pub async fn sync_container_now(container: &str) -> Result<(), String> {
                 pve_all_ok &= st.ok;
                 st
             }
-            None => sync_one_replica(container, peer, &secret).await,
+            None => {
+                // Storage first: a standby is only useful if it can see the
+                // same shared storage the container binds.
+                let mounts = push_storage_mounts(&storage_mounts, peer, &secret).await;
+                let mut st = sync_one_replica(container, peer, &secret).await;
+                if let Err(e) = mounts {
+                    st.ok = false;
+                    st.message = format!(
+                        "{}; storage mount setup FAILED: {} — this standby cannot start the container until it succeeds",
+                        st.message, e);
+                }
+                if let Some(why) = &local_disk {
+                    st.message = format!("{}; cannot fail over: {}", st.message, why);
+                }
+                st
+            }
         };
         let mut store = HaStore::load();
         let previous_ok = store.get(container)
@@ -3062,6 +3227,7 @@ pub fn pve_commit_receive(f: &std::collections::HashMap<String, String>, plan: &
             failover_after_secs: default_failover_after(),
             self_identity: None,
             zfs_datasets: Vec::new(),
+            bind_requirements: Vec::new(),
         });
     }
     let e = store.get_mut(vmid).ok_or("HA entry vanished")?;
@@ -3368,15 +3534,74 @@ pub fn peer_is_local(peer: &HaPeer) -> bool {
     };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out) else { return false };
     let Some(ifaces) = v.as_array() else { return false };
+    let mut local: Vec<std::net::IpAddr> = Vec::new();
     for iface in ifaces {
         let Some(infos) = iface.get("addr_info").and_then(|a| a.as_array()) else { continue };
         for info in infos {
-            if info.get("local").and_then(|l| l.as_str()) == Some(peer.address.as_str()) {
-                return true;
+            if let Some(ip) = info.get("local").and_then(|l| l.as_str()).and_then(|l| l.parse().ok()) {
+                local.push(ip);
             }
         }
     }
-    false
+    address_is_local(&peer.address, &local, resolve_bounded)
+}
+
+/// Resolved addresses of hostnames this node has looked up for
+/// [`peer_is_local`], with when they were resolved.
+type ResolveCache = HashMap<String, (Vec<std::net::IpAddr>, std::time::Instant)>;
+static RESOLVE_CACHE: std::sync::LazyLock<std::sync::Mutex<ResolveCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// DNS lookup for [`peer_is_local`], bounded: `peer_is_local` is called
+/// from the async sync round and failover monitor, where a hung resolver
+/// must not stall a runtime thread. The lookup runs on its own thread with
+/// a 2 s cap (a timeout counts as "not local", the safe answer for a
+/// replica filter) and answers are cached for 5 minutes.
+fn resolve_bounded(host: &str) -> Vec<std::net::IpAddr> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    if let Some((ips, at)) = RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(host)
+        && at.elapsed() < TTL
+    {
+        return ips.clone();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = host.to_string();
+    std::thread::spawn(move || {
+        use std::net::ToSocketAddrs;
+        let ips: Vec<std::net::IpAddr> = (h.as_str(), 0u16).to_socket_addrs()
+            .map(|a| a.map(|s| s.ip()).collect())
+            .unwrap_or_default();
+        let _ = tx.send(ips);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(ips) => {
+            RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+                .insert(host.to_string(), (ips.clone(), std::time::Instant::now()));
+            ips
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Whether `address` names this machine, given its interface addresses.
+/// A hostname is resolved first: a replica entry can carry an FQDN, and
+/// comparing that string to interface IPs never matched — wolfstack-3
+/// then listed itself (`node-80f7d5a4@node3.example.net`, which
+/// resolves to its own 203.0.113.165) as a standby of gateway and every
+/// round "failed" syncing to itself (2026-11-22). Pure but for `resolve`.
+pub fn address_is_local(
+    address: &str,
+    local: &[std::net::IpAddr],
+    resolve: impl Fn(&str) -> Vec<std::net::IpAddr>,
+) -> bool {
+    let a = address.trim().trim_start_matches('[').trim_end_matches(']');
+    if a.is_empty() {
+        return false;
+    }
+    match a.parse::<std::net::IpAddr>() {
+        Ok(ip) => local.contains(&ip),
+        Err(_) => resolve(a).iter().any(|ip| !ip.is_loopback() && local.contains(ip)),
+    }
 }
 
 /// Ask a peer for its /api/wolfha/status of one container.
@@ -3734,6 +3959,28 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_replica_named_by_hostname_is_recognised_as_this_node() {
+        // Source: wolfstack-3 2026-11-22 — `ip -o -4 addr` and
+        // `getent hosts node3.example.net`.
+        let local: Vec<std::net::IpAddr> = ["127.0.0.1", "203.0.113.165", "10.0.0.4", "10.0.0.165"]
+            .iter().map(|s| s.parse().unwrap()).collect();
+        let dns = |h: &str| -> Vec<std::net::IpAddr> {
+            match h {
+                "node3.example.net" => vec!["203.0.113.165".parse().unwrap()],
+                "node2.example.net" => vec!["203.0.113.166".parse().unwrap()],
+                "localhost" => vec!["127.0.0.1".parse().unwrap()],
+                _ => vec![],
+            }
+        };
+        assert!(super::address_is_local("node3.example.net", &local, dns));
+        assert!(super::address_is_local("10.0.0.4", &local, dns));
+        assert!(!super::address_is_local("node2.example.net", &local, dns));
+        assert!(!super::address_is_local("unresolvable.example", &local, dns));
+        // A name resolving only to loopback is no evidence about the peer.
+        assert!(!super::address_is_local("localhost", &local, dns));
+    }
 
     /// End-to-end functional test of the replication pipeline against real
     /// files: signatures on the "replica" copy, delta on the "primary"
