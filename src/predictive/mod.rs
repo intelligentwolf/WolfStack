@@ -79,6 +79,7 @@ pub mod wolfnet_reachability;
 pub mod docker_wolfnet_collision;
 pub mod missing_subnet_route;
 pub mod compromise_indicators;
+pub mod intrusion;
 pub mod baselines;
 pub mod tamper_detection;
 pub mod threat_intel;

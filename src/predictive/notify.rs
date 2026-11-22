@@ -53,6 +53,17 @@ pub const CAPACITY_FINDINGS: &[&str] = &[
     crate::predictive::boot_partition::FINDING_BOOT_SPACE,
 ];
 
+/// Findings that are a live compromise signal and must page under Simple
+/// verbosity: the `compromise_indicator:*` family (BootingWorld IoCs and the
+/// container-wide intrusion analyzer), plus an out-of-band change to the
+/// host's root `authorized_keys` — a key added there is the same "way back
+/// in" that `compromise_indicator:new_ssh_key` reports for containers, and
+/// it used to page only under Verbose.
+pub fn is_compromise_finding(finding_type: &str) -> bool {
+    finding_type.starts_with("compromise_indicator:")
+        || finding_type == crate::predictive::tamper_detection::FT_AUTHORIZED_KEYS_TAMPER
+}
+
 pub fn is_capacity_finding(finding_type: &str) -> bool {
     CAPACITY_FINDINGS.contains(&finding_type)
 }
@@ -146,7 +157,7 @@ pub fn dispatch_alerts(proposals: Vec<Proposal>) {
             // mode. Everything else (disk-fill ETA, container restart-loops,
             // memory creep) is early-warning Threshold material visible in
             // the Predictive Inbox; Simple mode suppresses the push for those.
-            let category = if p.finding_type.starts_with("compromise_indicator:") {
+            let category = if is_compromise_finding(&p.finding_type) {
                 crate::alerting::AlertCategory::Compromise
             } else if is_capacity_finding(&p.finding_type) {
                 // Disk running out: fires under Simple verbosity, and a
@@ -240,6 +251,27 @@ fn format_for_channel(p: &Proposal) -> (String, String) {
     message.push_str("\n\nOpen the Predictive Inbox to snooze, dismiss, or apply.");
 
     (title, message)
+}
+
+#[cfg(test)]
+mod compromise_category_tests {
+    use super::is_compromise_finding;
+
+    #[test]
+    fn compromise_findings_page_in_simple_mode() {
+        // Every intrusion compromise type, and the BootingWorld family.
+        for ft in crate::predictive::intrusion::ALL_TYPES {
+            let expect = ft.starts_with("compromise_indicator:");
+            assert_eq!(is_compromise_finding(ft), expect, "{}", ft);
+        }
+        assert!(is_compromise_finding("compromise_indicator:locker_binary"));
+        // A new key in the HOST's root authorized_keys is the same signal.
+        assert!(is_compromise_finding(crate::predictive::tamper_detection::FT_AUTHORIZED_KEYS_TAMPER));
+        // Posture and exposure stay Verbose-only.
+        assert!(!is_compromise_finding(crate::predictive::intrusion::FT_DEV_SERVER));
+        assert!(!is_compromise_finding(crate::predictive::tamper_detection::FT_SSHD_CONFIG_TAMPER));
+        assert!(!is_compromise_finding("host_disk_free"));
+    }
 }
 
 #[cfg(test)]

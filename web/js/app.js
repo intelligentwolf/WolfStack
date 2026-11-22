@@ -79721,23 +79721,66 @@ function predictiveHistorySvg(data) {
 }
 
 // Findings with a real one-click action behind POST /api/proposals/{id}/apply.
-// The server gates on the same finding type + port-111 resource id and executes
-// a fixed, compiled-in sequence — this list only decides whether the button is
-// drawn, exactly like PRED_AUTOFIX_TYPES mirrors AUTOFIX_FINDING_TYPES.
-// See src/predictive/rpcbind.rs (is_rpcbind_exposure).
+// The server decides by finding type + scope and executes a fixed, compiled-in
+// sequence (src/api/mod.rs one_click_action) — this only decides whether the
+// button is drawn, exactly like PRED_AUTOFIX_TYPES mirrors AUTOFIX_FINDING_TYPES.
+//   * rpcbind exposure on port 111 (src/predictive/rpcbind.rs)
+//   * Quarantine on a container-scoped compromise_indicator:* finding from the
+//     intrusion analyzer (resource id `intrusion:<target>|…`, never `host`)
+//   * Release on that container's `security_quarantine` card
+// See src/quarantine.rs.
+function predictiveIntrusionTarget(p) {
+    const rid = (p && p.scope && p.scope.resource_id) || '';
+    if (!rid.startsWith('intrusion:')) return null;
+    const target = rid.slice('intrusion:'.length).split('|')[0];
+    return target || null;
+}
+
 function predictiveOneClickAction(p) {
-    if (!p || p.finding_type !== 'service_bound_publicly') return null;
-    const rid = (p.scope && p.scope.resource_id) || '';
-    const port = rid.split('/')[0].split(':').pop();
-    if (port !== '111') return null;
-    return {
-        label: 'Switch rpcbind off',
-        confirm: 'Switch rpcbind off on this host?\n\n'
-            + 'WolfStack will first check that nothing is using RPC — no NFS mounts, no exports, '
-            + 'no NFS server, nothing but the portmapper registered — and refuse if anything is. '
-            + 'Both units are then stopped and masked, which closes port 111.\n\n'
-            + 'Publishing an NFS share through WolfStack turns it back on automatically.',
-    };
+    if (!p) return null;
+    if (p.finding_type === 'service_bound_publicly') {
+        const rid = (p.scope && p.scope.resource_id) || '';
+        const port = rid.split('/')[0].split(':').pop();
+        if (port !== '111') return null;
+        return {
+            label: 'Switch rpcbind off',
+            hint: 'Checks nothing needs RPC first, then stops and masks both units.',
+            failTitle: 'rpcbind left as it is',
+            confirm: 'Switch rpcbind off on this host?\n\n'
+                + 'WolfStack will first check that nothing is using RPC — no NFS mounts, no exports, '
+                + 'no NFS server, nothing but the portmapper registered — and refuse if anything is. '
+                + 'Both units are then stopped and masked, which closes port 111.\n\n'
+                + 'Publishing an NFS share through WolfStack turns it back on automatically.',
+        };
+    }
+    const target = predictiveIntrusionTarget(p);
+    if (!target || target === 'host') return null;
+    if (p.finding_type === 'security_quarantine') {
+        return {
+            label: 'Release quarantine',
+            hint: 'Restores the container\'s network. Evidence already collected is kept.',
+            failTitle: 'Quarantine not released',
+            confirm: 'Release this container from quarantine?\n\n'
+                + 'Its network is restored immediately. Only do this once the container has been '
+                + 'cleaned or rebuilt and the secrets it held have been rotated — anything still '
+                + 'running inside it regains the network too.',
+        };
+    }
+    if (String(p.finding_type || '').startsWith('compromise_indicator:')) {
+        return {
+            label: 'Quarantine container',
+            hint: 'Cuts the container\'s network from the host and stops the processes this finding names. Evidence is kept.',
+            failTitle: 'Container not quarantined',
+            danger: true,
+            dangerTitle: 'Quarantine this container?',
+            dangerText: 'All network traffic to and from the container is dropped on the host — every site and service it runs goes offline until you release it.',
+            confirm: 'WolfStack will, in this order:\n'
+                + '1. drop all of the container\'s traffic on its host-side network link (root inside the container cannot undo this);\n'
+                + '2. freeze the processes this finding names (miners, binaries running from /tmp, processes carrying an injected loader), copy their binaries, command lines and environments to /var/lib/wolfstack/quarantine with SHA-256s, then kill them.\n\n'
+                + 'Files are not deleted. Quarantine follows the container across restarts until released.',
+        };
+    }
+    return null;
 }
 
 function predictiveRemediationHtml(r, proposalId, p) {
@@ -79745,9 +79788,9 @@ function predictiveRemediationHtml(r, proposalId, p) {
     const oneClick = predictiveOneClickAction(p);
     const oneClickHtml = oneClick ? `
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;padding:8px 10px;background:var(--bg-tertiary,#2d2f3a);border-radius:6px;">
-            <button class="btn btn-sm btn-primary" style="font-size:11px;padding:3px 10px;"
+            <button class="btn btn-sm ${oneClick.danger ? 'btn-danger' : 'btn-primary'}" style="font-size:11px;padding:3px 10px;"
                 onclick="predictiveApplyOneClick('${escapeAttr(proposalId)}', this)">${escapeHtml(oneClick.label)}</button>
-            <span style="font-size:11px;color:var(--text-muted);">Checks nothing needs RPC first, then stops and masks both units.</span>
+            <span style="font-size:11px;color:var(--text-muted);">${escapeHtml(oneClick.hint || '')}</span>
         </div>` : '';
     if (r.kind === 'manual') {
         const cmds = (r.commands || []).map((cmd, idx) => {
@@ -79785,7 +79828,19 @@ async function predictiveApplyOneClick(proposalId, btn) {
     const p = (predictiveState.proposals || []).find(x => x.id === proposalId);
     const action = predictiveOneClickAction(p);
     if (!action) { showToast('This finding has no one-click action', 'error'); return; }
-    if (!await wolfConfirm(action.confirm, action.label, { okText: action.label })) return;
+    // Quarantine takes production services offline: the danger dialog
+    // (Cancel pre-focused, confirm armed only after a countdown) instead of
+    // a plain confirm.
+    const confirmed = action.danger
+        ? await showDangerConfirm({
+            title: action.dangerTitle || action.label,
+            danger: action.dangerText || '',
+            detail: action.confirm,
+            countdown: 5,
+            confirmLabel: action.label,
+        })
+        : await wolfConfirm(action.confirm, action.label, { okText: action.label });
+    if (!confirmed) return;
     const orig = btn ? btn.innerHTML : '';
     if (btn) { btn.disabled = true; btn.innerHTML = 'Applying…'; }
     try {
@@ -79797,11 +79852,18 @@ async function predictiveApplyOneClick(proposalId, btn) {
             // storage network instead"), so it must stay on screen until read.
             showModal(
                 (d.error || `HTTP ${r.status}`)
-                + '\n\nThe finding stays open — nothing was changed.',
-                'rpcbind left as it is');
+                + '\n\nThe finding stays open.',
+                action.failTitle || 'Action not applied');
             return;
         }
-        showToast(d.message || 'Applied', 'success', 8000);
+        if (d.warning) {
+            // Done, but incompletely (e.g. a quarantined container still has
+            // an interface that could not be cut off): a blocking dialog,
+            // not a success toast that fades before it is read.
+            showModal((d.message || 'Applied') + '\n\n⚠ ' + d.warning, 'Applied — with a warning');
+        } else {
+            showToast(d.message || 'Applied', 'success', 8000);
+        }
         if (typeof predictiveLoad === 'function') predictiveLoad();
     } catch (e) {
         showToast(`Apply failed: ${e.message || e}`, 'error');

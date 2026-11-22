@@ -946,7 +946,7 @@ fn scan_ssh_bruteforce(out: &mut Vec<DependencyCheck>) {
 /// host the operator didn't put there, it's almost certainly a
 /// compromise — miners are the most common payload for exposed-Redis,
 /// exposed-Docker-API, and weak-SSH attacks.
-const MINER_PROCS: &[&str] = &[
+pub(crate) const MINER_PROCS: &[&str] = &[
     "xmrig", "xmr-stak", "minerd", "cpuminer", "ccminer",
     "ethminer", "nsfminer", "phoenixminer", "teamredminer",
     "nbminer", "lolminer", "bzminer", "t-rex", "gminer",
@@ -960,6 +960,17 @@ fn scan_crypto_miners(out: &mut Vec<DependencyCheck>) {
     // loop the first cut used, which is the difference between the
     // security scan being a background hum and being a noticeable
     // blip in top.
+    //
+    // Miners inside containers are reported by the predictive intrusion
+    // analyzer (`predictive::intrusion`, FT_MINER) instead: it runs every
+    // 5 minutes rather than every few hours, names the container, and
+    // offers one-click quarantine. Skipping them here keeps one miner to
+    // one page.
+    let targets = crate::predictive::intrusion::targets::enumerate();
+    let in_container: std::collections::HashSet<u32> = targets.iter()
+        .filter(|t| t.kind.is_container())
+        .flat_map(|t| t.pids.iter().copied())
+        .collect();
     let mut hits: Vec<(String, String)> = Vec::new();
     let proc_entries = match std::fs::read_dir("/proc") { Ok(e) => e, Err(_) => return };
     for entry in proc_entries.flatten() {
@@ -967,6 +978,9 @@ fn scan_crypto_miners(out: &mut Vec<DependencyCheck>) {
         let name_s = name.to_string_lossy();
         // Only directories whose name is entirely digits are PIDs.
         if !name_s.chars().all(|c| c.is_ascii_digit()) { continue; }
+        if name_s.parse::<u32>().is_ok_and(|p| in_container.contains(&p)
+            // An exited, unreaped process keeps its name but runs nothing.
+            || crate::predictive::intrusion::targets::is_zombie(p)) { continue; }
         let comm_path = entry.path().join("comm");
         let comm = match std::fs::read_to_string(&comm_path) {
             Ok(s) => s.trim().to_string(), Err(_) => continue,
@@ -989,7 +1003,7 @@ fn scan_crypto_miners(out: &mut Vec<DependencyCheck>) {
         &format!("Crypto-miner process detected ({} match{})",
             hits.len(), if hits.len() == 1 { "" } else { "es" }),
         &format!(
-            "Known crypto-miner binaries are running on this host. If you didn't install them, the box is compromised — miners are the #1 payload for exposed-Redis, exposed-Docker-API, and weak-SSH hacks.\n\n{}",
+            "Known crypto-miner binaries are running on this host (miners inside containers are reported per container in the Predictive Inbox, with one-click quarantine). If you didn't install them, the box is compromised — miners are the #1 payload for exposed-Redis, exposed-Docker-API, and weak-SSH hacks.\n\n{}",
             detail),
         Some("1. Identify the parent: `ps -ef | grep <pid>` and check if it's a container (`docker ps -q | xargs docker inspect`). 2. Kill it: `kill -9 <pid>`. 3. Find the persistence mechanism (cron, systemd unit, ~/.bashrc, /etc/rc.local) and remove it. 4. Rotate every credential on this host. 5. Consider reimaging — miners rarely come alone.".into()),
     ));
@@ -1010,7 +1024,7 @@ fn scan_crypto_miners(out: &mut Vec<DependencyCheck>) {
 /// Per-file decision is pure (`tmp_file_flaggable`) so every branch
 /// is unit-tested; the ownership suppression below it is the second
 /// gate.
-fn tmp_file_flaggable(name: &str, mode: u32, age_secs: i64) -> bool {
+pub(crate) fn tmp_file_flaggable(name: &str, mode: u32, age_secs: i64) -> bool {
     if mode & 0o111 == 0 { return false; }
     // Files older than 24h aren't worth flagging (and negative age =
     // clock skew — don't trust it).

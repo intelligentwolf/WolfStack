@@ -21,6 +21,10 @@ actix-files = "0.7"
 # Fleet Logs (loghub) — compress closed log segments. Already present
 # transitively (0.13.3 in Cargo.lock); promoted to a direct dependency.
 zstd = "0.13"
+# gzip for npm registry tarballs (predictive/intrusion/npm.rs). Already in
+# the lockfile through reqwest's dependency tree; declared so we rely on it
+# directly rather than by accident.
+flate2 = "1"
 actix-rt = "2"
 actix-ws = "0.3"
 actix-multipart = "0.7"

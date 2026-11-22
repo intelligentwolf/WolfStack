@@ -5836,6 +5836,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "deadpool-postgres",
+ "flate2",
  "futures",
  "futures-core",
  "hex",
