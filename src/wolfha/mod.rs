@@ -2281,7 +2281,7 @@ async fn push_storage_mounts(
 /// (replicas share the primary's disk bandwidth; parallel rounds
 /// double-read the rootfs for no wall-clock win on spinning disks).
 /// Records per-replica status in the store.
-pub async fn sync_container_now(container: &str) -> Result<(), String> {
+pub async fn sync_container_now(container: &str, cluster: &crate::agent::ClusterState) -> Result<(), String> {
     let store = HaStore::load();
     let entry = store.get(container)
         .ok_or_else(|| format!("'{}' is not WolfHA-managed here", container))?;
@@ -2461,6 +2461,7 @@ pub async fn sync_container_now(container: &str) -> Result<(), String> {
             tracing::debug!("wolfha: skipping self-aliased replica entry {} for '{}'", peer.node_id, container);
             continue;
         }
+        let peer = &reach_replica(container, peer, cluster).await;
         let status = match &vm_delta {
             Some(p) if p.applied_by.contains(&peer.node_id) => {
                 // Already has this delta from an earlier round; nothing to
@@ -3301,7 +3302,7 @@ pub fn end_sync(container: &str) {
 /// Periodic replication driver: every minute, start a sync round for
 /// each primary entry whose oldest replica status is older than its
 /// interval. Runs forever; spawned once at startup.
-pub async fn scheduler_forever() {
+pub async fn scheduler_forever(cluster: std::sync::Arc<crate::agent::ClusterState>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let store = HaStore::load();
@@ -3322,8 +3323,9 @@ pub async fn scheduler_forever() {
             if !try_begin_sync(&container) {
                 continue;
             }
+            let cluster = cluster.clone();
             tokio::spawn(async move {
-                if let Err(e) = sync_container_now(&container).await {
+                if let Err(e) = sync_container_now(&container, &cluster).await {
                     tracing::warn!("wolfha: scheduled sync of '{}': {}", container, e);
                 }
                 end_sync(&container);
@@ -3521,6 +3523,112 @@ fn fence_secs(failover_after: u64) -> u64 {
     (failover_after / 2).max(30)
 }
 
+/// Every address this node knows `peer` by, best first: the one recorded
+/// with it, then the cluster registry's (id aliases resolved — a peer
+/// often records itself under its self-id, the registry under another),
+/// then its public IP. Unusable and duplicate addresses dropped.
+///
+/// Source of the requirement: on the dev cluster 2026-11-22 a node had
+/// recorded itself as its LAN address (192.0.2.3), unreachable from its
+/// peer, while the registry's Tailscale address worked — and a promotion
+/// that tried only the recorded one would have declared the live primary
+/// dead and started a second copy.
+pub fn peer_addresses(cluster: &crate::agent::ClusterState, peer: &HaPeer) -> Vec<(String, u16)> {
+    let reg = cluster.get_node(&peer.node_id);
+    merge_peer_addresses(
+        (&peer.address, peer.port),
+        reg.as_ref().map(|n| (n.address.as_str(), n.port, n.public_ip.as_deref())),
+    )
+}
+
+/// Pure core of [`peer_addresses`]: recorded first, then the
+/// registry's address and public IP; unusable and duplicate entries out.
+fn merge_peer_addresses(recorded: (&str, u16), registry: Option<(&str, u16, Option<&str>)>) -> Vec<(String, u16)> {
+    let usable = |a: &str| !a.is_empty() && a != "0.0.0.0" && !a.starts_with("127.") && a != "::1";
+    let mut out: Vec<(String, u16)> = Vec::new();
+    let mut push = |a: &str, p: u16| {
+        if usable(a) && !out.iter().any(|(x, y)| x == a && *y == p) {
+            out.push((a.to_string(), p));
+        }
+    };
+    push(recorded.0, recorded.1);
+    if let Some((addr, port, public)) = registry {
+        push(addr, port);
+        if let Some(ip) = public {
+            push(ip, port);
+        }
+    }
+    out
+}
+
+/// First of `cands` that accepts a TCP connection within 3 s.
+pub async fn first_reachable(cands: &[(String, u16)]) -> Option<(String, u16)> {
+    for (a, p) in cands {
+        let target = if a.contains(':') { format!("[{}]:{}", a, p) } else { format!("{}:{}", a, p) };
+        if let Ok(Ok(_)) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(&target),
+        ).await {
+            return Some((a.clone(), *p));
+        }
+    }
+    None
+}
+
+/// `peer` as this sync round should call it: its recorded address if
+/// that still answers, otherwise the first of its other known addresses
+/// that does — saved over the recorded one, so the repair is permanent.
+///
+/// Source of the requirement: production 2026-11-22. A standby had been
+/// recorded under a WireGuard address only the region servers can reach
+/// (a tunnel interface). The promotion's handoff reached it on another address,
+/// but every sync round after it used the recorded one alone and failed
+/// with "replica manifest unavailable". Nothing answering leaves the peer
+/// as recorded: the round then fails with its usual, specific error.
+async fn reach_replica(container: &str, peer: &HaPeer, cluster: &crate::agent::ClusterState) -> HaPeer {
+    let cands = peer_addresses(cluster, peer);
+    let Some((address, port)) = first_reachable(&cands).await else {
+        return peer.clone();
+    };
+    if address == peer.address && port == peer.port {
+        return peer.clone();
+    }
+    tracing::info!("wolfha[{}]: replica {} recorded at {}:{} does not answer, {}:{} does — recording that",
+        container, peer.node_id, peer.address, peer.port, address, port);
+    let healed = HaPeer { node_id: peer.node_id.clone(), address, port };
+    let (c, h) = (container.to_string(), healed.clone());
+    let saved = tokio::task::spawn_blocking(move || {
+        let mut store = HaStore::load();
+        let Some(e) = store.get_mut(&c) else { return Ok(()) };
+        for r in e.replicas.iter_mut().filter(|r| r.node_id == h.node_id) {
+            r.address = h.address.clone();
+            r.port = h.port;
+        }
+        store.save()
+    }).await;
+    match saved {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("wolfha[{}]: could not save replica {}'s new address: {}", container, peer.node_id, e),
+        Err(e) => tracing::warn!("wolfha[{}]: replica address save task: {}", container, e),
+    }
+    healed
+}
+
+/// Record the address the current primary of `container` answered on, so
+/// the replica entry promote_local builds for it from `entry.primary` is
+/// one this node can actually reach.
+pub fn set_primary_address(container: &str, address: &str, port: u16) -> Result<(), String> {
+    let mut store = HaStore::load();
+    let Some(e) = store.get_mut(container) else { return Ok(()) };
+    let Some(p) = e.primary.as_mut() else { return Ok(()) };
+    if p.address == address && p.port == port {
+        return Ok(());
+    }
+    p.address = address.to_string();
+    p.port = port;
+    store.save()
+}
+
 /// Is this peer actually THIS machine? Node ids alias across registries
 /// (each node's registry may know the same machine under a different
 /// id — live-tested 2026-08-08: a promoted standby's replica list
@@ -3606,7 +3714,29 @@ pub fn address_is_local(
 
 /// Ask a peer for its /api/wolfha/status of one container.
 /// Ok(json) when ANY of its urls answered; Err when none did.
-async fn peer_status(peer: &HaPeer, container: &str, secret: &str) -> Result<serde_json::Value, ()> {
+/// `peer`'s WolfHA status for `container`, asked on every address it is
+/// known by (see [`peer_addresses`]), with the address that answered.
+/// A recorded address only one path can reach must not make a live node
+/// look dead: that would self-fence a healthy primary, or read a running
+/// one as gone. Production 2026-11-22: a standby logged its primary
+/// "unreachable" for four hours while it ran, because the recorded
+/// address was a WireGuard one only the region servers route to.
+async fn peer_status(
+    peer: &HaPeer,
+    container: &str,
+    secret: &str,
+    cluster: &crate::agent::ClusterState,
+) -> Result<(serde_json::Value, HaPeer), ()> {
+    for (address, port) in peer_addresses(cluster, peer) {
+        let at = HaPeer { node_id: peer.node_id.clone(), address, port };
+        if let Ok(v) = peer_status_at(&at, container, secret).await {
+            return Ok((v, at));
+        }
+    }
+    Err(())
+}
+
+async fn peer_status_at(peer: &HaPeer, container: &str, secret: &str) -> Result<serde_json::Value, ()> {
     let client = &*crate::api::API_HTTP_CLIENT;
     let urls = crate::api::build_node_urls(
         &peer.address, peer.port,
@@ -3678,11 +3808,11 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
                         // "primary" whose syncs the real one refuses.
                         let mut active_peer: Option<HaPeer> = None;
                         for peer in &entry.replicas {
-                            if let Ok(v) = peer_status(peer, &c, &secret).await {
+                            if let Ok((v, at)) = peer_status(peer, &c, &secret, &cluster).await {
                                 let p_active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
                                 let p_role = v.get("role").and_then(|s| s.as_str()).unwrap_or("");
                                 if p_active && p_role == "primary" {
-                                    active_peer = Some(peer.clone());
+                                    active_peer = Some(at);
                                     break;
                                 }
                             }
@@ -3717,7 +3847,7 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
                         // either — their witness gate fails the same way).
                         let mut any_replica_reachable = false;
                         for peer in &entry.replicas {
-                            if peer_status(peer, &c, &secret).await.is_ok() {
+                            if peer_status(peer, &c, &secret, &cluster).await.is_ok() {
                                 any_replica_reachable = true;
                                 break;
                             }
@@ -3758,12 +3888,12 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
                     let mut taken_over: Option<HaPeer> = None;
                     let mut all_reachable = true;
                     for peer in &entry.replicas {
-                        match peer_status(peer, &c, &secret).await {
-                            Ok(v) => {
+                        match peer_status(peer, &c, &secret, &cluster).await {
+                            Ok((v, at)) => {
                                 let active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
                                 let their_role = v.get("role").and_then(|s| s.as_str()).unwrap_or("");
                                 if active || their_role == "primary" {
-                                    taken_over = Some(peer.clone());
+                                    taken_over = Some(at);
                                     break;
                                 }
                             }
@@ -3806,7 +3936,7 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
                         tokio::task::spawn_blocking(move || subject_is_running(k, &cc))
                             .await.unwrap_or(false)
                     };
-                    let pstat = peer_status(&primary, &c, &secret).await;
+                    let pstat = peer_status(&primary, &c, &secret, &cluster).await.map(|(v, _)| v);
 
                     // Active-active self-heal: a standby that is somehow
                     // running while the primary also runs is a duplicate —
@@ -3887,7 +4017,7 @@ pub async fn failover_monitor_forever(cluster: std::sync::Arc<crate::agent::Clus
                             if peer.node_id == primary.node_id {
                                 continue;
                             }
-                            if let Ok(v) = peer_status(peer, &c, &secret).await {
+                            if let Ok((v, _)) = peer_status(peer, &c, &secret, &cluster).await {
                                 let their_role = v.get("role").and_then(|s| s.as_str()).unwrap_or("");
                                 let their_stale = v.get("stale").and_then(|s| s.as_bool()).unwrap_or(false);
                                 if their_role == "primary" || (their_role == "replica" && !their_stale) {
@@ -4423,5 +4553,41 @@ mod tests {
         assert!(c2.is_empty() && d2.is_empty(), "second diff should be a no-op");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod peer_address_tests {
+    use super::{first_reachable, merge_peer_addresses};
+
+    #[tokio::test]
+    async fn a_dead_recorded_address_falls_through_to_one_that_answers() {
+        // Production 2026-11-22: the recorded address did not answer and
+        // the registry's did; the round must use the one that answers.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead); // nothing listens there now: connection refused
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let cands = vec![("127.0.0.1".to_string(), dead_port), ("127.0.0.1".to_string(), live_port)];
+        assert_eq!(first_reachable(&cands).await, Some(("127.0.0.1".to_string(), live_port)));
+        assert_eq!(first_reachable(&cands[..1]).await, None);
+    }
+
+    #[test]
+    fn the_registry_address_rescues_an_unroutable_recorded_one() {
+        // Dev cluster 2026-11-22: a dev node recorded itself as its LAN
+        // address; the registry knew its Tailscale address.
+        let a = merge_peer_addresses(("192.0.2.3", 8553), Some(("100.64.0.22", 8553, None)));
+        assert_eq!(a, vec![("192.0.2.3".to_string(), 8553), ("100.64.0.22".to_string(), 8553)]);
+    }
+
+    #[test]
+    fn unusable_and_duplicate_addresses_are_dropped() {
+        let a = merge_peer_addresses(("0.0.0.0", 8553), Some(("10.0.0.3", 8553, Some("10.0.0.3"))));
+        assert_eq!(a, vec![("10.0.0.3".to_string(), 8553)]);
+        assert!(merge_peer_addresses(("127.0.0.1", 8553), None).is_empty());
+        // A node unknown to the registry keeps its recorded address.
+        assert_eq!(merge_peer_addresses(("203.0.113.9", 8553), None), vec![("203.0.113.9".to_string(), 8553)]);
     }
 }

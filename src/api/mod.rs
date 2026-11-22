@@ -13836,44 +13836,6 @@ fn wolfha_self_peer(state: &web::Data<AppState>) -> Result<crate::wolfha::HaPeer
     Ok(crate::wolfha::HaPeer { node_id: me.id, address, port: me.port })
 }
 
-/// Every address this node knows `peer` by, best first: the one recorded
-/// with it, then the cluster registry's (id aliases resolved — a peer
-/// often records itself under its self-id, the registry under another),
-/// then its public IP. Unusable and duplicate addresses dropped.
-///
-/// Source of the requirement: on the dev cluster 2026-11-22 a node had
-/// recorded itself as its LAN address (192.0.2.3), unreachable from its
-/// peer, while the registry's Tailscale address worked — and a promotion
-/// that tried only the recorded one would have declared the live primary
-/// dead and started a second copy.
-fn wolfha_peer_addresses(cluster: &crate::agent::ClusterState, peer: &crate::wolfha::HaPeer) -> Vec<(String, u16)> {
-    let reg = cluster.get_node(&peer.node_id);
-    merge_peer_addresses(
-        (&peer.address, peer.port),
-        reg.as_ref().map(|n| (n.address.as_str(), n.port, n.public_ip.as_deref())),
-    )
-}
-
-/// Pure core of [`wolfha_peer_addresses`]: recorded first, then the
-/// registry's address and public IP; unusable and duplicate entries out.
-fn merge_peer_addresses(recorded: (&str, u16), registry: Option<(&str, u16, Option<&str>)>) -> Vec<(String, u16)> {
-    let usable = |a: &str| !a.is_empty() && a != "0.0.0.0" && !a.starts_with("127.") && a != "::1";
-    let mut out: Vec<(String, u16)> = Vec::new();
-    let mut push = |a: &str, p: u16| {
-        if usable(a) && !out.iter().any(|(x, y)| x == a && *y == p) {
-            out.push((a.to_string(), p));
-        }
-    };
-    push(recorded.0, recorded.1);
-    if let Some((addr, port, public)) = registry {
-        push(addr, port);
-        if let Some(ip) = public {
-            push(ip, port);
-        }
-    }
-    out
-}
-
 /// Seconds since the cluster last saw `node_id` alive, if it counts it
 /// online and fresh within that node's own online window — the same test
 /// the automatic failover's "one-sided network problem" gate uses
@@ -13888,20 +13850,6 @@ fn wolfha_peer_seen_online(cluster: &crate::agent::ClusterState, node_id: &str) 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let ago = now.saturating_sub(n.last_seen);
     (ago < cluster.online_window_for(&n)).then_some(ago)
-}
-
-/// First of `cands` that accepts a TCP connection within 3 s.
-async fn wolfha_first_reachable(cands: &[(String, u16)]) -> Option<(String, u16)> {
-    for (a, p) in cands {
-        let target = if a.contains(':') { format!("[{}]:{}", a, p) } else { format!("{}:{}", a, p) };
-        if let Ok(Ok(_)) = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::net::TcpStream::connect(&target),
-        ).await {
-            return Some((a.clone(), *p));
-        }
-    }
-    None
 }
 
 /// GET /api/wolfha/list — this node's HA entries plus live state.
@@ -14245,6 +14193,7 @@ async fn wolfha_enable_pve(
     failover_after: u64,
     self_peer: crate::wolfha::HaPeer,
     secret: String,
+    cluster: Arc<ClusterState>,
     tasks: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
     tid: String,
 ) {
@@ -14313,7 +14262,7 @@ async fn wolfha_enable_pve(
         &format!("Streaming {} dataset(s) to {} standby(s) with zfs send (the container keeps running)…", datasets.len(), peers.len()));
     wolfha_protect_note(&container,
         &format!("Streaming {} dataset(s) to {} standby(s) with zfs send…", datasets.len(), peers.len()));
-    if let Err(e) = crate::wolfha::sync_container_now(&container).await {
+    if let Err(e) = crate::wolfha::sync_container_now(&container, &cluster).await {
         return wolfha_enable_pve_unwind(&container, &datasets, had_onboot, &tasks, &tid,
             format!("Seeding failed: {}. No HA entry was created — fix the cause and try again.", e)).await;
     }
@@ -15018,6 +14967,7 @@ pub async fn wolfha_enable(
     wolfha_protect_note(&container, "Preparing initial replica seed…");
     let tid = task_id.clone();
     let secret = state.cluster_secret.clone();
+    let enable_cluster = state.cluster.clone();
 
     tokio::spawn(async move {
         // Holds the per-container protect slot for the life of this
@@ -15025,7 +14975,7 @@ pub async fn wolfha_enable(
         let _inflight_guard = inflight_guard;
         if subject_kind == crate::wolfha::SubjectKind::PveContainer {
             wolfha_enable_pve(container, peers, interval, auto_failover, witness, failover_after,
-                self_peer, secret, tasks, tid).await;
+                self_peer, secret, enable_cluster, tasks, tid).await;
             return;
         }
         // One live full tar of the rootfs, shipped to every replica. The
@@ -15172,7 +15122,21 @@ pub async fn wolfha_enable(
         migration_update(&tasks, &tid, "seed", "Creating live rootfs snapshot…");
         wolfha_protect_note(&container, "Creating live rootfs snapshot…");
         let (rootfs_c, archive_c) = (rootfs.clone(), archive.clone());
-        let tar_res = tokio::task::spawn_blocking(move || crate::wolfha::tar_full_rootfs(&rootfs_c, &archive_c)).await;
+        // Packing a large rootfs takes many minutes (an 11 GB one sat on
+        // one unchanging line long enough to look hung — 2026-11-22), so
+        // report the compressed size as it grows.
+        let mut tar = tokio::task::spawn_blocking(move || crate::wolfha::tar_full_rootfs(&rootfs_c, &archive_c));
+        let tar_res = loop {
+            tokio::select! {
+                r = &mut tar => break r,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    let mb = tokio::fs::metadata(&archive).await.map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                    let msg = format!("Packing the rootfs for the first copy — {} MB compressed so far (the container keeps running)…", mb);
+                    migration_update(&tasks, &tid, "seed", &msg);
+                    wolfha_protect_note(&container, &msg);
+                }
+            }
+        };
         if let Err(e) = tar_res.map_err(|e| e.to_string()).and_then(|r| r) {
             let _ = std::fs::remove_file(&archive);
             wolfha_protect_fail(&container, &format!("Seed snapshot failed: {}", e));
@@ -15411,8 +15375,9 @@ pub async fn wolfha_sync_now(
         return HttpResponse::Ok().json(serde_json::json!({ "message": "a sync round is already running for this container" }));
     }
     let c = container.clone();
+    let cluster = state.cluster.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::wolfha::sync_container_now(&c).await {
+        if let Err(e) = crate::wolfha::sync_container_now(&c, &cluster).await {
             tracing::warn!("wolfha: manual sync of '{}': {}", c, e);
         }
         crate::wolfha::end_sync(&c);
@@ -15455,12 +15420,12 @@ pub async fn wolfha_demote(
         if let Some(ip) = peer_ip(&req) {
             cands.push((ip.to_string(), new_primary.port));
         }
-        for c in wolfha_peer_addresses(&state.cluster, &new_primary) {
+        for c in crate::wolfha::peer_addresses(&state.cluster, &new_primary) {
             if !cands.contains(&c) {
                 cands.push(c);
             }
         }
-        if let Some((a, p)) = wolfha_first_reachable(&cands).await
+        if let Some((a, p)) = crate::wolfha::first_reachable(&cands).await
             && (a != new_primary.address || p != new_primary.port)
         {
             tracing::info!("wolfha[{}]: new primary {} advertised {}:{}, reachable at {}:{} — using that",
@@ -15784,6 +15749,10 @@ pub async fn wolfha_promote(
         // Set once the old primary has stopped and demoted itself — from
         // then on a failed start here must hand the container back.
         let mut handed_off_by: Option<crate::wolfha::HaPeer> = None;
+        // The address the old primary answered the handoff on. It joins
+        // this container's standbys once promoted, and a standby recorded
+        // under an address that doesn't answer never gets another sync.
+        let mut answered_at: Option<(String, u16)> = None;
         if let Some(primary) = current_primary {
             migration_update(&tasks, &tid, "handoff",
                 &format!("Asking {} to stop '{}' and push a final delta…", primary.node_id, container));
@@ -15800,7 +15769,7 @@ pub async fn wolfha_promote(
             // beside it.
             let mut refused: Option<String> = None;
             let mut unreachable: Vec<String> = Vec::new();
-            'addresses: for (addr, port) in wolfha_peer_addresses(&cluster_for_dedupe, &primary) {
+            'addresses: for (addr, port) in crate::wolfha::peer_addresses(&cluster_for_dedupe, &primary) {
                 for url in build_node_urls(&addr, port, "/api/wolfha/demote") {
                     match client.post(&url)
                         .peer_auth(secret.clone())
@@ -15813,6 +15782,7 @@ pub async fn wolfha_promote(
                             handoff_msg = v.get("message").and_then(|m| m.as_str())
                                 .unwrap_or("clean handoff from the old primary").to_string();
                             handed_off_by = Some(primary.clone());
+                            answered_at = Some((addr.clone(), port));
                             break 'addresses;
                         }
                         Ok(r) => {
@@ -15847,7 +15817,12 @@ pub async fn wolfha_promote(
         migration_update(&tasks, &tid, "start", &format!("Promoting and starting '{}' here…", container));
         let c = container.clone();
         let me = self_peer.clone();
-        let blk = web::block(move || crate::wolfha::promote_local(&c, Some(me))).await;
+        let blk = web::block(move || {
+            if let Some((a, p)) = &answered_at {
+                crate::wolfha::set_primary_address(&c, a, *p)?;
+            }
+            crate::wolfha::promote_local(&c, Some(me))
+        }).await;
         if matches!(blk, Ok(Ok(()))) {
             // A replica set inherited through a failover can hold the same
             // machine under two aliases — canonicalise it immediately.
@@ -15879,7 +15854,7 @@ pub async fn wolfha_promote(
         });
         let mut resume_err = String::from("no address answered");
         let mut resumed = false;
-        let resume_urls: Vec<String> = wolfha_peer_addresses(&cluster_for_dedupe, &old)
+        let resume_urls: Vec<String> = crate::wolfha::peer_addresses(&cluster_for_dedupe, &old)
             .into_iter()
             .flat_map(|(a, p)| build_node_urls(&a, p, "/api/wolfha/resume"))
             .collect();
@@ -52058,28 +52033,6 @@ mod predictive_forward_tests {
         // normal operator and may federate.
         assert!(is_operator_request("apikey"));
         assert!(is_operator_request("apikeys-admin"));
-    }
-}
-
-#[cfg(test)]
-mod wolfha_peer_address_tests {
-    use super::merge_peer_addresses;
-
-    #[test]
-    fn the_registry_address_rescues_an_unroutable_recorded_one() {
-        // Dev cluster 2026-11-22: a dev node recorded itself as its LAN
-        // address; the registry knew its Tailscale address.
-        let a = merge_peer_addresses(("192.0.2.3", 8553), Some(("100.64.0.22", 8553, None)));
-        assert_eq!(a, vec![("192.0.2.3".to_string(), 8553), ("100.64.0.22".to_string(), 8553)]);
-    }
-
-    #[test]
-    fn unusable_and_duplicate_addresses_are_dropped() {
-        let a = merge_peer_addresses(("0.0.0.0", 8553), Some(("10.0.0.3", 8553, Some("10.0.0.3"))));
-        assert_eq!(a, vec![("10.0.0.3".to_string(), 8553)]);
-        assert!(merge_peer_addresses(("127.0.0.1", 8553), None).is_empty());
-        // A node unknown to the registry keeps its recorded address.
-        assert_eq!(merge_peer_addresses(("203.0.113.9", 8553), None), vec![("203.0.113.9".to_string(), 8553)]);
     }
 }
 
