@@ -87657,6 +87657,14 @@ async function loadWolfHa() {
     listEl.innerHTML = attemptCards + names.map(name => {
         const copies = byContainer[name];
         const primary = copies.find(c => c.role === 'primary' && !c.stale);
+        // A protect still seeding: each standby records its copy as its
+        // seed lands, but the primary records the HA entry only once every
+        // standby is done. In between there is no primary entry — that is
+        // NOT a lost primary, and offering "Promote — primary is gone"
+        // there invited a takeover of a container still running at its
+        // source (2026-11-22).
+        const attempt = primary ? null : attempts.find(a => a.container === name);
+        const seeding = !!(attempt && !attempt.error);
         const rows = copies.map(c => {
             const nodeName = c._node.hostname || c._node.id;
             // Theme tokens, not hardcoded hexes: the original pale-on-alpha
@@ -87692,6 +87700,8 @@ async function loadWolfHa() {
                 actions = `<button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="wolfHaSyncNow('${vlanEsc(c._node.id)}', '${vlanEsc(name)}')">Sync now</button>
                     <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick='wolfHaOpenSettings(${JSON.stringify(c._node.id)}, ${JSON.stringify(name)}, ${JSON.stringify({interval_minutes: c.interval_minutes, auto_failover: !!c.auto_failover, witness: c.witness || "", failover_after_secs: c.failover_after_secs || 90})})'>Settings</button>
                     <button class="btn btn-sm btn-danger" style="font-size:11px;padding:2px 8px;" onclick="wolfHaDisable('${vlanEsc(c._node.id)}', '${vlanEsc(name)}')">Disable HA</button>`;
+            } else if (attempt) {
+                actions = '';
             } else {
                 const label = primary ? 'Promote (failover)' : 'Promote — primary is gone';
                 actions = `<button class="btn btn-sm" style="font-size:11px;padding:2px 8px;background:var(--warning);color:#111;border-color:var(--warning);" onclick="wolfHaPromote('${vlanEsc(c._node.id)}', '${vlanEsc(name)}', ${primary ? 'true' : 'false'})">${label}</button>`;
@@ -87706,8 +87716,17 @@ async function loadWolfHa() {
         }).join('');
         const isVm = copies.some(c => c.kind === 'vm');
         const isPve = copies.some(c => c.kind === 'pve_container');
-        const warn = primary ? '' :
-            `<div style="margin-top:6px;font-size:11px;color:var(--warning);">No active primary is reachable for this ${isVm ? 'VM' : 'container'} — promote the freshest standby to bring it back.</div>`;
+        const attemptNode = attempt ? (attempt._node.hostname || attempt._node.id) : '';
+        const warn = primary ? ''
+            : seeding
+                ? `<div role="status" style="margin-top:6px;font-size:12px;color:var(--text-muted);">Being protected from ${vlanEsc(attemptNode)} — it keeps running there. ${vlanEsc(attempt.message)} <span style="font-size:10px;">(${wolfHaAge(attempt.updated_at)})</span></div>`
+                : attempt
+                    ? `<div role="alert" style="margin-top:6px;font-size:12px;color:var(--danger);">Protecting from ${vlanEsc(attemptNode)} failed: ${vlanEsc(attempt.error)} — the container still runs there; this copy is left over from the attempt.</div>
+                       <div style="margin-top:8px;display:flex;gap:6px;">
+                           <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="wolfHaOpenProtectModal()">Try again</button>
+                           <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="wolfHaDismissAttempt('${vlanEsc(attempt._node.id)}','${vlanEsc(name)}')">Dismiss</button>
+                       </div>`
+                    : `<div style="margin-top:6px;font-size:11px;color:var(--warning);">No active primary is reachable for this ${isVm ? 'VM' : 'container'} — promote the freshest standby to bring it back.</div>`;
         // Theme tokens only, same rule as the badges above: a hardcoded
         // colour here reads as a wash on light/arctic/fruit.
         const kindBadge = isVm

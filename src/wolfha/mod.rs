@@ -2229,12 +2229,26 @@ async fn sync_one_replica_from(
 /// Content-Length — the receiver's progress and limits see a size, not
 /// chunked-unknown.
 pub async fn stream_archive_part(path: &str) -> Result<reqwest::multipart::Part, String> {
+    stream_archive_part_counted(path, None).await
+}
+
+/// [`stream_archive_part`], adding every byte handed to the upload to
+/// `sent` — so a multi-gigabyte seed can report how far it has got.
+pub async fn stream_archive_part_counted(
+    path: &str,
+    sent: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> Result<reqwest::multipart::Part, String> {
+    use futures::StreamExt;
     let file = tokio::fs::File::open(path).await
         .map_err(|e| format!("open archive {}: {}", path, e))?;
     let len = file.metadata().await
         .map_err(|e| format!("archive metadata {}: {}", path, e))?
         .len();
-    let stream = tokio_util::io::ReaderStream::new(file);
+    let stream = tokio_util::io::ReaderStream::new(file).inspect(move |chunk| {
+        if let (Some(c), Ok(b)) = (&sent, chunk) {
+            c.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     Ok(reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), len))
 }
 
