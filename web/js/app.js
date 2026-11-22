@@ -87761,7 +87761,10 @@ async function wolfHaPollTask(nodeId, taskId, label) {
             // final result toast is still delivered.
             const dismissed = !document.getElementById(`wolfha-${taskId}`);
             if (s.completed || !dismissed) {
-                showToast(`${label}: ${s.message}`, s.completed ? (s.error ? 'error' : 'success') : 'info', s.completed ? 10000 : 0, `wolfha-${taskId}`);
+                // A failure stays until dismissed: a promotion's error names
+                // what is missing and what was rolled back — the operator
+                // has to be able to read and copy it, not race a timer.
+                showToast(`${label}: ${s.message}`, s.completed ? (s.error ? 'error' : 'success') : 'info', s.completed && !s.error ? 10000 : 0, `wolfha-${taskId}`);
             }
             if (s.completed) { loadWolfHa(); return; }
         } catch (e) {
@@ -87828,7 +87831,9 @@ async function wolfHaDoPromote(nodeId, container) {
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.task_id) {
-            showToast(data.error || 'Promotion failed to start', 'error');
+            // Stays until dismissed: a refusal lists everything this node
+            // is missing to start the copy.
+            showToast(data.error || 'Promotion failed to start', 'error', 0);
             return;
         }
         showToast(`Promoting '${container}'…`, 'info', 4000, `wolfha-${data.task_id}`);
