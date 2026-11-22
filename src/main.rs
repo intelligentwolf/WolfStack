@@ -2885,7 +2885,7 @@ async fn main() -> std::io::Result<()> {
             tokio::time::sleep(Duration::from_secs(30)).await;
             wolfha::boot_guard().await;
         });
-        tokio::spawn(wolfha::scheduler_forever());
+        tokio::spawn(wolfha::scheduler_forever(cluster.clone()));
         let wolfha_cluster = cluster.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(45)).await;
