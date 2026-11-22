@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.48.3: WolfHA shows protect progress and never offers a takeover mid-protect** _(2026-11-22 — [`f007bc83`](https://github.com/intelligentwolf/WolfStack/commit/f007bc83ef1386cba9e50436f031bb12054330a0))_
+- **v25.48.2: WolfHA keeps syncing a standby whose recorded address stopped answering** _(2026-11-22 — [`ed007f86`](https://github.com/intelligentwolf/WolfStack/commit/ed007f86baa05b7c8da697a190451abc105d8aa4))_
 - **v25.48.1: update the web server, email and URL libraries with known vulnerabilities** _(2026-11-22 — [`a80d57d8`](https://github.com/intelligentwolf/WolfStack/commit/a80d57d809030a0882f8ddc731938ee4a8a17312))_
 - **v25.48.0: a WolfHA promotion is refused before anything stops if the standby can't run the container, and never starts a second copy** _(2026-11-22 — [`64a66cdb`](https://github.com/intelligentwolf/WolfStack/commit/64a66cdb4cdde128624c164b23b958708827f17d))_
 - **v25.47.0: find intruders inside containers, not just on the host, and quarantine one in a click** _(2026-11-22 — [`b75406ed`](https://github.com/intelligentwolf/WolfStack/commit/b75406edc9acb4431d48e5be99e014261d4e934e))_
