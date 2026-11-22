@@ -87967,7 +87967,7 @@ function wolfHaOpenProtectModal() {
                 <div id="wolfha-replicas" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;font-size:13px;">
                     ${nodes.map(n => `<label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" class="wolfha-replica-cb" value="${vlanEsc(n.id)}" onchange="wolfHaReplicaTick(this)"> ${vlanEsc(n.hostname || n.id)} <span class="wolfha-prio" data-node="${vlanEsc(n.id)}" style="font-size:10px;color:var(--text-muted);"></span></label>`).join('')}
                 </div>
-                <span style="font-size:11px;color:var(--text-muted);">The subject's own node is ignored if ticked. The first-ticked standby is preferred at failover.</span></div>
+                <span style="font-size:11px;color:var(--text-muted);">A copy must live on a different machine, so the node it runs on can't be picked. The first-ticked standby is preferred at failover.</span></div>
             <div><label style="font-size:13px;color:var(--text-muted);">Sync interval (minutes)</label>
                 <input id="wolfha-interval" type="number" min="1" value="5" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 <span id="wolfha-interval-hint" style="font-size:11px;color:var(--text-muted);">A failover can lose up to this much recent change — anything running a database should use the database's own replication instead.</span></div>
@@ -88022,11 +88022,31 @@ async function wolfHaSuggestWitness() {
     } catch (_) { hintEl.textContent = ''; }
 }
 
+// The node the subject runs on can't hold its standby — a copy on the
+// same machine dies with it. Its tick box is disabled and labelled the
+// moment it's picked as the source (it used to stay tickable and was
+// silently dropped on submit, which read as a bug — Paul, 2026-11-22).
+function wolfHaMarkSourceNode(nodeId) {
+    document.querySelectorAll('.wolfha-replica-cb').forEach(cb => {
+        const isSource = !!nodeId && cb.value === nodeId;
+        cb.disabled = isSource;
+        if (isSource && cb.checked) {
+            cb.checked = false;
+            wolfHaReplicaTick(cb);
+        }
+        const prio = cb.parentElement?.querySelector('.wolfha-prio');
+        if (prio && isSource) prio.textContent = '(runs here — the source)';
+        else if (prio && prio.textContent === '(runs here — the source)') prio.textContent = '';
+        if (cb.parentElement) cb.parentElement.style.opacity = isSource ? '0.6' : '';
+    });
+}
+
 // Load the protectable subjects for the chosen node, for whichever kind
 // the operator picked. Also retitles the surrounding labels so the modal
 // never says "container" while listing VMs.
 async function wolfHaLoadSubjects() {
     const nodeId = document.getElementById('wolfha-node')?.value;
+    wolfHaMarkSourceNode(nodeId);
     const kind = document.getElementById('wolfha-kind')?.value || 'container';
     const sel = document.getElementById('wolfha-container');
     const isVm = kind === 'vm';
@@ -88073,6 +88093,7 @@ function wolfHaReplicaTick(cb) {
     _wolfHaTickOrder = _wolfHaTickOrder.filter(id => id !== cb.value);
     if (cb.checked) _wolfHaTickOrder.push(cb.value);
     document.querySelectorAll('.wolfha-prio').forEach(el => {
+        if (el.textContent === '(runs here — the source)') return;
         const idx = _wolfHaTickOrder.indexOf(el.getAttribute('data-node'));
         el.textContent = idx >= 0 ? `priority ${idx + 1}` : '';
     });
@@ -88089,7 +88110,7 @@ async function wolfHaSubmitProtect() {
     const after = parseInt(document.getElementById('wolfha-after')?.value, 10) || 90;
     const kind = document.getElementById('wolfha-kind')?.value || 'container';
     if (!nodeId || !container) { showToast(`Pick a node and a ${kind === 'vm' ? 'VM' : 'container'}`, 'error'); return; }
-    if (replicas.length === 0) { showToast('Pick at least one replica node (not the subject\'s own node)', 'error'); return; }
+    if (replicas.length === 0) { showToast('Pick at least one replica node other than the one it runs on', 'error'); return; }
     if (autoFailover && !witness) { showToast('Automatic failover needs a witness IP (usually your gateway)', 'error'); return; }
     document.getElementById('wolfha-protect-modal')?.remove();
     try {
