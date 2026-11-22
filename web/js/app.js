@@ -87657,6 +87657,14 @@ async function loadWolfHa() {
     listEl.innerHTML = attemptCards + names.map(name => {
         const copies = byContainer[name];
         const primary = copies.find(c => c.role === 'primary' && !c.stale);
+        // A protect still seeding: each standby records its copy as its
+        // seed lands, but the primary records the HA entry only once every
+        // standby is done. In between there is no primary entry — that is
+        // NOT a lost primary, and offering "Promote — primary is gone"
+        // there invited a takeover of a container still running at its
+        // source (2026-11-22).
+        const attempt = primary ? null : attempts.find(a => a.container === name);
+        const seeding = !!(attempt && !attempt.error);
         const rows = copies.map(c => {
             const nodeName = c._node.hostname || c._node.id;
             // Theme tokens, not hardcoded hexes: the original pale-on-alpha
@@ -87692,6 +87700,8 @@ async function loadWolfHa() {
                 actions = `<button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="wolfHaSyncNow('${vlanEsc(c._node.id)}', '${vlanEsc(name)}')">Sync now</button>
                     <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick='wolfHaOpenSettings(${JSON.stringify(c._node.id)}, ${JSON.stringify(name)}, ${JSON.stringify({interval_minutes: c.interval_minutes, auto_failover: !!c.auto_failover, witness: c.witness || "", failover_after_secs: c.failover_after_secs || 90})})'>Settings</button>
                     <button class="btn btn-sm btn-danger" style="font-size:11px;padding:2px 8px;" onclick="wolfHaDisable('${vlanEsc(c._node.id)}', '${vlanEsc(name)}')">Disable HA</button>`;
+            } else if (attempt) {
+                actions = '';
             } else {
                 const label = primary ? 'Promote (failover)' : 'Promote — primary is gone';
                 actions = `<button class="btn btn-sm" style="font-size:11px;padding:2px 8px;background:var(--warning);color:#111;border-color:var(--warning);" onclick="wolfHaPromote('${vlanEsc(c._node.id)}', '${vlanEsc(name)}', ${primary ? 'true' : 'false'})">${label}</button>`;
@@ -87706,8 +87716,17 @@ async function loadWolfHa() {
         }).join('');
         const isVm = copies.some(c => c.kind === 'vm');
         const isPve = copies.some(c => c.kind === 'pve_container');
-        const warn = primary ? '' :
-            `<div style="margin-top:6px;font-size:11px;color:var(--warning);">No active primary is reachable for this ${isVm ? 'VM' : 'container'} — promote the freshest standby to bring it back.</div>`;
+        const attemptNode = attempt ? (attempt._node.hostname || attempt._node.id) : '';
+        const warn = primary ? ''
+            : seeding
+                ? `<div role="status" style="margin-top:6px;font-size:12px;color:var(--text-muted);">Being protected from ${vlanEsc(attemptNode)} — it keeps running there. ${vlanEsc(attempt.message)} <span style="font-size:10px;">(${wolfHaAge(attempt.updated_at)})</span></div>`
+                : attempt
+                    ? `<div role="alert" style="margin-top:6px;font-size:12px;color:var(--danger);">Protecting from ${vlanEsc(attemptNode)} failed: ${vlanEsc(attempt.error)} — the container still runs there; this copy is left over from the attempt.</div>
+                       <div style="margin-top:8px;display:flex;gap:6px;">
+                           <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="wolfHaOpenProtectModal()">Try again</button>
+                           <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="wolfHaDismissAttempt('${vlanEsc(attempt._node.id)}','${vlanEsc(name)}')">Dismiss</button>
+                       </div>`
+                    : `<div style="margin-top:6px;font-size:11px;color:var(--warning);">No active primary is reachable for this ${isVm ? 'VM' : 'container'} — promote the freshest standby to bring it back.</div>`;
         // Theme tokens only, same rule as the badges above: a hardcoded
         // colour here reads as a wash on light/arctic/fruit.
         const kindBadge = isVm
@@ -87948,7 +87967,7 @@ function wolfHaOpenProtectModal() {
                 <div id="wolfha-replicas" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;font-size:13px;">
                     ${nodes.map(n => `<label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" class="wolfha-replica-cb" value="${vlanEsc(n.id)}" onchange="wolfHaReplicaTick(this)"> ${vlanEsc(n.hostname || n.id)} <span class="wolfha-prio" data-node="${vlanEsc(n.id)}" style="font-size:10px;color:var(--text-muted);"></span></label>`).join('')}
                 </div>
-                <span style="font-size:11px;color:var(--text-muted);">The subject's own node is ignored if ticked. The first-ticked standby is preferred at failover.</span></div>
+                <span style="font-size:11px;color:var(--text-muted);">A copy must live on a different machine, so the node it runs on can't be picked. The first-ticked standby is preferred at failover.</span></div>
             <div><label style="font-size:13px;color:var(--text-muted);">Sync interval (minutes)</label>
                 <input id="wolfha-interval" type="number" min="1" value="5" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 <span id="wolfha-interval-hint" style="font-size:11px;color:var(--text-muted);">A failover can lose up to this much recent change — anything running a database should use the database's own replication instead.</span></div>
@@ -88003,11 +88022,31 @@ async function wolfHaSuggestWitness() {
     } catch (_) { hintEl.textContent = ''; }
 }
 
+// The node the subject runs on can't hold its standby — a copy on the
+// same machine dies with it. Its tick box is disabled and labelled the
+// moment it's picked as the source (it used to stay tickable and was
+// silently dropped on submit, which read as a bug — Paul, 2026-11-22).
+function wolfHaMarkSourceNode(nodeId) {
+    document.querySelectorAll('.wolfha-replica-cb').forEach(cb => {
+        const isSource = !!nodeId && cb.value === nodeId;
+        cb.disabled = isSource;
+        if (isSource && cb.checked) {
+            cb.checked = false;
+            wolfHaReplicaTick(cb);
+        }
+        const prio = cb.parentElement?.querySelector('.wolfha-prio');
+        if (prio && isSource) prio.textContent = '(runs here — the source)';
+        else if (prio && prio.textContent === '(runs here — the source)') prio.textContent = '';
+        if (cb.parentElement) cb.parentElement.style.opacity = isSource ? '0.6' : '';
+    });
+}
+
 // Load the protectable subjects for the chosen node, for whichever kind
 // the operator picked. Also retitles the surrounding labels so the modal
 // never says "container" while listing VMs.
 async function wolfHaLoadSubjects() {
     const nodeId = document.getElementById('wolfha-node')?.value;
+    wolfHaMarkSourceNode(nodeId);
     const kind = document.getElementById('wolfha-kind')?.value || 'container';
     const sel = document.getElementById('wolfha-container');
     const isVm = kind === 'vm';
@@ -88054,6 +88093,7 @@ function wolfHaReplicaTick(cb) {
     _wolfHaTickOrder = _wolfHaTickOrder.filter(id => id !== cb.value);
     if (cb.checked) _wolfHaTickOrder.push(cb.value);
     document.querySelectorAll('.wolfha-prio').forEach(el => {
+        if (el.textContent === '(runs here — the source)') return;
         const idx = _wolfHaTickOrder.indexOf(el.getAttribute('data-node'));
         el.textContent = idx >= 0 ? `priority ${idx + 1}` : '';
     });
@@ -88070,7 +88110,7 @@ async function wolfHaSubmitProtect() {
     const after = parseInt(document.getElementById('wolfha-after')?.value, 10) || 90;
     const kind = document.getElementById('wolfha-kind')?.value || 'container';
     if (!nodeId || !container) { showToast(`Pick a node and a ${kind === 'vm' ? 'VM' : 'container'}`, 'error'); return; }
-    if (replicas.length === 0) { showToast('Pick at least one replica node (not the subject\'s own node)', 'error'); return; }
+    if (replicas.length === 0) { showToast('Pick at least one replica node other than the one it runs on', 'error'); return; }
     if (autoFailover && !witness) { showToast('Automatic failover needs a witness IP (usually your gateway)', 'error'); return; }
     document.getElementById('wolfha-protect-modal')?.remove();
     try {

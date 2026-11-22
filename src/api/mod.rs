@@ -15184,7 +15184,8 @@ pub async fn wolfha_enable(
             for url in &urls {
                 // Fresh streaming part per attempt — the archive is read
                 // from disk as it uploads, never buffered.
-                let part = match crate::wolfha::stream_archive_part(&archive).await {
+                let sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let part = match crate::wolfha::stream_archive_part_counted(&archive, Some(sent.clone())).await {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = std::fs::remove_file(&archive);
@@ -15200,12 +15201,31 @@ pub async fn wolfha_enable(
                     .text("wolfnet_ip", wolfnet_ip.clone())
                     .text("ha_meta", ha_meta_json.clone())
                     .part("archive", part.file_name("seed.tar.gz"));
-                match client.post(url)
+                let send = client.post(url)
                     .peer_auth(secret.clone())
                     .timeout(std::time::Duration::from_secs(3600))
                     .multipart(form)
-                    .send().await
-                {
+                    .send();
+                tokio::pin!(send);
+                // A seed upload runs for minutes; without this the status
+                // sat on one line and looked hung (2026-11-22). Once every
+                // byte is sent the standby is unpacking before it answers.
+                let resp = loop {
+                    tokio::select! {
+                        r = &mut send => break r,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                            let mb = sent.load(std::sync::atomic::Ordering::Relaxed) / (1024 * 1024);
+                            let msg = if mb >= size_mb {
+                                format!("Seeding replica {}/{} on {} — all {} MB sent, unpacking it there…", i + 1, peers.len(), peer.node_id, size_mb)
+                            } else {
+                                format!("Seeding replica {}/{} on {} — {} of {} MB sent…", i + 1, peers.len(), peer.node_id, mb, size_mb)
+                            };
+                            migration_update(&tasks, &tid, "seed", &msg);
+                            wolfha_protect_note(&container, &msg);
+                        }
+                    }
+                };
+                match resp {
                     Ok(r) if r.status().is_success() => { ok = true; break; }
                     Ok(r) => {
                         let status = r.status();
