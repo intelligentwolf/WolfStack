@@ -82,6 +82,7 @@ fn category_to_severity(c: AlertCategory) -> &'static str {
         AlertCategory::Compromise => "critical",
         AlertCategory::Capacity { urgent: true } => "critical",
         AlertCategory::Capacity { urgent: false } => "warning",
+        AlertCategory::Hardware => "critical",
         AlertCategory::BruteForce | AlertCategory::Posture => "warning",
         AlertCategory::Threshold | AlertCategory::Lifecycle => "info",
     }
@@ -386,6 +387,13 @@ pub struct AlertConfig {
     /// flip this off without untangling individual per-rule toggles.
     #[serde(default = "default_true")]
     pub recovery_notifications: bool,
+
+    /// Version of the cluster-shared alert settings: unix milliseconds of
+    /// the operator save (on any node) they came from. Nodes in a cluster
+    /// converge on the highest one — see `api::alert_settings_reconcile`.
+    /// 0 = never saved through a version that tracks it.
+    #[serde(default)]
+    pub shared_rev: u64,
 }
 
 /// Quiet-hours window. When `enabled` is true and the current time
@@ -506,6 +514,18 @@ pub enum AlertCategory {
     /// wake-me-up signal. Non-urgent ones respect quiet hours when the
     /// operator lists "capacity" there.
     Capacity { urgent: bool },
+    /// A physical disk is failing or has dropped out, or a RAID array has
+    /// lost redundancy — plus the weekly "are the disks OK" report. Fires
+    /// under Simple too. Until this existed the storage watcher filed
+    /// these as `Lifecycle`, which Simple drops: wolfstack-1 lost one
+    /// half of its md3 mirror on 2026-11-15 and the operator heard
+    /// nothing for eight days, because the only trace was a line in the
+    /// dashboard's in-memory alert log. One more disk failure there would
+    /// have been data loss, so this is never "noise".
+    ///
+    /// Respects quiet hours when the operator lists "hardware" there: a
+    /// degraded mirror is still serving, so it can wait until morning.
+    Hardware,
 }
 
 fn default_cpu_threshold() -> f32 { 90.0 }
@@ -539,6 +559,7 @@ impl AlertCategory {
             AlertCategory::Threshold  => "threshold",
             AlertCategory::Lifecycle  => "lifecycle",
             AlertCategory::Capacity { .. } => "capacity",
+            AlertCategory::Hardware => "hardware",
         }
     }
 }
@@ -570,6 +591,7 @@ impl Default for AlertConfig {
             grouping_window_secs: 0,
             grouping_strategy: GroupingStrategy::ByNode,
             recovery_notifications: true,
+            shared_rev: 0,
             discord_bot_token: String::new(),
             telegram_receiver_enabled: false,
             twilio_account_sid: String::new(),
@@ -598,6 +620,31 @@ impl AlertConfig {
     /// SMTP password, and — once wired — a Discord *bot* token that's
     /// vastly more sensitive than a webhook). /etc/wolfstack defaults
     /// to 755, so without this the file would be world-readable.
+    /// The shared-settings version to advertise to peers. A node whose
+    /// settings predate `shared_rev` but are actually in use (alerts on and
+    /// a delivery path set up) is given its file's modification time once
+    /// and persists it, so an existing, working setup becomes the copy the
+    /// rest of the cluster converges on after the upgrade — with no
+    /// operator action. A node that was never configured stays at 0 and
+    /// never overwrites anyone.
+    pub fn effective_shared_rev(&mut self) -> u64 {
+        if self.shared_rev == 0 && self.enabled && self.has_delivery() {
+            let mtime_ms = std::fs::metadata(alerts_config_file())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if mtime_ms > 0 {
+                self.shared_rev = mtime_ms;
+                if let Err(e) = self.save() {
+                    warn!("could not record alert settings version: {e}");
+                }
+            }
+        }
+        self.shared_rev
+    }
+
     pub fn save(&self) -> Result<(), String> {
         let path = alerts_config_file();
         if let Some(dir) = std::path::Path::new(&path).parent() {
@@ -648,13 +695,15 @@ impl AlertConfig {
 
     /// Whether an alert of the given category should be dispatched
     /// under the current verbosity setting. Simple mode allows
-    /// `Compromise` and `Capacity`; Verbose allows everything.
+    /// `Compromise`, `Capacity` and `Hardware`; Verbose allows everything.
     pub fn allows(&self, category: AlertCategory) -> bool {
         match self.alert_verbosity {
             AlertVerbosity::Verbose => true,
             AlertVerbosity::Simple => matches!(
                 category,
-                AlertCategory::Compromise | AlertCategory::Capacity { .. }
+                AlertCategory::Compromise
+                    | AlertCategory::Capacity { .. }
+                    | AlertCategory::Hardware
             ),
         }
     }
@@ -1070,7 +1119,7 @@ pub async fn send_alert(config: &AlertConfig, category: AlertCategory, title: &s
 
     let priority: u8 = match category {
         AlertCategory::Compromise | AlertCategory::Capacity { urgent: true } => 5,
-        AlertCategory::Capacity { urgent: false } => 4,
+        AlertCategory::Capacity { urgent: false } | AlertCategory::Hardware => 4,
         _ => 3,
     };
     dispatch_to_channels(config, title, message, priority).await;
@@ -1878,6 +1927,37 @@ mod tests {
             "non-urgent capacity honours quiet hours when listed");
         assert!(cfg.allows_at(AlertCategory::Capacity { urgent: true }, inside),
             "urgent capacity must fire inside quiet hours");
+    }
+
+    /// A failed disk / degraded array must reach the operator under the
+    /// DEFAULT (Simple) verbosity — wolfstack-1's md3 mirror ran on one
+    /// disk for eight days in November 2026 because these were Lifecycle.
+    #[test]
+    fn hardware_fires_in_simple_and_honours_listed_quiet_hours() {
+        let simple = AlertConfig { enabled: true, ..Default::default() };
+        assert_eq!(simple.alert_verbosity, AlertVerbosity::Simple);
+        assert!(simple.allows(AlertCategory::Hardware));
+        assert!(should_send(&simple, AlertCategory::Hardware));
+        assert!(!simple.allows(AlertCategory::Lifecycle));
+
+        let quiet = |cats: Vec<String>| AlertConfig {
+            enabled: true,
+            quiet_hours: Some(QuietHours {
+                enabled: true,
+                start_hhmm: "09:00".into(),
+                end_hhmm: "17:00".into(),
+                timezone: "Europe/Berlin".into(),
+                days_of_week: 0x1F,
+                suppress_categories: cats,
+            }),
+            ..Default::default()
+        };
+        let inside = chrono::DateTime::parse_from_rfc3339("2026-05-19T11:00:00Z")
+            .unwrap().with_timezone(&chrono::Utc);
+        assert!(!quiet(vec!["hardware".into()]).allows_at(AlertCategory::Hardware, inside),
+            "hardware honours quiet hours when the operator lists it");
+        assert!(quiet(vec!["lifecycle".into()]).allows_at(AlertCategory::Hardware, inside),
+            "hardware is not silenced by another category's quiet-hours entry");
     }
 
     #[test]

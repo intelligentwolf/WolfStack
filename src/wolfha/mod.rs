@@ -35,6 +35,7 @@
 
 pub mod binds;
 pub mod replication;
+pub mod storage;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -682,6 +683,7 @@ pub fn dedupe_replicas(container: &str, cluster: &crate::agent::ClusterState) {
 /// Install a full seed on this node: fresh container dir, extracted
 /// rootfs, replica config, marker, optional WolfNet marker. Refuses to
 /// clobber a real (non-replica) container of the same name.
+#[allow(clippy::too_many_arguments)] // one seed's full identity; bundling would only rename them
 pub fn install_seed(
     container: &str,
     kind: SubjectKind,
@@ -690,10 +692,19 @@ pub fn install_seed(
     primary: HaPeer,
     wolfnet_ip: Option<&str>,
     meta: Option<&HaMeta>,
+    target_base: Option<&str>,
 ) -> Result<(), String> {
-    let base = crate::containers::lxc_base_dir(container);
+    // Where the copy goes: the storage location the primary asked for
+    // (validated against this node's registered locations), else wherever
+    // an existing copy already lives, else the default location.
+    let existing_base = crate::containers::lxc_base_dir(container);
+    let existing_dir = format!("{}/{}", existing_base, container);
+    let base = match target_base {
+        Some(b) => storage::resolve_target(Some(b))?,
+        None => existing_base.clone(),
+    };
     let container_dir = format!("{}/{}", base, container);
-    if std::path::Path::new(&container_dir).exists() {
+    if std::path::Path::new(&existing_dir).exists() {
         if !is_replica(container) {
             return Err(format!(
                 "a container named '{}' already exists on this node and is NOT a WolfHA replica — refusing to overwrite it",
@@ -703,6 +714,17 @@ pub fn install_seed(
         // Re-seed of an existing replica: start clean.
         if crate::containers::lxc_is_running(container) {
             return Err(format!("replica '{}' is running here — stop it before re-seeding", container));
+        }
+        std::fs::remove_dir_all(&existing_dir)
+            .map_err(|e| format!("could not clear old replica dir: {}", e))?;
+    }
+    // A copy at `base` that `lxc_base_dir` didn't report (it checks the
+    // locations in order) must also be a replica, or it is someone else's.
+    if container_dir != existing_dir && std::path::Path::new(&container_dir).exists() {
+        if !std::path::Path::new(&format!("{}/{}", container_dir, REPLICA_MARKER)).exists() {
+            return Err(format!(
+                "'{}' already exists in {} and is NOT a WolfHA replica — refusing to overwrite it",
+                container, base));
         }
         std::fs::remove_dir_all(&container_dir)
             .map_err(|e| format!("could not clear old replica dir: {}", e))?;
@@ -1414,8 +1436,14 @@ pub fn vm_set_autostart(name: &str, on: bool) -> Result<(), String> {
 /// every write from before the copy began.
 pub fn vm_take_seed(name: &str) -> Result<(String, u64, crate::vms::manager::VmConfig), String> {
     let (disk, cfg) = vm_disk_and_config(name)?;
-    let stage_dir = "/var/lib/wolfstack/wolfha";
+    let stage_dir = storage::VM_STAGE_DIR;
     std::fs::create_dir_all(stage_dir).map_err(|e| format!("staging dir: {}", e))?;
+    // The seed image is about the size of the disk file (exactly, for a
+    // stopped VM's file copy) — refuse before writing it onto a drive that
+    // can't hold it.
+    let disk_len = std::fs::metadata(&disk).map(|m| m.len())
+        .map_err(|e| format!("read {}: {}", disk, e))?;
+    storage::check_fits(stage_dir, disk_len, "The VM's seed image on this node")?;
     let out = format!("{}/vmseed-{}.qcow2", stage_dir, uuid::Uuid::new_v4());
     if subject_is_running(SubjectKind::Vm, name) {
         // Same 6-hour ceiling as vm_take_delta: a full copy of a large

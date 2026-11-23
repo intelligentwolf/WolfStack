@@ -14374,8 +14374,8 @@ async fn wolfha_read_multipart(
     String,
 > {
     use futures::StreamExt;
-    let stage_dir = "/var/lib/wolfstack/wolfha";
-    std::fs::create_dir_all(stage_dir).map_err(|e| format!("staging dir: {}", e))?;
+    let default_stage_dir = "/var/lib/wolfstack/wolfha";
+    std::fs::create_dir_all(default_stage_dir).map_err(|e| format!("staging dir: {}", e))?;
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut archive_path: Option<String> = None;
     let mut blockdelta_path: Option<String> = None;
@@ -14391,6 +14391,26 @@ async fn wolfha_read_multipart(
         // `efivars` is an OVMF NVRAM image (hundreds of KB) riding along
         // with VM seeds/deltas — binary, so it must never land in the
         // lossy text-field map.
+        // A seed names the storage location its copy goes to (and how much
+        // room it needs) in text fields sent BEFORE the archive: stage the
+        // upload on that same drive, and refuse before writing a byte if it
+        // won't fit — never fill a root disk mid-upload again (2026-11-23).
+        let stage_dir = if field_name == "archive" {
+            match fields.get("target_base").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(base) => {
+                    let base = crate::wolfha::storage::resolve_target(Some(base))?;
+                    let dir = crate::wolfha::storage::staging_dir(&base);
+                    std::fs::create_dir_all(&dir).map_err(|e| format!("staging dir: {}", e))?;
+                    if let Some(need) = fields.get("need_bytes").and_then(|n| n.trim().parse::<u64>().ok()) {
+                        crate::wolfha::storage::check_fits(&base, need, "This copy")?;
+                    }
+                    dir
+                }
+                None => default_stage_dir.to_string(),
+            }
+        } else {
+            default_stage_dir.to_string()
+        };
         let staged = match field_name.as_str() {
             "archive" => Some(format!("{}/incoming-{}.tar.gz", stage_dir, uuid::Uuid::new_v4())),
             "blockdelta" => Some(format!("{}/incoming-{}.blocks", stage_dir, uuid::Uuid::new_v4())),
@@ -14623,6 +14643,9 @@ pub async fn wolfha_receive_seed(
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "archive is required"}));
     };
     let config = fields.get("config").cloned().unwrap_or_default();
+    // Storage location the primary chose for this copy. Absent from older
+    // primaries, which keeps the old behaviour (existing or default path).
+    let target_base = fields.get("target_base").cloned().filter(|s| !s.trim().is_empty());
     let wolfnet_ip = fields.get("wolfnet_ip").cloned().filter(|s| !s.is_empty());
     let ha_meta: Option<crate::wolfha::HaMeta> = fields.get("ha_meta")
         .and_then(|m| serde_json::from_str(m).ok());
@@ -14659,6 +14682,7 @@ pub async fn wolfha_receive_seed(
         web::block(move || {
             crate::wolfha::install_seed(
                 &c, seed_kind, &archive_c, &config, primary, wolfnet_ip.as_deref(), ha_meta.as_ref(),
+                target_base.as_deref(),
             )
         }).await
     };
@@ -14670,6 +14694,154 @@ pub async fn wolfha_receive_seed(
         Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
         Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// Ask a standby for its container storage locations and free space.
+async fn wolfha_peer_storage(
+    peer: &crate::wolfha::HaPeer, secret: &str,
+) -> Result<Vec<crate::wolfha::storage::StorageOption>, String> {
+    let client = &*API_HTTP_CLIENT;
+    let mut last_err = String::from("unreachable");
+    for url in build_node_urls(&peer.address, peer.port, "/api/wolfha/storage") {
+        match client.get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .peer_auth(secret)
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => {
+                let v: serde_json::Value = r.json().await.map_err(|e| e.to_string())?;
+                return serde_json::from_value(v.get("options").cloned().unwrap_or_default())
+                    .map_err(|e| format!("unreadable storage list: {}", e));
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                let _ = r.bytes().await;
+                return Err("its WolfStack is too old to report free space — upgrade it first".to_string());
+            }
+            Ok(r) => {
+                last_err = format!("HTTP {}", r.status().as_u16());
+                let _ = r.bytes().await;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(last_err)
+}
+
+/// Check a standby has room for a VM seed: the staged image, and the disk
+/// it becomes in the same folder as on this node — twice the size when both
+/// sit on one drive.
+async fn wolfha_peer_vm_room(
+    peer: &crate::wolfha::HaPeer, secret: &str, disk_dir: &str, size: u64,
+) -> Result<(), String> {
+    use crate::wolfha::storage::{gb, HEADROOM_BYTES};
+    let client = &*API_HTTP_CLIENT;
+    let q = format!("/api/wolfha/storage?path={}", urlencoding::encode(disk_dir));
+    let mut last_err = String::from("unreachable");
+    for url in build_node_urls(&peer.address, peer.port, &q) {
+        match client.get(&url).timeout(std::time::Duration::from_secs(15)).peer_auth(secret).send().await {
+            Ok(r) if r.status().is_success() => {
+                let v: serde_json::Value = r.json().await.map_err(|e| e.to_string())?;
+                let free = |k: &str| v.get(k).and_then(|x| x.get("free_bytes")).and_then(|x| x.as_u64());
+                let dev = |k: &str| v.get(k).and_then(|x| x.get("device")).and_then(|x| x.as_u64());
+                let (Some(disk_free), Some(stage_free)) = (free("path"), free("vm_staging")) else {
+                    return Err("it did not report free space for the VM's disk folder".to_string());
+                };
+                let same_drive = dev("path").is_some() && dev("path") == dev("vm_staging");
+                let want = |n: u64| n.saturating_add(HEADROOM_BYTES);
+                return if same_drive {
+                    if disk_free >= want(size.saturating_mul(2)) { Ok(()) } else {
+                        Err(format!("the copy needs {} on the drive holding {} (staged image + disk, plus {} kept free) but only {} is free",
+                            gb(size.saturating_mul(2)), disk_dir, gb(HEADROOM_BYTES), gb(disk_free)))
+                    }
+                } else if disk_free < want(size) {
+                    Err(format!("the disk needs {} in {} (plus {} kept free) but only {} is free",
+                        gb(size), disk_dir, gb(HEADROOM_BYTES), gb(disk_free)))
+                } else if stage_free < want(size) {
+                    Err(format!("staging the image needs {} in {} (plus {} kept free) but only {} is free",
+                        gb(size), crate::wolfha::storage::VM_STAGE_DIR, gb(HEADROOM_BYTES), gb(stage_free)))
+                } else { Ok(()) };
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                let _ = r.bytes().await;
+                return Err("its WolfStack is too old to report free space — upgrade it first".to_string());
+            }
+            Ok(r) => {
+                last_err = format!("HTTP {}", r.status().as_u16());
+                let _ = r.bytes().await;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(last_err)
+}
+
+/// The storage location a standby's copy goes to: the requested one, else
+/// the standby's default (most free space) — and only if it fits.
+fn wolfha_pick_storage(
+    opts: &[crate::wolfha::storage::StorageOption], requested: Option<&str>, need: u64,
+) -> Result<String, String> {
+    use crate::wolfha::storage::{gb, HEADROOM_BYTES};
+    let requested = requested.map(str::trim).filter(|s| !s.is_empty());
+    let chosen = match requested {
+        Some(r) => opts.iter().find(|o| o.path.trim_end_matches('/') == r.trim_end_matches('/'))
+            .ok_or_else(|| format!("'{}' is not one of its storage locations", r))?,
+        None => opts.iter().find(|o| o.default)
+            .ok_or_else(|| "it has no container storage location".to_string())?,
+    };
+    if chosen.free_bytes >= need.saturating_add(HEADROOM_BYTES) {
+        return Ok(chosen.path.clone());
+    }
+    let others: Vec<String> = opts.iter()
+        .filter(|o| o.path != chosen.path && o.free_bytes >= need.saturating_add(HEADROOM_BYTES))
+        .map(|o| format!("{} ({} free)", o.path, gb(o.free_bytes)))
+        .collect();
+    Err(format!(
+        "the copy needs {} on {} (plus {} kept free) but only {} is free there{}",
+        gb(need), chosen.path, gb(HEADROOM_BYTES), gb(chosen.free_bytes),
+        if others.is_empty() { " — no storage location on it has room".to_string() }
+        else { format!(" — pick {} instead", others.join(" or ")) }))
+}
+
+#[derive(Deserialize)]
+pub struct WolfHaStorageQuery {
+    /// Optional extra path to report free space for (a VM's disk folder).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// GET /api/wolfha/storage — this node's container storage locations with
+/// free space (the Protect dialog's "store the copy on" list, and the
+/// primary's pre-seed space check). Operator session or cluster secret.
+pub async fn wolfha_storage(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<WolfHaStorageQuery>,
+) -> HttpResponse {
+    if wolfha_peer_auth(&req, &state).is_err()
+        && let Err(resp) = require_auth(&req, &state)
+    {
+        return resp;
+    }
+    let path = query.path.clone().filter(|p| p.starts_with('/'));
+    let res = web::block(move || {
+        let options = crate::wolfha::storage::storage_options();
+        let space = |p: String| crate::wolfha::storage::fs_space(&p).map(|(f, t)| serde_json::json!({
+            "path": p.clone(), "free_bytes": f, "total_bytes": t,
+            "device": crate::wolfha::storage::fs_device(&p),
+        }));
+        let path_space = path.and_then(space);
+        let vm_staging = space(crate::wolfha::storage::VM_STAGE_DIR.to_string());
+        serde_json::json!({
+            "options": options,
+            "path": path_space,
+            "vm_staging": vm_staging,
+            "headroom_bytes": crate::wolfha::storage::HEADROOM_BYTES,
+        })
+    }).await;
+    match res {
+        Ok(v) => HttpResponse::Ok().json(v),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
@@ -14690,6 +14862,12 @@ pub struct WolfHaEnableReq {
     pub witness: String,
     #[serde(default)]
     pub failover_after_secs: u64,
+    /// Standby node id → the storage location (one of that node's
+    /// registered LXC paths) its copy goes to. A standby not listed gets the
+    /// location with the most free space. Containers only — a VM copy keeps
+    /// the storage path its definition names.
+    #[serde(default)]
+    pub storage: std::collections::HashMap<String, String>,
 }
 
 /// Validate the auto-failover settings shared by enable and update.
@@ -14960,6 +15138,7 @@ pub async fn wolfha_enable(
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
     let auto_failover = body.auto_failover;
+    let storage_req = body.storage.clone();
 
     let tasks = state.migration_tasks.clone();
     let task_id = migration_create(&tasks);
@@ -15042,6 +15221,19 @@ pub async fn wolfha_enable(
                 bind_requirements: Vec::new(),
             }).unwrap_or_default();
             let size_mb = seed_size / (1024 * 1024);
+            // Room on every standby, checked before the first byte is sent.
+            let disk_dir = crate::vms::manager::VmManager::new().os_disk_path_for(&vm_cfg)
+                .parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            for peer in &peers {
+                if let Err(e) = wolfha_peer_vm_room(peer, &secret, &disk_dir, seed_size).await {
+                    let _ = std::fs::remove_file(&seed_path);
+                    let vm = container.clone();
+                    let _ = tokio::task::spawn_blocking(move || crate::wolfha::vm_end_tracking(&vm)).await;
+                    wolfha_protect_fail(&container, &format!("Not protected — {}: {}", peer.node_id, e));
+                    migration_fail(&tasks, &tid, &format!("Not protected — {}: {}", peer.node_id, e));
+                    return;
+                }
+            }
             for (i, peer) in peers.iter().enumerate() {
                 migration_update(&tasks, &tid, "seed",
                     &format!("Seeding replica {}/{} on {} ({} MB)…", i + 1, peers.len(), peer.node_id, size_mb));
@@ -15118,7 +15310,59 @@ pub async fn wolfha_enable(
             return;
         }
 
-        let archive = format!("{}/seed-{}.tar.gz", stage_dir, uuid::Uuid::new_v4());
+        // ── Room for the copy, checked BEFORE packing ──
+        // Every standby is asked where its copy goes and whether it fits;
+        // this node checks it has room to pack. Any "no" stops here, before
+        // an hour of packing and a multi-GB upload (2026-11-23: a 172 GB
+        // copy filled a standby's root disk mid-unpack).
+        migration_update(&tasks, &tid, "seed", "Measuring the container to check every standby has room…");
+        wolfha_protect_note(&container, "Measuring the container to check every standby has room…");
+        let rootfs_m = rootfs.clone();
+        let rootfs_bytes = match tokio::task::spawn_blocking(move || crate::wolfha::storage::dir_bytes(&rootfs_m)).await
+            .map_err(|e| e.to_string()).and_then(|r| r)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                wolfha_protect_fail(&container, &format!("Could not measure the container: {}", e));
+                migration_fail(&tasks, &tid, &format!("Could not measure the container: {}", e));
+                return;
+            }
+        };
+        let need = crate::wolfha::storage::seed_need_bytes(rootfs_bytes);
+        let mut targets: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for peer in &peers {
+            let chosen = match wolfha_peer_storage(peer, &secret).await {
+                Ok(opts) => wolfha_pick_storage(&opts, storage_req.get(&peer.node_id).map(|s| s.as_str()), need)
+                    .map_err(|e| format!("{}: {}", peer.node_id, e)),
+                Err(e) => Err(format!(
+                    "could not check free space on {}: {} — nothing was packed or sent", peer.node_id, e)),
+            };
+            match chosen {
+                Ok(path) => { targets.insert(peer.node_id.clone(), path); }
+                Err(e) => {
+                    wolfha_protect_fail(&container, &format!("Not protected — {}", e));
+                    migration_fail(&tasks, &tid, &format!("Not protected — {}", e));
+                    return;
+                }
+            }
+        }
+        // Pack on whichever local storage location has the most room —
+        // never the root disk by default.
+        let local_stage = match tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let base = crate::wolfha::storage::resolve_target(None)?;
+            crate::wolfha::storage::check_fits(&base, rootfs_bytes, "Packing the first copy on this node")?;
+            let dir = crate::wolfha::storage::staging_dir(&base);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("staging dir: {}", e))?;
+            Ok(dir)
+        }).await.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok(d) => d,
+            Err(e) => {
+                wolfha_protect_fail(&container, &format!("Not protected — {}", e));
+                migration_fail(&tasks, &tid, &format!("Not protected — {}", e));
+                return;
+            }
+        };
+        let archive = format!("{}/seed-{}.tar.gz", local_stage, uuid::Uuid::new_v4());
         migration_update(&tasks, &tid, "seed", "Creating live rootfs snapshot…");
         wolfha_protect_note(&container, "Creating live rootfs snapshot…");
         let (rootfs_c, archive_c) = (rootfs.clone(), archive.clone());
@@ -15200,6 +15444,10 @@ pub async fn wolfha_enable(
                     .text("primary", primary_json.clone())
                     .text("wolfnet_ip", wolfnet_ip.clone())
                     .text("ha_meta", ha_meta_json.clone())
+                    // Sent before the archive: the standby stages the upload
+                    // on this drive and checks the room before writing.
+                    .text("target_base", targets.get(&peer.node_id).cloned().unwrap_or_default())
+                    .text("need_bytes", need.to_string())
                     .part("archive", part.file_name("seed.tar.gz"));
                 let send = client.post(url)
                     .peer_auth(secret.clone())
@@ -17803,8 +18051,10 @@ pub async fn ai_save_config(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config_json;
+    let email_changed;
     {
         let mut config = state.ai_agent.config.lock().unwrap();
+        let email_before = config.email_transport();
 
         // Update fields — only update keys if not masked values
         if let Some(v) = body.get("agent_enabled").and_then(|v| v.as_bool()) {
@@ -17901,9 +18151,16 @@ pub async fn ai_save_config(
         if let Err(e) = config.save() {
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
         }
+        email_changed = config.email_transport() != email_before;
 
         // Serialize full config (with real keys) for cluster sync
         config_json = serde_json::to_value(&*config).unwrap_or_default();
+    }
+    // Alert email is part of the shared alert settings: a change here makes
+    // this node's copy the newest, so the reconcile can't push an older
+    // email setup back over it.
+    if email_changed {
+        alert_settings_changed(&state);
     }
 
     // Push to same-cluster peers and report what actually happened. The
@@ -36220,7 +36477,12 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
     }
 
     match config.save() {
-        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),
+        Ok(()) => {
+            // Alert settings are shared across the cluster: stamp this save
+            // as the newest version and copy it to the other nodes.
+            alert_settings_changed(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "saved": true }))
+        }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
 }
@@ -36237,107 +36499,241 @@ pub struct AlertSettingsBundle {
     pub email: Option<crate::ai::EmailTransport>,
 }
 
-/// POST /api/alerts/config/copy-to-cluster — push this node's alert
-/// settings (and alert email, when on) to every other WolfStack node in
-/// the same cluster, and report per node.
-///
-/// Why: alert settings live per node, and nothing propagated them, so
-/// wolfstack-1/2/3 all ended up with alerting off (2026-11-19 — a disk
-/// filled with nobody told). Configuring one node and copying is the
-/// fix an operator can do in one click.
-///
-/// Secrets travel only over HTTPS or the encrypted WolfNet link — the
-/// plain-HTTP fallback `build_node_urls` offers for ordinary peer calls
-/// is deliberately not used here, because this payload carries webhook
-/// URLs and the SMTP password.
-pub async fn alerts_config_copy_to_cluster(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+/// Unix milliseconds — the unit of `AlertConfig::shared_rev`.
+fn alert_rev_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
-    let bundle = match web::block(|| {
-        let alert_config = crate::alerting::AlertConfig::load();
-        let ai = crate::ai::AiConfig::load();
-        let email = (ai.email_enabled && !ai.email_to.trim().is_empty())
-            .then(|| ai.email_transport());
-        AlertSettingsBundle { alert_config, email }
-    }).await {
+/// This node's saved alert settings, plus alert email when it is on here.
+fn alert_settings_bundle() -> AlertSettingsBundle {
+    let alert_config = crate::alerting::AlertConfig::load();
+    let ai = crate::ai::AiConfig::load();
+    let email = (ai.email_enabled && !ai.email_to.trim().is_empty())
+        .then(|| ai.email_transport());
+    AlertSettingsBundle { alert_config, email }
+}
+
+/// The WolfStack peers alert settings go to. `all_clusters` = every node this
+/// node manages; otherwise only its own cluster — the same boundary the AI /
+/// SMTP settings sync keeps, because the payload carries the SMTP password and
+/// a multi-cluster manager may hold other operators' fleets.
+fn alert_settings_peers(cluster: &crate::agent::ClusterState, all_clusters: bool) -> Vec<crate::agent::Node> {
+    let nodes = cluster.get_all_nodes();
+    let self_cluster = nodes.iter().find(|n| n.is_self).and_then(|n| n.cluster_name.clone());
+    nodes.into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack")
+        .filter(|n| all_clusters
+            || crate::agent::same_display_cluster(n.cluster_name.as_deref(), self_cluster.as_deref()))
+        .collect()
+}
+
+/// HTTPS, then the encrypted WolfNet link. The plain-HTTP fallback
+/// `build_node_urls` offers for ordinary peer calls is deliberately not used:
+/// these calls carry webhook URLs and the SMTP password.
+fn alert_settings_urls(peer: &crate::agent::Node, path: &str) -> Vec<String> {
+    let mut urls = vec![format!(
+        "https://{}:{}{}", crate::netaddr::bracket_host(&peer.address), peer.port, path,
+    )];
+    if let Some(wn) = lookup_node_wolfnet_ip(&peer.address) {
+        urls.push(format!("http://{}:{}{}", wn, peer.port + 1, path));
+    }
+    urls
+}
+
+/// Send `bundle` to one peer. Ok(()) when it saved it.
+async fn push_alert_settings_to(
+    peer: &crate::agent::Node, secret: &str, bundle: &AlertSettingsBundle,
+) -> Result<(), String> {
+    let client = (*API_HTTP_CLIENT).clone();
+    let mut last_err = String::from("unreachable");
+    for url in alert_settings_urls(peer, "/api/alerts/config/peer-apply") {
+        match client.post(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .peer_auth(secret)
+            .json(bundle)
+            .send().await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let _ = resp.bytes().await;
+                return Ok(());
+            }
+            Ok(resp) => {
+                let code = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                // A 404 means the peer runs a WolfStack from before this
+                // endpoint existed — say so instead of a bare status.
+                return Err(if code == reqwest::StatusCode::NOT_FOUND {
+                    "peer's WolfStack is too old for this — upgrade it first".to_string()
+                } else if code == reqwest::StatusCode::CONFLICT {
+                    "peer already has newer alert settings (saved there more recently) — not replaced".to_string()
+                } else {
+                    format!("HTTP {}: {}", code.as_u16(), body.chars().take(200).collect::<String>())
+                });
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(last_err)
+}
+
+/// Ask a peer which alert-settings version it holds. None = unreachable, or a
+/// WolfStack too old to say (it will be brought in line once it upgrades).
+async fn peer_alert_settings_rev(peer: &crate::agent::Node, secret: &str) -> Option<u64> {
+    let client = (*API_HTTP_CLIENT).clone();
+    for url in alert_settings_urls(peer, "/api/alerts/config/rev") {
+        if let Ok(resp) = client.get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .peer_auth(secret)
+            .send().await
+        {
+            if !resp.status().is_success() {
+                // Drain so the connection is released (see tests/resource_safety.rs).
+                let _ = resp.bytes().await;
+                return None;
+            }
+            let v: serde_json::Value = resp.json().await.ok()?;
+            return v.get("rev").and_then(|r| r.as_u64());
+        }
+    }
+    None
+}
+
+/// Push this node's alert settings to every peer in scope and report per node.
+async fn push_alert_settings(
+    cluster: &crate::agent::ClusterState, secret: &str, all_clusters: bool,
+) -> (bool, Vec<serde_json::Value>) {
+    let bundle = match tokio::task::spawn_blocking(alert_settings_bundle).await {
         Ok(b) => b,
-        Err(e) => return HttpResponse::InternalServerError()
-            .json(serde_json::json!({ "error": format!("could not read local settings: {}", e) })),
+        Err(e) => return (false, vec![serde_json::json!({ "ok": false, "error": e.to_string() })]),
     };
     let email_copied = bundle.email.is_some();
-
-    let my_cluster = local_cluster_name(&state.cluster);
-    let peers: Vec<_> = state.cluster.get_all_nodes().into_iter()
-        .filter(|n| !n.is_self && n.node_type == "wolfstack")
-        .filter(|n| n.cluster_name.clone().unwrap_or_else(|| "WolfStack".to_string()) == my_cluster)
-        .collect();
-
-    let secret = state.cluster_secret.clone();
-    let client = (*API_HTTP_CLIENT).clone();
-    let mut results = Vec::with_capacity(peers.len());
-    for peer in peers {
+    let mut results = Vec::new();
+    for peer in alert_settings_peers(cluster, all_clusters) {
         let label = if peer.hostname.is_empty() { peer.address.clone() } else { peer.hostname.clone() };
-        if !peer.online {
-            results.push(serde_json::json!({
-                "node_id": peer.id, "hostname": label, "ok": false,
-                "error": "offline — not updated; copy again once it is back",
-            }));
-            continue;
-        }
-        let path = "/api/alerts/config/peer-apply";
-        let mut urls = vec![format!(
-            "https://{}:{}{}", crate::netaddr::bracket_host(&peer.address), peer.port, path,
-        )];
-        if let Some(wn) = lookup_node_wolfnet_ip(&peer.address) {
-            urls.push(format!("http://{}:{}{}", wn, peer.port + 1, path));
-        }
-        let mut last_err = String::from("unreachable");
-        let mut ok = false;
-        for url in urls {
-            match client.post(&url)
-                .timeout(std::time::Duration::from_secs(10))
-                .peer_auth(&secret)
-                .json(&bundle)
-                .send().await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let _ = resp.bytes().await;
-                    ok = true;
-                    break;
-                }
-                Ok(resp) => {
-                    let code = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    // A 404 means the peer runs a WolfStack from before this
-                    // endpoint existed — say so instead of a bare status.
-                    last_err = if code == reqwest::StatusCode::NOT_FOUND {
-                        "peer's WolfStack is too old for this — upgrade it first".to_string()
-                    } else {
-                        format!("HTTP {}: {}", code.as_u16(), body.chars().take(200).collect::<String>())
-                    };
-                }
-                Err(e) => last_err = e.to_string(),
-            }
-        }
-        results.push(if ok {
-            serde_json::json!({ "node_id": peer.id, "hostname": label, "ok": true })
+        let cluster_label = peer.cluster_name.clone().unwrap_or_else(|| "WolfStack".to_string());
+        let outcome = if peer.online {
+            push_alert_settings_to(&peer, secret, &bundle).await
         } else {
-            serde_json::json!({ "node_id": peer.id, "hostname": label, "ok": false, "error": last_err })
+            Err("offline — it will be updated automatically once it is back".to_string())
+        };
+        results.push(match outcome {
+            Ok(()) => serde_json::json!({ "node_id": peer.id, "hostname": label, "cluster": cluster_label, "ok": true }),
+            Err(e) => serde_json::json!({ "node_id": peer.id, "hostname": label, "cluster": cluster_label, "ok": false, "error": e }),
         });
     }
-    // Each peer's "alerts reach nobody" finding clears on that peer's
-    // next predictive tick (≤ 5 min), not here.
+    (email_copied, results)
+}
 
+/// Background reconcile, run every few minutes from `main.rs`: alert settings
+/// are per node, and until 2026-11-23 they only spread when someone pressed
+/// "copy" — so wolfstack-2/3 sat with alerting off while the operator believed
+/// it was on everywhere. Now every node in a cluster converges on the most
+/// recently saved settings: a node offers its copy to any same-cluster peer
+/// holding an older version. Offline nodes and nodes that join later catch up
+/// on a later pass. A node that was never configured (version 0) offers
+/// nothing, so it can never blank out a configured one.
+pub async fn alert_settings_reconcile(cluster: &crate::agent::ClusterState, secret: &str) {
+    let rev = tokio::task::spawn_blocking(|| crate::alerting::AlertConfig::load().effective_shared_rev())
+        .await.unwrap_or(0);
+    if rev == 0 { return; }
+    let mut bundle: Option<AlertSettingsBundle> = None;
+    for peer in alert_settings_peers(cluster, false).into_iter().filter(|p| p.online) {
+        let Some(peer_rev) = peer_alert_settings_rev(&peer, secret).await else { continue };
+        if peer_rev >= rev { continue; }
+        if bundle.is_none() {
+            bundle = tokio::task::spawn_blocking(alert_settings_bundle).await.ok();
+        }
+        let Some(b) = bundle.as_ref() else { return };
+        match push_alert_settings_to(&peer, secret, b).await {
+            Ok(()) => tracing::info!("alert settings copied to '{}' (it had an older version)", peer.hostname),
+            Err(e) => tracing::warn!("could not copy alert settings to '{}': {}", peer.hostname, e),
+        }
+    }
+}
+
+/// Record an operator save of the shared alert settings (alert rules or alert
+/// email) and copy it to the rest of this node's cluster in the background.
+/// The reconcile pass retries anyone this misses.
+pub fn alert_settings_changed(state: &web::Data<AppState>) {
+    let mut cfg = crate::alerting::AlertConfig::load();
+    cfg.shared_rev = alert_rev_now();
+    if let Err(e) = cfg.save() {
+        tracing::warn!("could not record alert settings version: {e}");
+        return;
+    }
+    let cluster = state.cluster.clone();
+    let secret = state.cluster_secret.clone();
+    tokio::spawn(async move {
+        let (_, results) = push_alert_settings(&cluster, &secret, false).await;
+        for r in results.iter().filter(|r| r["ok"] != true) {
+            tracing::warn!("alert settings not yet copied to {}: {}", r["hostname"], r["error"]);
+        }
+    });
+}
+
+/// POST /api/alerts/config/copy-to-cluster — push this node's alert
+/// settings (and alert email, when on) to every other WolfStack node in
+/// the same cluster now, and report per node. Same-cluster copying also
+/// happens automatically on every save; this button is the visible,
+/// reported version. `?scope=all` widens it to every WolfStack node this
+/// node manages, in every cluster: the region servers sit in their own
+/// cluster, and that crossing is never automatic (see
+/// `alert_settings_peers`).
+#[derive(Deserialize)]
+pub struct CopyAlertsQuery {
+    /// "all" = every managed cluster; anything else (or absent) = this
+    /// node's own cluster only.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+pub async fn alerts_config_copy_to_cluster(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<CopyAlertsQuery>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let all_clusters = query.scope.as_deref() == Some("all");
+    // Pressing copy means "these are the settings": make them the newest
+    // version so peers accept them and the reconcile keeps them in place.
+    let stamped = web::block(|| {
+        let mut cfg = crate::alerting::AlertConfig::load();
+        cfg.shared_rev = alert_rev_now();
+        cfg.save()
+    }).await;
+    if let Ok(Err(e)) | Err(e) = stamped.map_err(|e| e.to_string()) {
+        return HttpResponse::InternalServerError()
+            .json(serde_json::json!({ "error": format!("could not read local settings: {}", e) }));
+    }
+    let (email_copied, results) = push_alert_settings(&state.cluster, &state.cluster_secret, all_clusters).await;
     HttpResponse::Ok().json(serde_json::json!({
-        "cluster": my_cluster,
+        "cluster": local_cluster_name(&state.cluster),
+        "all_clusters": all_clusters,
         "email_copied": email_copied,
         "results": results,
     }))
 }
 
+/// GET /api/alerts/config/rev — which alert-settings version this node holds.
+/// Cluster-secret only; carries no settings.
+pub async fn alerts_config_rev(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_cluster_secret(&req, &state) { return resp; }
+    let rev = web::block(|| crate::alerting::AlertConfig::load().effective_shared_rev())
+        .await.unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({ "rev": rev }))
+}
+
 /// POST /api/alerts/config/peer-apply — receive alert settings from a
-/// cluster peer (see `alerts_config_copy_to_cluster`). Cluster-secret
-/// only: this writes webhook URLs and the SMTP password.
+/// cluster peer (see `push_alert_settings`). Cluster-secret only: this
+/// writes webhook URLs and the SMTP password.
+///
+/// Refuses (409) settings older than the ones held here, so a node that was
+/// offline during a save can't push its stale copy back over the new one.
+/// Version 0 (a sender from before versioning) is accepted, as the copy
+/// button always was.
 pub async fn alerts_config_peer_apply(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -36345,8 +36741,13 @@ pub async fn alerts_config_peer_apply(
 ) -> HttpResponse {
     if let Err(resp) = require_cluster_secret(&req, &state) { return resp; }
     let bundle = body.into_inner();
-    let res = web::block(move || -> Result<(), String> {
+    let email = bundle.email.clone();
+    let res = web::block(move || -> Result<bool, String> {
         let mut cfg = crate::alerting::AlertConfig::load();
+        let incoming = bundle.alert_config.shared_rev;
+        if incoming != 0 && incoming < cfg.shared_rev {
+            return Ok(false);
+        }
         cfg.adopt_shared_settings(&bundle.alert_config);
         cfg.save()?;
         if let Some(email) = bundle.email {
@@ -36354,13 +36755,23 @@ pub async fn alerts_config_peer_apply(
             ai.set_email_transport(email);
             ai.save()?;
         }
-        Ok(())
+        Ok(true)
     }).await;
     match res {
-        Ok(Ok(())) => {
-            tracing::info!("alert settings updated from a cluster peer (copy to every node)");
+        Ok(Ok(true)) => {
+            // The AI settings page saves from the in-memory copy; without
+            // this, the next save there would write the old email back over
+            // what was just received.
+            if let Some(email) = email {
+                let mut ai = state.ai_agent.config.lock().unwrap_or_else(|e| e.into_inner());
+                ai.set_email_transport(email);
+            }
+            tracing::info!("alert settings updated from a cluster peer");
             HttpResponse::Ok().json(serde_json::json!({ "saved": true }))
         }
+        Ok(Ok(false)) => HttpResponse::Conflict().json(serde_json::json!({
+            "error": "this node holds newer alert settings",
+        })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     }
@@ -49858,6 +50269,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfha/signatures", web::post().to(wolfha_signatures))
         .route("/api/wolfha/apply-delta", web::post().to(wolfha_apply_delta))
         .route("/api/wolfha/receive-seed", web::post().to(wolfha_receive_seed))
+        .route("/api/wolfha/storage", web::get().to(wolfha_storage))
         .route("/api/wolfha/enable", web::post().to(wolfha_enable))
         .route("/api/wolfha/witness-hint", web::get().to(wolfha_witness_hint))
         .route("/api/wolfha/protect-dismiss", web::post().to(wolfha_protect_dismiss))
@@ -50599,6 +51011,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/alerts/test", web::post().to(alerts_test))
         .route("/api/alerts/config/copy-to-cluster", web::post().to(alerts_config_copy_to_cluster))
         .route("/api/alerts/config/peer-apply", web::post().to(alerts_config_peer_apply))
+        .route("/api/alerts/config/rev", web::get().to(alerts_config_rev))
         .route("/api/system/install-package", web::post().to(system_install_package))
         // Predictive ops — Inbox + Acks. Static segments before
         // {id} so actix doesn't swallow them as ids.

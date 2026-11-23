@@ -452,6 +452,13 @@
              failure of something they just did. -->
         <div id="node-outage-banner" role="status" aria-live="polite" style="display:none; margin:12px 16px 0; padding:14px 18px; border-radius:8px;"></div>
 
+        <!-- Disk hardware banner (2026-11-23): any node in the list whose
+             physical disk is failing or whose RAID array has lost a disk.
+             Read from each node's metrics.hardware_faults, so it shows on
+             every page and survives agent restarts (the alert log does
+             not). Filled by renderHardwareFaultBanner(). -->
+        <div id="hardware-fault-banner" role="alert" aria-live="assertive" style="display:none; margin:12px 16px 0; padding:14px 18px; border-radius:8px;"></div>
+
         <!-- Page Content -->
         <div class="page-content">
             <!-- ═══ Datacenter Overview ═══ -->
@@ -6967,7 +6974,7 @@
                                             value="simple" checked style="margin-top:3px;width:16px;height:16px;cursor:pointer;">
                                         <span>
                                             <strong style="display:block;">Simple <span style="color:var(--text-muted);font-weight:400;">(recommended)</span></strong>
-                                            <span style="color:var(--text-muted);">Only push when something looks like a real compromise (crypto miner running, suspicious binary in /tmp or /dev/shm, outbound scan from this host) or a disk is running out of space. Internet-background noise (failed SSH logins, "we blocked another IP", threshold breaches, config recommendations) is suppressed — visible on the dashboard, no email/Discord/Slack/Telegram/ntfy push.</span>
+                                            <span style="color:var(--text-muted);">Only push when something looks like a real compromise (crypto miner running, suspicious binary in /tmp or /dev/shm, outbound scan from this host), a disk is running out of space, or a physical disk is failing or a RAID array has lost a disk (plus a weekly disk-health report). Internet-background noise (failed SSH logins, "we blocked another IP", threshold breaches, config recommendations) is suppressed — visible on the dashboard, no email/Discord/Slack/Telegram/ntfy push.</span>
                                         </span>
                                     </label>
                                     <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;">
@@ -7016,10 +7023,11 @@
                             </div>
                         </div>
 
-                        <div style="margin-top:20px;display:flex;gap:12px;">
+                        <div style="margin-top:20px;display:flex;gap:12px;flex-wrap:wrap;">
                             <button class="btn btn-primary" onclick="saveAlertingConfig()"><span class="ws-icon-clean-wrap" data-icon="save"></span> Save Settings</button>
                             <button class="btn btn-sm" onclick="testAlerting()"><span class="ws-icon-clean-wrap" data-icon="lab"></span> Send Test Alert</button>
                             <button class="btn btn-sm" onclick="copyAlertingToCluster()" title="Alert settings are per node — copy these to every other node in this cluster"><span class="ws-icon-clean-wrap" data-icon="upload"></span> Copy to every node in this cluster</button>
+                            <button class="btn btn-sm" onclick="copyAlertingToCluster('all')" title="Also reaches nodes in your other clusters, such as region servers"><span class="ws-icon-clean-wrap" data-icon="upload"></span> Copy to all clusters</button>
                         </div>
                         <div id="alerting-copy-result" role="status" aria-live="polite" style="margin-top:10px;font-size:13px;line-height:1.6;"></div>
                     </div>

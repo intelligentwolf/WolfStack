@@ -616,6 +616,7 @@ mod tests {
             processes: 100,
             os_name: None, os_version: None, kernel_version: None,
             hardware_tier: "low".into(),
+            hardware_faults: vec![],
         }
     }
 

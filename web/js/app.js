@@ -8902,6 +8902,7 @@ async function fetchNodes() {
             renderDatacenterOverview();
         }
         renderNodeOutageBanner();
+        renderHardwareFaultBanner();
 
         // Update current node metrics if viewing a server dashboard
         if (currentPage === 'dashboard' && currentNodeId) {
@@ -22852,7 +22853,7 @@ async function renderAlertsOverview() {
             <div class="card"><div class="card-body" style="padding:14px;">
                 <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Verbosity</div>
                 <div style="font-size:14px; font-weight:600; text-transform:capitalize;">${escapeHtml(verbosity)}</div>
-                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">${verbosity === 'simple' ? 'Compromise and disk-full alerts fire' : 'All categories fire'}</div>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">${verbosity === 'simple' ? 'Compromise, disk-full and failing-disk alerts fire' : 'All categories fire'}</div>
             </div></div>
             <div class="card"><div class="card-body" style="padding:14px;">
                 <div style="font-size:11px; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px;">Schedule</div>
@@ -23036,6 +23037,7 @@ async function renderAlertsSchedule() {
                     <label style="display:block; font-size:11px; color:var(--text-muted); margin-bottom:6px;">Suppress categories</label>
                     <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-threshold" ${supprChecked('threshold')}> Threshold (CPU/memory)</label>
                     <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-capacity" ${supprChecked('capacity')}> Disk space warnings <span style="color:var(--text-muted);">(a disk that fills within hours always gets through)</span></label>
+                    <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-hardware" ${supprChecked('hardware')}> Disk hardware (failing disk, degraded RAID, weekly disk report)</label>
                     <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-lifecycle" ${supprChecked('lifecycle')}> Lifecycle (offline/restored/reboot)</label>
                     <label style="display:block; font-size:12px; margin-bottom:4px;"><input type="checkbox" id="sched-supp-posture" ${supprChecked('posture')}> Posture (config findings)</label>
                     <label style="display:block; font-size:12px;"><input type="checkbox" id="sched-supp-bruteforce" ${supprChecked('brute_force')}> Brute-force (failed-auth chatter)</label>
@@ -23119,6 +23121,7 @@ async function saveAlertsSchedule() {
     const suppressCats = [];
     if (document.getElementById('sched-supp-threshold').checked) suppressCats.push('threshold');
     if (document.getElementById('sched-supp-capacity').checked) suppressCats.push('capacity');
+    if (document.getElementById('sched-supp-hardware').checked) suppressCats.push('hardware');
     if (document.getElementById('sched-supp-lifecycle').checked) suppressCats.push('lifecycle');
     if (document.getElementById('sched-supp-posture').checked) suppressCats.push('posture');
     if (document.getElementById('sched-supp-bruteforce').checked) suppressCats.push('brute_force');
@@ -57164,28 +57167,34 @@ async function testAlerting() {
 // Alert settings are per node and never propagated, which is how
 // wolfstack-1/2/3 all ended up with alerting off when a disk filled
 // (2026-11-19). Saves first — the backend copies the SAVED config.
-async function copyAlertingToCluster() {
+async function copyAlertingToCluster(scope) {
+    const everywhere = scope === 'all';
     const out = document.getElementById('alerting-copy-result');
     if (!(await saveAlertingConfig(true))) return;
+    const where = everywhere ? 'every node in every cluster you manage from here' : 'every node in this cluster';
     if (!(await showDangerConfirm({
-        title: 'Copy alert settings to every node in this cluster?',
-        danger: 'Every other node in this cluster gets this node\u2019s alert settings: channels, delivery paths, verbosity, quiet hours and rules. Their current alert settings are replaced.',
-        detail: 'Alert email (SMTP) is copied too when it is switched on here. Inbound bots (Discord bot, Telegram receiver, WhatsApp) stay as each node has them.',
+        title: 'Copy alert settings to ' + where + '?',
+        danger: 'Every other node ' + (everywhere ? 'in every cluster (region servers included)' : 'in this cluster') + ' gets this node\u2019s alert settings: channels, delivery paths, verbosity, quiet hours and rules. Their current alert settings are replaced.',
+        detail: 'Alert email (SMTP, including its password) is copied too when it is switched on here. Inbound bots (Discord bot, Telegram receiver, WhatsApp) stay as each node has them.',
         countdown: 2,
-        confirmLabel: 'Copy to every node',
+        confirmLabel: everywhere ? 'Copy to all clusters' : 'Copy to every node',
     }))) return;
     if (out) { out.setAttribute('role', 'status'); out.textContent = 'Copying\u2026'; }
     try {
-        const resp = await fetch('/api/alerts/config/copy-to-cluster', { method: 'POST' });
+        const resp = await fetch('/api/alerts/config/copy-to-cluster' + (everywhere ? '?scope=all' : ''), { method: 'POST' });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
         const results = data.results || [];
         const failed = results.filter(r => !r.ok);
         if (results.length === 0) {
-            if (out) out.textContent = 'No other nodes in cluster \u201c' + (data.cluster || '') + '\u201d \u2014 nothing to copy to.';
+            if (out) out.textContent = everywhere
+                ? 'No other WolfStack nodes in any cluster \u2014 nothing to copy to.'
+                : 'No other nodes in cluster \u201c' + (data.cluster || '') + '\u201d \u2014 nothing to copy to.';
             return;
         }
-        const lines = results.map(r => (r.ok ? '\u2705 ' : '\u274c ') + r.hostname + (r.ok ? '' : ' \u2014 ' + (r.error || 'failed')));
+        const lines = results.map(r => (r.ok ? '\u2705 ' : '\u274c ') + r.hostname
+            + (everywhere && r.cluster ? ' (' + r.cluster + ')' : '')
+            + (r.ok ? '' : ' \u2014 ' + (r.error || 'failed')));
         const head = failed.length === 0
             ? 'Copied to all ' + results.length + ' node(s)' + (data.email_copied ? ', including alert email.' : '. Alert email is off here, so each node keeps its own email setting.')
             : 'Copied to ' + (results.length - failed.length) + ' of ' + results.length + ' node(s). Not updated:';
@@ -60873,6 +60882,62 @@ function renderNodeOutageBanner() {
     el.className = cls;
     el.innerHTML = html;
     el.style.display = 'block';
+}
+
+// ─── Disk hardware banner ────────────────────────────────────────────────────
+// Every node carries metrics.hardware_faults (failing disk, degraded RAID) from
+// its storage watcher. Until 2026-11-23 the only trace of a failed disk was a
+// line in the in-memory alert log, and wolfstack-1 ran a one-disk mirror for a
+// week unnoticed. Dismissal is per browser session and per fault set: a NEW
+// fault brings the banner back.
+function hardwareFaultSignature(entries) {
+    return entries.map(e => e.node.id + ':' + e.faults.map(f => f.title).join('|')).join(';');
+}
+
+function renderHardwareFaultBanner() {
+    const el = document.getElementById('hardware-fault-banner');
+    if (!el) return;
+    const entries = (allNodes || [])
+        .map(node => ({ node, faults: (node.metrics && Array.isArray(node.metrics.hardware_faults)) ? node.metrics.hardware_faults : [] }))
+        .filter(e => e.faults.length > 0);
+    const hide = () => { el.style.display = 'none'; el.innerHTML = ''; el.className = ''; el.dataset.sig = ''; };
+    if (entries.length === 0) { hide(); return; }
+    const sig = hardwareFaultSignature(entries);
+    let dismissed = false;
+    try { dismissed = sessionStorage.getItem('ws-hw-fault-dismissed') === sig; } catch (_) {}
+    if (dismissed) { hide(); return; }
+    if (el.dataset.sig === sig) return;   // unchanged — don't re-announce every poll
+    el.dataset.sig = sig;
+    const total = entries.reduce((n, e) => n + e.faults.length, 0);
+    const anyCritical = entries.some(e => e.faults.some(f => f.severity === 'critical'));
+    el.className = anyCritical ? 'ws-banner-danger' : 'ws-banner-warning';
+    const rows = entries.map(e => {
+        const items = e.faults.map(f => `<li style="margin:2px 0;"><strong>${escapeHtml(f.title)}</strong> <span style="color:var(--text-secondary);">— ${escapeHtml(f.detail)}</span></li>`).join('');
+        return `<div style="margin-top:8px;">
+                <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                    <span style="font-weight:600;">${escapeHtml(nodeName(e.node))}</span>
+                    <button class="btn btn-sm" onclick="selectServerView('${escapeAttr(e.node.id)}', 'storage')">Open Storage</button>
+                </div>
+                <ul style="margin:4px 0 0 18px; padding:0;">${items}</ul>
+            </div>`;
+    }).join('');
+    el.innerHTML = `
+        <div style="display:flex; align-items:flex-start; gap:12px;">
+            <div style="font-size:20px; line-height:1;"><span class="ws-icon-clean-wrap" data-icon="warning"></span></div>
+            <div style="flex:1; font-size:13px; line-height:1.5;">
+                <div style="font-weight:600;">Disk hardware problem${total > 1 ? 's' : ''} on ${entries.length} server${entries.length > 1 ? 's' : ''}</div>
+                ${rows}
+            </div>
+            <button class="btn btn-sm" onclick="dismissHardwareFaultBanner()" aria-label="Hide this disk warning until a new problem appears">Hide</button>
+        </div>`;
+    el.style.display = 'block';
+}
+
+function dismissHardwareFaultBanner() {
+    const el = document.getElementById('hardware-fault-banner');
+    if (!el) return;
+    try { sessionStorage.setItem('ws-hw-fault-dismissed', el.dataset.sig || ''); } catch (_) {}
+    el.style.display = 'none'; el.innerHTML = ''; el.className = ''; el.dataset.sig = '';
 }
 
 function dismissNodeOutageBanner() {
@@ -87965,9 +88030,10 @@ function wolfHaOpenProtectModal() {
                 </select></div>
             <div><label style="font-size:13px;color:var(--text-muted);">Replica nodes <span style="font-size:11px;">(tick order = failover priority)</span></label>
                 <div id="wolfha-replicas" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;font-size:13px;">
-                    ${nodes.map(n => `<label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" class="wolfha-replica-cb" value="${vlanEsc(n.id)}" onchange="wolfHaReplicaTick(this)"> ${vlanEsc(n.hostname || n.id)} <span class="wolfha-prio" data-node="${vlanEsc(n.id)}" style="font-size:10px;color:var(--text-muted);"></span></label>`).join('')}
+                    ${nodes.map(n => `<div><label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" class="wolfha-replica-cb" value="${vlanEsc(n.id)}" onchange="wolfHaReplicaTick(this)"> ${vlanEsc(n.hostname || n.id)} <span class="wolfha-prio" data-node="${vlanEsc(n.id)}" style="font-size:10px;color:var(--text-muted);"></span></label>
+                        <div class="wolfha-store" data-node="${vlanEsc(n.id)}" style="display:none;margin:4px 0 6px 24px;"></div></div>`).join('')}
                 </div>
-                <span style="font-size:11px;color:var(--text-muted);">A copy must live on a different machine, so the node it runs on can't be picked. The first-ticked standby is preferred at failover.</span></div>
+                <span style="font-size:11px;color:var(--text-muted);">A copy must live on a different machine, so the node it runs on can't be picked. The first-ticked standby is preferred at failover. Each standby's copy goes on the drive you pick under it — the one with the most free space is chosen for you, and protection stops before anything is copied if it won't fit.</span></div>
             <div><label style="font-size:13px;color:var(--text-muted);">Sync interval (minutes)</label>
                 <input id="wolfha-interval" type="number" min="1" value="5" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 <span id="wolfha-interval-hint" style="font-size:11px;color:var(--text-muted);">A failover can lose up to this much recent change — anything running a database should use the database's own replication instead.</span></div>
@@ -88047,6 +88113,7 @@ function wolfHaMarkSourceNode(nodeId) {
 async function wolfHaLoadSubjects() {
     const nodeId = document.getElementById('wolfha-node')?.value;
     wolfHaMarkSourceNode(nodeId);
+    wolfHaRefreshStorage();
     const kind = document.getElementById('wolfha-kind')?.value || 'container';
     const sel = document.getElementById('wolfha-container');
     const isVm = kind === 'vm';
@@ -88086,12 +88153,50 @@ async function wolfHaLoadSubjects() {
 // Kept because older markup and any cached page may still call it.
 async function wolfHaLoadContainers() { return wolfHaLoadSubjects(); }
 
+// "Store the copy on" — one dropdown per ticked standby, listing that
+// node's container storage locations with their free space (2026-11-23: a
+// 172 GB copy was unpacked onto a standby's root disk while a 3.6 TB drive
+// sat unused beside it). Containers only: a VM copy keeps the disk folder
+// its definition names, and a Proxmox copy goes to the matching ZFS pool.
+async function wolfHaLoadStorage(nodeId) {
+    const box = document.querySelector(`.wolfha-store[data-node="${CSS.escape(nodeId)}"]`);
+    const cb = document.querySelector(`.wolfha-replica-cb[value="${CSS.escape(nodeId)}"]`);
+    if (!box) return;
+    const kind = document.getElementById('wolfha-kind')?.value || 'container';
+    if (!cb?.checked || kind !== 'container') { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.style.display = 'block';
+    if (box.querySelector('select')) return;   // already loaded for this tick
+    box.innerHTML = '<span style="font-size:11px;color:var(--text-muted);">Checking its drives…</span>';
+    const gb = b => (b / 1e9) >= 1000 ? (b / 1e12).toFixed(1) + ' TB' : Math.round(b / 1e9) + ' GB';
+    try {
+        const resp = await fetch(nodeApiUrl(nodeId, '/api/wolfha/storage'));
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(d.error || ('HTTP ' + resp.status));
+        const opts = Array.isArray(d.options) ? d.options : [];
+        if (!opts.length) throw new Error('it reports no container storage locations');
+        const selId = 'wolfha-store-' + nodeId.replace(/[^A-Za-z0-9_-]/g, '_');
+        box.innerHTML = `<label for="${vlanEsc(selId)}" style="font-size:11px;color:var(--text-muted);">Store the copy on</label>
+            <select id="${vlanEsc(selId)}" class="wolfha-store-sel" data-node="${vlanEsc(nodeId)}" style="width:100%;padding:6px 10px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:2px;">
+                ${opts.map(o => `<option value="${vlanEsc(o.path)}"${o.default ? ' selected' : ''}>${vlanEsc(o.path)} — ${gb(o.free_bytes)} free of ${gb(o.total_bytes)}${o.default ? ' (most space)' : ''}</option>`).join('')}
+            </select>`;
+    } catch (e) {
+        // Visible, not silent: the protect itself will refuse a standby it
+        // can't check, so say why here first.
+        box.innerHTML = `<span role="alert" style="font-size:11px;color:var(--danger,#ef4444);">Couldn't read this node's drives: ${vlanEsc(e.message || String(e))}. It may need upgrading to this WolfStack version before it can hold a copy.</span>`;
+    }
+}
+
+function wolfHaRefreshStorage() {
+    document.querySelectorAll('.wolfha-replica-cb').forEach(cb => wolfHaLoadStorage(cb.value));
+}
+
 // Tick-order tracking: the sequence replicas are ticked IS the failover
 // priority the backend stores. Unticking removes; re-ticking re-appends.
 let _wolfHaTickOrder = [];
 function wolfHaReplicaTick(cb) {
     _wolfHaTickOrder = _wolfHaTickOrder.filter(id => id !== cb.value);
     if (cb.checked) _wolfHaTickOrder.push(cb.value);
+    wolfHaLoadStorage(cb.value);
     document.querySelectorAll('.wolfha-prio').forEach(el => {
         if (el.textContent === '(runs here — the source)') return;
         const idx = _wolfHaTickOrder.indexOf(el.getAttribute('data-node'));
@@ -88112,11 +88217,18 @@ async function wolfHaSubmitProtect() {
     if (!nodeId || !container) { showToast(`Pick a node and a ${kind === 'vm' ? 'VM' : 'container'}`, 'error'); return; }
     if (replicas.length === 0) { showToast('Pick at least one replica node other than the one it runs on', 'error'); return; }
     if (autoFailover && !witness) { showToast('Automatic failover needs a witness IP (usually your gateway)', 'error'); return; }
+    const storage = {};
+    if (kind === 'container') {
+        replicas.forEach(id => {
+            const sel = document.querySelector(`.wolfha-store-sel[data-node="${CSS.escape(id)}"]`);
+            if (sel && sel.value) storage[id] = sel.value;
+        });
+    }
     document.getElementById('wolfha-protect-modal')?.remove();
     try {
         const resp = await fetch(nodeApiUrl(nodeId, '/api/wolfha/enable'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ container, kind, replica_node_ids: replicas, interval_minutes: interval, auto_failover: autoFailover, witness, failover_after_secs: after }),
+            body: JSON.stringify({ container, kind, replica_node_ids: replicas, interval_minutes: interval, auto_failover: autoFailover, witness, failover_after_secs: after, storage }),
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.task_id) {
