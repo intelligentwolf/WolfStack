@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.49.0: choose the drive for each WolfHA copy and never start one that won't fit; failing disks alert and show a banner** _(2026-11-23 — [`60deb98a`](https://github.com/intelligentwolf/WolfStack/commit/60deb98af0217f482357c29d2e31ad98dc864c43))_
 - **v25.48.3: WolfHA shows protect progress and never offers a takeover mid-protect** _(2026-11-22 — [`f007bc83`](https://github.com/intelligentwolf/WolfStack/commit/f007bc83ef1386cba9e50436f031bb12054330a0))_
 - **v25.48.2: WolfHA keeps syncing a standby whose recorded address stopped answering** _(2026-11-22 — [`ed007f86`](https://github.com/intelligentwolf/WolfStack/commit/ed007f86baa05b7c8da697a190451abc105d8aa4))_
 - **v25.48.1: update the web server, email and URL libraries with known vulnerabilities** _(2026-11-22 — [`a80d57d8`](https://github.com/intelligentwolf/WolfStack/commit/a80d57d809030a0882f8ddc731938ee4a8a17312))_
