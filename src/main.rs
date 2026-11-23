@@ -1612,6 +1612,13 @@ async fn main() -> std::io::Result<()> {
                     let mut hw_faults: Vec<crate::array::HardwareFault> = Vec::new();
                     let hw = crate::alerting::AlertCategory::Hardware;
                     let lifecycle = crate::alerting::AlertCategory::Lifecycle;
+                    // Disk warnings that are NOT a failure — a few reallocated
+                    // sectors, a drive with no readable SMART (USB sticks, odd
+                    // enclosures). Posture is Verbose-only, so Simple mode
+                    // notifies only when a disk has actually failed; the
+                    // warnings stay on Storage, in Issues and in the weekly
+                    // report.
+                    let disk_warning = crate::alerting::AlertCategory::Posture;
                     // `last_seen = current` at the end of each tick is what
                     // de-duplicates alerts. The self-test pass only runs on the
                     // hourly tick, so on the other 59 its keys would vanish
@@ -1716,25 +1723,45 @@ async fn main() -> std::io::Result<()> {
                                 severity: "warning".into(), title: title.clone(), detail: detail.clone(),
                             });
                             if !last_seen.contains(&key) {
-                                new_alerts.push(("warning".into(), title, detail, hw));
+                                new_alerts.push(("warning".into(), title, detail, disk_warning));
                             }
                         }
                         let health = match check.smart.as_ref() {
                             Some(h) => h,
                             None => continue,
                         };
-                        let reasons = health.failing_reasons();
-                        if reasons.is_empty() { continue; }
-                        let key = format!("smart:{}", dev);
-                        current.insert(key.clone());
-                        let title = format!("Disk {} is failing (SMART)", dev);
-                        let detail = format!("{} — back up and plan replacement: {}",
-                            dev, reasons.join("; "));
-                        hw_faults.push(crate::array::HardwareFault {
-                            severity: "critical".into(), title: title.clone(), detail: detail.clone(),
-                        });
-                        if !last_seen.contains(&key) {
-                            new_alerts.push(("critical".into(), title, detail, hw));
+                        let reasons = health.critical_reasons();
+                        if !reasons.is_empty() {
+                            let key = format!("smart:{}", dev);
+                            current.insert(key.clone());
+                            let title = format!("Disk {} is failing (SMART)", dev);
+                            let detail = format!("{} — back up and plan replacement: {}",
+                                dev, reasons.join("; "));
+                            hw_faults.push(crate::array::HardwareFault {
+                                severity: "critical".into(), title: title.clone(), detail: detail.clone(),
+                            });
+                            if !last_seen.contains(&key) {
+                                new_alerts.push(("critical".into(), title, detail, hw));
+                            }
+                            continue;
+                        }
+                        // Reallocated sectors on their own are wear the drive
+                        // has already handled (see DiskSmart::critical_reasons):
+                        // a warning, not a failure. The count is part of the
+                        // key, so the alert fires once per count — a disk whose
+                        // count keeps climbing alerts every time it climbs.
+                        if let Some(n) = health.reallocated_sectors.filter(|&n| n > 0) {
+                            let key = format!("smart_realloc:{}:{}", dev, n);
+                            current.insert(key.clone());
+                            let title = format!("Disk {} has {} reallocated sector(s)", dev, n);
+                            let detail = format!("{} — the drive has replaced {} bad sector(s) from its spare pool; data is intact. Watch for the count rising, and plan replacement if it does.",
+                                dev, n);
+                            hw_faults.push(crate::array::HardwareFault {
+                                severity: "warning".into(), title: title.clone(), detail: detail.clone(),
+                            });
+                            if !last_seen.contains(&key) {
+                                new_alerts.push(("warning".into(), title, detail, disk_warning));
+                            }
                         }
                     }
 

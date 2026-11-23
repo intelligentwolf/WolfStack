@@ -1220,20 +1220,29 @@ pub fn ensure_smartmontools() -> bool {
     installed
 }
 
-/// Whether a whole-disk device has real hardware behind it.
+/// Kernel subsystems whose disks smartctl can read SMART from: the SCSI bus
+/// (SATA, SAS and USB-bridged drives all appear there) and the NVMe classes
+/// (`nvme` per controller, `nvme-subsystem` under native multipath). Names
+/// are the `/sys/bus` and `/sys/class` directory names.
+const SMART_CAPABLE_SUBSYSTEMS: [&str; 3] = ["scsi", "nvme", "nvme-subsystem"];
+
+/// Whether a whole-disk device is a physical drive that can report SMART.
 ///
 /// `/sys/block/<name>/device` is the driver-model link to the backing
-/// device. SCSI/SATA, NVMe, virtio, MMC and Xen disks all have one;
-/// purely virtual block devices — zram above all — do not. That link is
-/// therefore the kernel's own answer to "could this thing possibly have
-/// SMART data", which is exactly the question being asked.
-///
-/// Name matching was rejected: it needs extending for every new virtual
-/// driver, and gets it wrong on platforms whose real disks use an
-/// unexpected prefix.
+/// device, and its `subsystem` link names the bus or class it hangs off.
+/// zram has no `device` link at all. Ceph RBD, virtio and MMC disks do have
+/// one, but on the `rbd`, `virtio` and `mmc` buses, none of which carries
+/// SMART — so they read as "unreadable" forever. On 2026-11-23 that put every
+/// mapped RBD volume on a Proxmox+Ceph cluster into the disk-failure banner.
+/// Asking the kernel which subsystem the disk is on answers "could this have
+/// SMART data" directly; name matching would need extending for every new
+/// virtual driver.
 fn disk_has_backing_hardware(dev_path: &str) -> bool {
     let name = dev_path.strip_prefix("/dev/").unwrap_or(dev_path);
-    std::path::Path::new(&format!("/sys/block/{name}/device")).exists()
+    std::fs::read_link(format!("/sys/block/{name}/device/subsystem"))
+        .ok()
+        .and_then(|t| t.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .is_some_and(|sub| SMART_CAPABLE_SUBSYSTEMS.contains(&sub.as_str()))
 }
 
 /// List whole physical disk device paths (`/dev/sda`, `/dev/nvme0n1`, …) —
@@ -1340,12 +1349,27 @@ impl DiskSmart {
     /// (188 Command-Timeout is deliberately excluded: it's cabling/power noise
     /// and the Storage page doesn't surface it.)
     pub fn failing_reasons(&self) -> Vec<String> {
+        let mut r = self.critical_reasons();
+        if let Some(n) = self.reallocated_sectors.filter(|&n| n > 0) {
+            r.push(format!("{} reallocated sector(s)", n));
+        }
+        r
+    }
+
+    /// The subset of `failing_reasons` that means the disk is failing NOW —
+    /// everything except reallocated sectors on their own.
+    ///
+    /// A reallocated sector is one the drive already replaced from its spare
+    /// pool: the data is safe and a small count can sit unchanged for years.
+    /// Treating any non-zero count as a failure put three disks on two
+    /// servers into the red failing-disk banner on 2026-11-23 (counts 1 and 8).
+    /// The count still shows on the Storage page and in Issues, and the
+    /// storage watcher alerts again whenever it GROWS — a rising count is the
+    /// real warning sign.
+    pub fn critical_reasons(&self) -> Vec<String> {
         let mut r = Vec::new();
         if self.passed == Some(false) {
             r.push("SMART overall-health self-assessment reports FAILED".to_string());
-        }
-        if let Some(n) = self.reallocated_sectors.filter(|&n| n > 0) {
-            r.push(format!("{} reallocated sector(s)", n));
         }
         if let Some(n) = self.pending_sectors.filter(|&n| n > 0) {
             r.push(format!("{} current-pending sector(s)", n));
@@ -2972,6 +2996,10 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         };
         assert!(failing(&realloc));
         assert!(realloc.failing_reasons().iter().any(|r| r.contains("reallocated")));
+        // ...but reallocated sectors alone are wear, not a failure in progress.
+        assert!(realloc.critical_reasons().is_empty());
+        let both = DiskSmart { reallocated_sectors: Some(8), pending_sectors: Some(2), ..Default::default() };
+        assert_eq!(both.critical_reasons(), vec!["2 current-pending sector(s)".to_string()]);
 
         let pending = DiskSmart { passed: Some(true), pending_sectors: Some(3), ..Default::default() };
         assert!(failing(&pending));
@@ -3083,8 +3111,8 @@ mod virtual_disk_filter_tests {
     }
 
     /// The filter must not throw the real disks out with the virtual ones.
-    /// Every device the kernel exposes with a `device` link is hardware we
-    /// genuinely want SMART data for.
+    /// Every device on the SCSI bus or an NVMe class is a drive we genuinely
+    /// want SMART data for. (`nvme0n1` here resolves to the `nvme` class.)
     #[test]
     fn real_disks_survive_the_filter() {
         let Ok(entries) = std::fs::read_dir("/sys/block") else {
@@ -3094,7 +3122,9 @@ mod virtual_disk_filter_tests {
         let mut hardware_backed = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if e.path().join("device").exists() {
+            let sub = std::fs::canonicalize(e.path().join("device/subsystem")).ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+            if matches!(sub.as_deref(), Some("scsi" | "nvme" | "nvme-subsystem")) {
                 hardware_backed.push(name);
             }
         }

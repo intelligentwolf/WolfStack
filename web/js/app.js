@@ -60885,11 +60885,17 @@ function renderNodeOutageBanner() {
 }
 
 // ─── Disk hardware banner ────────────────────────────────────────────────────
-// Every node carries metrics.hardware_faults (failing disk, degraded RAID) from
-// its storage watcher. Until 2026-11-23 the only trace of a failed disk was a
-// line in the in-memory alert log, and wolfstack-1 ran a one-disk mirror for a
-// week unnoticed. Dismissal is per browser session and per fault set: a NEW
-// fault brings the banner back.
+// Every node carries metrics.hardware_faults from its storage watcher. Until
+// 2026-11-23 the only trace of a failed disk was a line in the in-memory alert
+// log, and wolfstack-1 ran a one-disk mirror for a week unnoticed.
+//
+// The banner is for disks failing NOW (severity "critical": a dead array
+// member, SMART FAILED, pending/uncorrectable sectors, NVMe critical bits).
+// Warnings — a stable reallocated-sector count, a disk whose SMART can't be
+// read — stay on the Storage page, in Issues and in the weekly report; the
+// first version banner'd them too and buried the real failures. One line per
+// server, the detail behind a disclosure. Dismissal is per browser session
+// and per fault set: a NEW fault brings the banner back.
 function hardwareFaultSignature(entries) {
     return entries.map(e => e.node.id + ':' + e.faults.map(f => f.title).join('|')).join(';');
 }
@@ -60898,7 +60904,11 @@ function renderHardwareFaultBanner() {
     const el = document.getElementById('hardware-fault-banner');
     if (!el) return;
     const entries = (allNodes || [])
-        .map(node => ({ node, faults: (node.metrics && Array.isArray(node.metrics.hardware_faults)) ? node.metrics.hardware_faults : [] }))
+        .map(node => ({
+            node,
+            faults: (node.metrics && Array.isArray(node.metrics.hardware_faults))
+                ? node.metrics.hardware_faults.filter(f => f.severity === 'critical') : [],
+        }))
         .filter(e => e.faults.length > 0);
     const hide = () => { el.style.display = 'none'; el.innerHTML = ''; el.className = ''; el.dataset.sig = ''; };
     if (entries.length === 0) { hide(); return; }
@@ -60908,25 +60918,24 @@ function renderHardwareFaultBanner() {
     if (dismissed) { hide(); return; }
     if (el.dataset.sig === sig) return;   // unchanged — don't re-announce every poll
     el.dataset.sig = sig;
-    const total = entries.reduce((n, e) => n + e.faults.length, 0);
-    const anyCritical = entries.some(e => e.faults.some(f => f.severity === 'critical'));
-    el.className = anyCritical ? 'ws-banner-danger' : 'ws-banner-warning';
+    el.className = 'ws-banner-danger';
     const rows = entries.map(e => {
+        const summary = e.faults.length === 1 ? escapeHtml(e.faults[0].title) : `${e.faults.length} disk faults`;
         const items = e.faults.map(f => `<li style="margin:2px 0;"><strong>${escapeHtml(f.title)}</strong> <span style="color:var(--text-secondary);">— ${escapeHtml(f.detail)}</span></li>`).join('');
-        return `<div style="margin-top:8px;">
-                <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-                    <span style="font-weight:600;">${escapeHtml(nodeName(e.node))}</span>
-                    <button class="btn btn-sm" onclick="selectServerView('${escapeAttr(e.node.id)}', 'storage')">Open Storage</button>
-                </div>
-                <ul style="margin:4px 0 0 18px; padding:0;">${items}</ul>
-            </div>`;
+        return `<li style="margin:2px 0;">
+                <details>
+                    <summary style="cursor:pointer;"><strong>${escapeHtml(nodeName(e.node))}</strong>: ${summary}</summary>
+                    <ul style="margin:4px 0 4px 18px; padding:0;">${items}</ul>
+                    <button class="btn btn-sm" onclick="selectServerView('${escapeAttr(e.node.id)}', 'storage')">Open Storage on ${escapeHtml(nodeName(e.node))}</button>
+                </details>
+            </li>`;
     }).join('');
     el.innerHTML = `
         <div style="display:flex; align-items:flex-start; gap:12px;">
             <div style="font-size:20px; line-height:1;"><span class="ws-icon-clean-wrap" data-icon="warning"></span></div>
             <div style="flex:1; font-size:13px; line-height:1.5;">
-                <div style="font-weight:600;">Disk hardware problem${total > 1 ? 's' : ''} on ${entries.length} server${entries.length > 1 ? 's' : ''}</div>
-                ${rows}
+                <div style="font-weight:600;">Failing disk${entries.length > 1 ? 's' : ''} on ${entries.length} server${entries.length > 1 ? 's' : ''} — back up and plan replacement</div>
+                <ul style="margin:4px 0 0 0; padding:0; list-style:none;">${rows}</ul>
             </div>
             <button class="btn btn-sm" onclick="dismissHardwareFaultBanner()" aria-label="Hide this disk warning until a new problem appears">Hide</button>
         </div>`;
