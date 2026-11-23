@@ -26,6 +26,12 @@
 //! WolfStack's job is monitoring + day-to-day ops.
 
 use serde::{Deserialize, Serialize};
+
+mod health_report;
+pub use health_report::{
+    build_weekly_report, hardware_faults, mark_weekly_report_sent, publish_hardware_faults,
+    report_disks, weekly_report_due, HardwareFault,
+};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -1570,6 +1576,7 @@ fn now_secs() -> u64 {
 }
 
 /// Outcome of one watchdog poll of a device.
+#[derive(Clone)]
 pub struct SmartCheck {
     /// The reading, when one could be taken on this poll.
     pub smart: Option<DiskSmart>,

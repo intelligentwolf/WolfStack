@@ -1546,6 +1546,23 @@ async fn main() -> std::io::Result<()> {
             });
         }
 
+        // Alert-settings reconcile — every 10 min (first pass 2 min after
+        // start): copy this node's alert settings to any same-cluster peer
+        // holding an older version, so a node that was offline during a save,
+        // or joined later, still ends up alerting. See
+        // `api::alert_settings_reconcile`.
+        {
+            let cluster = app_state.cluster.clone();
+            let secret = app_state.cluster_secret.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                loop {
+                    api::alert_settings_reconcile(&cluster, &secret).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                }
+            });
+        }
+
         // Storage-array health watcher — every 60s, scan /proc/mdstat
         // and per-disk SMART. Fire an alert_log entry on first
         // observation of a degraded array, faulty disk, or
@@ -1562,6 +1579,11 @@ async fn main() -> std::io::Result<()> {
                 // hourly off this same loop, reusing the readings it already
                 // took instead of running a second smartctl sweep.
                 let mut ticks: u64 = 0;
+                // Failed self-tests are only re-evaluated on the hourly tick,
+                // so their fault text is kept here between passes for the
+                // banner (`hw_faults` below is rebuilt every tick).
+                let mut selftest_faults: std::collections::HashMap<String, crate::array::HardwareFault> =
+                    std::collections::HashMap::new();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     ticks = ticks.wrapping_add(1);
@@ -1580,7 +1602,16 @@ async fn main() -> std::io::Result<()> {
                     let cluster_name = cluster_for_label.get_self_cluster_name();
 
                     let mut current = std::collections::HashSet::new();
-                    let mut new_alerts: Vec<(String, String, String)> = Vec::new();
+                    // (severity, title, detail, category). Disk and array
+                    // faults are `Hardware`, which fires under Simple
+                    // verbosity; they were `Lifecycle` until 2026-11-23, so a
+                    // degraded mirror on wolfstack-1 went unreported for a week.
+                    let mut new_alerts: Vec<(String, String, String, crate::alerting::AlertCategory)> = Vec::new();
+                    // Everything wrong with the disk hardware right now — not
+                    // just what is new — for the dashboard banner.
+                    let mut hw_faults: Vec<crate::array::HardwareFault> = Vec::new();
+                    let hw = crate::alerting::AlertCategory::Hardware;
+                    let lifecycle = crate::alerting::AlertCategory::Lifecycle;
                     // `last_seen = current` at the end of each tick is what
                     // de-duplicates alerts. The self-test pass only runs on the
                     // hourly tick, so on the other 59 its keys would vanish
@@ -1595,26 +1626,29 @@ async fn main() -> std::io::Result<()> {
                         if arr.state == "degraded" {
                             let key = format!("array_degraded:{}", arr.name);
                             current.insert(key.clone());
+                            let title = format!("Array degraded: /dev/{}", arr.name);
+                            let detail = format!("{} has lost redundancy — one more disk failure and data is lost. Members still present: [{}]. Replace the missing or faulty disk.",
+                                arr.level,
+                                arr.disks.iter().map(|d| format!("{}({})", d.device, d.state)).collect::<Vec<_>>().join(", "));
+                            hw_faults.push(crate::array::HardwareFault {
+                                severity: "critical".into(), title: title.clone(), detail: detail.clone(),
+                            });
                             if !last_seen.contains(&key) {
-                                new_alerts.push((
-                                    "critical".into(),
-                                    format!("Array degraded: /dev/{}", arr.name),
-                                    format!("level={} disks=[{}]", arr.level,
-                                        arr.disks.iter().map(|d| format!("{}({})", d.device, d.state)).collect::<Vec<_>>().join(", ")),
-                                ));
+                                new_alerts.push(("critical".into(), title, detail, hw));
                             }
                         }
                         for d in &arr.disks {
                             if d.state == "faulty" || d.state == "missing" {
                                 let key = format!("array_disk:{}:{}", arr.name, d.device);
                                 current.insert(key.clone());
+                                let title = format!("Disk {} on /dev/{} is {}", d.device, arr.name, d.state);
+                                let detail = format!("model={} role={}",
+                                    d.model.clone().unwrap_or_default(), d.role);
+                                hw_faults.push(crate::array::HardwareFault {
+                                    severity: "critical".into(), title: title.clone(), detail: detail.clone(),
+                                });
                                 if !last_seen.contains(&key) {
-                                    new_alerts.push((
-                                        "critical".into(),
-                                        format!("Disk {} on /dev/{} is {}", d.device, arr.name, d.state),
-                                        format!("model={} role={}",
-                                            d.model.clone().unwrap_or_default(), d.role),
-                                    ));
+                                    new_alerts.push(("critical".into(), title, detail, hw));
                                 }
                             }
                             // NOTE: per-disk SMART health (overall-health AND the
@@ -1675,13 +1709,14 @@ async fn main() -> std::io::Result<()> {
                         {
                             let key = format!("smart_unreadable:{}", dev);
                             current.insert(key.clone());
+                            let title = format!("Disk {} health is unreadable", dev);
+                            let detail = format!("{} — no successful SMART read in {} day(s), so this disk is NOT being monitored. Check cabling/enclosure, or inspect manually: smartctl -a {}",
+                                dev, check.stale_secs / 86_400, dev);
+                            hw_faults.push(crate::array::HardwareFault {
+                                severity: "warning".into(), title: title.clone(), detail: detail.clone(),
+                            });
                             if !last_seen.contains(&key) {
-                                new_alerts.push((
-                                    "warning".into(),
-                                    format!("Disk {} health is unreadable", dev),
-                                    format!("{} — no successful SMART read in {} day(s), so this disk is NOT being monitored. Check cabling/enclosure, or inspect manually: smartctl -a {}",
-                                        dev, check.stale_secs / 86_400, dev),
-                                ));
+                                new_alerts.push(("warning".into(), title, detail, hw));
                             }
                         }
                         let health = match check.smart.as_ref() {
@@ -1692,13 +1727,14 @@ async fn main() -> std::io::Result<()> {
                         if reasons.is_empty() { continue; }
                         let key = format!("smart:{}", dev);
                         current.insert(key.clone());
+                        let title = format!("Disk {} is failing (SMART)", dev);
+                        let detail = format!("{} — back up and plan replacement: {}",
+                            dev, reasons.join("; "));
+                        hw_faults.push(crate::array::HardwareFault {
+                            severity: "critical".into(), title: title.clone(), detail: detail.clone(),
+                        });
                         if !last_seen.contains(&key) {
-                            new_alerts.push((
-                                "critical".into(),
-                                format!("Disk {} is failing (SMART)", dev),
-                                format!("{} — back up and plan replacement: {}",
-                                    dev, reasons.join("; ")),
-                            ));
+                            new_alerts.push(("critical".into(), title, detail, hw));
                         }
                     }
 
@@ -1757,18 +1793,23 @@ async fn main() -> std::io::Result<()> {
                         for (dev, status) in &tested {
                             // Only an explicit failure alerts. An aborted or
                             // interrupted test reports no verdict at all and
-                            // must never be shown as a failure.
-                            if status.passed != Some(false) { continue; }
+                            // must never be shown as a failure — and a disk
+                            // that has since passed clears its banner entry.
+                            if status.passed != Some(false) {
+                                if status.passed == Some(true) { selftest_faults.remove(dev); }
+                                continue;
+                            }
                             let key = format!("selftest:{}", dev);
                             current.insert(key.clone());
+                            let title = format!("Disk {} failed its SMART self-test", dev);
+                            let detail = format!("{} — {}. The drive itself reports a fault; back up and plan replacement.",
+                                dev,
+                                status.result.clone().unwrap_or_else(|| "self-test reported a failure".into()));
+                            selftest_faults.insert(dev.clone(), crate::array::HardwareFault {
+                                severity: "critical".into(), title: title.clone(), detail: detail.clone(),
+                            });
                             if !last_seen.contains(&key) {
-                                new_alerts.push((
-                                    "critical".into(),
-                                    format!("Disk {} failed its SMART self-test", dev),
-                                    format!("{} — {}. The drive itself reports a fault; back up and plan replacement.",
-                                        dev,
-                                        status.result.clone().unwrap_or_else(|| "self-test reported a failure".into())),
-                                ));
+                                new_alerts.push(("critical".into(), title, detail, hw));
                             }
                         }
                         // Disks we could not evaluate this pass — asleep, or
@@ -1799,6 +1840,7 @@ async fn main() -> std::io::Result<()> {
                                     "critical".into(),
                                     "This node is using the built-in default cluster secret".into(),
                                     format!("{} peer(s) are configured. Every proxied per-node request is signed with the public default secret and will be rejected with 401 by any peer using its own — this node keeps reporting online while none of its pages load. Copy /etc/wolfstack/custom-cluster-secret from a working node (chmod 600) and restart the agent.", peers),
+                                    lifecycle,
                                 ));
                             }
                         }
@@ -1818,6 +1860,7 @@ async fn main() -> std::io::Result<()> {
                                 "warning".into(),
                                 "Storage configuration was damaged and has been repaired".into(),
                                 "WolfStack found trailing data after the end of storage.json, recovered the mount definitions it still contained, and rewrote the file. The damaged original was kept alongside it as storage.json.corrupt-<timestamp>. Check the Storage page to confirm your mounts are all present.".into(),
+                                lifecycle,
                             ));
                         }
                     }
@@ -1829,7 +1872,39 @@ async fn main() -> std::io::Result<()> {
                                 "critical".into(),
                                 "Storage configuration could not be read".into(),
                                 "WolfStack is holding an EMPTY storage config in memory and has blocked writes so the on-disk file cannot be overwritten. Mounts will not be applied until it is repaired, and saving from the Storage page is refused on purpose — writing now would destroy the mounts and credentials the file still contains. A copy has been preserved next to it.".into(),
+                                lifecycle,
                             ));
+                        }
+                    }
+
+                    // Publish the full current fault set (failed self-tests
+                    // carried between their hourly passes) for the banner.
+                    hw_faults.extend(selftest_faults.values().cloned());
+                    crate::array::publish_hardware_faults(hw_faults.clone());
+
+                    // ─── Weekly "are the disks OK" report (hourly check) ───
+                    // Sent whether or not anything is wrong, so a node whose
+                    // report stops arriving is noticed. Hardware only: the
+                    // physical disks and RAID arrays read above, not mounts.
+                    if ticks.is_multiple_of(60) {
+                        let now_unix = chrono::Utc::now().timestamp().max(0) as u64;
+                        let alert_cfg = crate::alerting::AlertConfig::load();
+                        if crate::alerting::should_send(&alert_cfg, hw)
+                            && crate::array::weekly_report_due(now_unix)
+                        {
+                            let phys_for_report = phys.clone();
+                            let arrays_for_report = arrays.clone();
+                            let faults_for_report = hw_faults.clone();
+                            let report = tokio::task::spawn_blocking(move || {
+                                let disks = crate::array::report_disks(&phys_for_report);
+                                crate::array::build_weekly_report(&disks, &arrays_for_report, &faults_for_report)
+                            }).await;
+                            if let Ok((title, detail)) = report {
+                                let (title, body) = crate::alerting::decorate_local(&title, &detail);
+                                crate::alerting::send_alert(&alert_cfg, hw, &title, &body).await;
+                                crate::alerting::send_alert_email_if_selected(&alert_cfg, &title, &body).await;
+                                crate::array::mark_weekly_report_sent(now_unix);
+                            }
                         }
                     }
 
@@ -1841,7 +1916,7 @@ async fn main() -> std::io::Result<()> {
                         {
                             let mut log = alert_log.write().unwrap_or_else(|e| e.into_inner());
                             let first_id = log.last().map(|e| e.id + 1).unwrap_or(1);
-                            for (next_id, (sev, title, detail)) in (first_id..).zip(&new_alerts) {
+                            for (next_id, (sev, title, detail, _)) in (first_id..).zip(&new_alerts) {
                                 log.push(api::AlertLogEntry {
                                     id: next_id,
                                     timestamp: now.clone(),
@@ -1861,13 +1936,11 @@ async fn main() -> std::io::Result<()> {
                         //    Both are best-effort — a failed dispatch logs a
                         //    warning but never blocks the watcher.
                         let alert_cfg = crate::alerting::AlertConfig::load();
-                        // Storage / SMART failures — Lifecycle category. The
-                        // event itself is rare (state-change-gated, not per-tick)
-                        // but operators told us Simple mode should stay minimal:
-                        // dashboard surfaces these, switch to Verbose to push.
-                        let cat = crate::alerting::AlertCategory::Lifecycle;
-                        let category_allowed = crate::alerting::should_send(&alert_cfg, cat);
-                        for (_sev, title, detail) in new_alerts {
+                        // Disk / array faults are `Hardware` (fires under
+                        // Simple); the node-config faults stay `Lifecycle`.
+                        // State-change-gated, so each fires once per fault.
+                        for (_sev, title, detail, cat) in new_alerts {
+                            let category_allowed = crate::alerting::should_send(&alert_cfg, cat);
                             // decorate_local prepends `[<cluster> / <host>]`
                             // and a Cluster:/Host:/When: header — same shape
                             // every other WolfStack alert uses. We pass the

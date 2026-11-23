@@ -34,6 +34,14 @@ pub struct SystemMetrics {
     /// Hardware classification: "low", "mid", or "high"
     #[serde(default)]
     pub hardware_tier: String,
+    /// What is wrong with this node's disk hardware right now (failing
+    /// disk, degraded RAID) — as published by the storage watcher. Carried
+    /// in metrics so every node's dashboard can raise a banner for any
+    /// node. Empty on healthy nodes and on peers older than this field.
+    /// Omitted when empty, so a healthy node's status report is
+    /// byte-identical to an older peer's (the wire-schema tests pin this).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hardware_faults: Vec<crate::array::HardwareFault>,
 }
 
 /// NVIDIA GPU telemetry returned by `nvidia-smi`, when the NVIDIA utility is
@@ -341,6 +349,7 @@ impl SystemMonitor {
             os_version: System::os_version(),
             kernel_version: System::kernel_version(),
             hardware_tier,
+            hardware_faults: crate::array::hardware_faults(),
         }
     }
 }
