@@ -24,4 +24,12 @@ ignore = [
     # rust_decimal, behind a feature we do not enable. `cargo tree -i rkyv`
     # prints nothing: it is not compiled into the binary.
     "RUSTSEC-2026-0235",
+
+    # cookie: private-jar nonces can repeat after fork(). Fixed only in
+    # cookie 0.18.3 (our reqwest copy is on it). actix-web (latest 4.20.0)
+    # still depends on cookie 0.16, which has no fix — but the private jar is
+    # behind cookie's `private` feature, which nothing in our tree enables
+    # (`cargo tree -e features -i cookie@0.16.2` shows only "default"), and
+    # WolfStack sets no private cookies. Remove when actix-web moves to 0.18.
+    "RUSTSEC-2026-0594",
 ]
