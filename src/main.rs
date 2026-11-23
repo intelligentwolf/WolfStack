@@ -1612,6 +1612,13 @@ async fn main() -> std::io::Result<()> {
                     let mut hw_faults: Vec<crate::array::HardwareFault> = Vec::new();
                     let hw = crate::alerting::AlertCategory::Hardware;
                     let lifecycle = crate::alerting::AlertCategory::Lifecycle;
+                    // Disk warnings that are NOT a failure — a few reallocated
+                    // sectors, a drive with no readable SMART (USB sticks, odd
+                    // enclosures). Posture is Verbose-only, so Simple mode
+                    // notifies only when a disk has actually failed; the
+                    // warnings stay on Storage, in Issues and in the weekly
+                    // report.
+                    let disk_warning = crate::alerting::AlertCategory::Posture;
                     // `last_seen = current` at the end of each tick is what
                     // de-duplicates alerts. The self-test pass only runs on the
                     // hourly tick, so on the other 59 its keys would vanish
@@ -1716,7 +1723,7 @@ async fn main() -> std::io::Result<()> {
                                 severity: "warning".into(), title: title.clone(), detail: detail.clone(),
                             });
                             if !last_seen.contains(&key) {
-                                new_alerts.push(("warning".into(), title, detail, hw));
+                                new_alerts.push(("warning".into(), title, detail, disk_warning));
                             }
                         }
                         let health = match check.smart.as_ref() {
@@ -1753,7 +1760,7 @@ async fn main() -> std::io::Result<()> {
                                 severity: "warning".into(), title: title.clone(), detail: detail.clone(),
                             });
                             if !last_seen.contains(&key) {
-                                new_alerts.push(("warning".into(), title, detail, hw));
+                                new_alerts.push(("warning".into(), title, detail, disk_warning));
                             }
                         }
                     }
