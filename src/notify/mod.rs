@@ -14,7 +14,7 @@
 //! ## What this is NOT
 //!
 //! Not a second notification system. `alerting.rs` already delivers to Discord,
-//! Slack, Telegram, ntfy and email with masked secrets and working retries; a
+//! Slack, Telegram, ntfy, Apprise and email with masked secrets and working retries; a
 //! parallel subsystem would mean two secret stores and two places to look when
 //! something failed to page you. This module supplies the two halves alerting
 //! lacks — an **event source** and a **rule layer** — and hands the result to

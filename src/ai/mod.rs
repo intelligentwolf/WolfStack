@@ -2693,7 +2693,7 @@ fn openai_tools_schema() -> serde_json::Value {
                         },
                         "channels": {
                             "type": "array",
-                            "items": { "type": "string", "enum": ["discord","slack","telegram","ntfy","email"] },
+                            "items": { "type": "string", "enum": ["discord","slack","telegram","ntfy","apprise","email"] },
                             "description": "Where to signal. Empty = every configured channel."
                         },
                         "cooldown_minutes": { "type": "integer", "description": "Silence per object after firing. Default 15." }

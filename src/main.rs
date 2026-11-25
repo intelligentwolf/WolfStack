@@ -1957,7 +1957,7 @@ async fn main() -> std::io::Result<()> {
                             while log.len() > 200 { log.remove(0); }
                         }
                         // 2. Fan out to the operator's selected delivery
-                        //    paths: Discord/Slack/Telegram/ntfy via the
+                        //    paths: Discord/Slack/Telegram/ntfy/Apprise via the
                         //    alerting module, email via the AI module's SMTP
                         //    creds (the same ones the daily report uses).
                         //    Both are best-effort — a failed dispatch logs a

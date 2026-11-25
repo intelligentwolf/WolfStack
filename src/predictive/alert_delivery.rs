@@ -49,7 +49,7 @@ pub struct DeliveryState {
     /// Settings → Alerts → "Enable alerts".
     pub enabled: bool,
     /// At least one selected channel (email, Discord, Slack, Telegram,
-    /// ntfy) has credentials.
+    /// ntfy, Apprise) has credentials.
     pub has_delivery: bool,
 }
 
@@ -85,7 +85,7 @@ pub fn analyze(
         (false, false) => "Alerts are switched off and no delivery channel is set up.",
         (false, true) => "A delivery channel is set up, but alerts are switched off.",
         (true, false) => "Alerts are switched on, but no delivery channel (email, Discord, \
-                          Slack, Telegram or ntfy) is set up or selected.",
+                          Slack, Telegram, ntfy or Apprise) is set up or selected.",
         (true, true) => unreachable!("returned above"),
     };
 
@@ -117,7 +117,7 @@ pub fn analyze(
         RemediationPlan::Manual {
             instructions: "On this node: Settings → Alerts → Notifications — \
                 switch alerts on and set up a push channel (ntfy, Discord, \
-                Slack or Telegram), and/or email under Settings → AI Agent → \
+                Slack, Telegram or Apprise), and/or email under Settings → AI Agent → \
                 Email Alerts. Press Send test. Then use \"Copy to every node \
                 in this cluster\" on the Notifications page so the other \
                 nodes deliver too.".into(),

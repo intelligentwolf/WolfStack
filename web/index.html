@@ -6809,6 +6809,74 @@
                                         placeholder="tk_… — only for reserved topics / self-hosted auth">
                                 </div>
 
+                                <h4 style="margin:16px 0 12px 0; font-size:14px; color:var(--accent-light);">Apprise (100+ services)</h4>
+                                <div class="form-group" style="margin-bottom:12px;">
+                                    <!-- Sibling of the label, not a child — same reason as ntfy's. -->
+                                    <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                                        <label for="alerting-apprise-url" style="margin:0;">Apprise API Server</label>
+                                        <button type="button" id="alerting-apprise-clear" onclick="clearAppriseChannel()"
+                                            style="display:none; background:transparent; border:none; color:var(--danger); font-size:12px; cursor:pointer; padding:0;">Disable Apprise</button>
+                                    </div>
+                                    <input type="text" id="alerting-apprise-url" class="form-control"
+                                        placeholder="http://apprise.lan:8000" aria-describedby="alerting-apprise-url-help alerting-apprise-url-error">
+                                    <div id="alerting-apprise-url-error" class="alerting-field-error" role="alert" style="display:none; color:var(--danger); font-size:12px; margin-top:4px;"></div>
+                                    <small id="alerting-apprise-url-help" style="color:var(--text-muted);">The root of your
+                                        <a href="https://github.com/caronc/apprise-api" target="_blank" rel="noopener" style="color:var(--accent-primary);">Apprise API</a>
+                                        server. Apprise passes each alert on to whatever you've set up there: Pushover, Gotify, Matrix, Teams, email, SMS and more.</small>
+                                </div>
+                                <fieldset class="form-group" style="margin:0 0 12px 0; padding:0; border:none;">
+                                    <legend style="font-size:13px; margin-bottom:6px; padding:0;">How to send</legend>
+                                    <div style="display:grid; gap:6px;">
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="radio" name="alerting-apprise-mode" value="key" checked style="width:16px;height:16px;margin-top:2px;">
+                                            <span>A configuration saved on the server (by its key)</span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="radio" name="alerting-apprise-mode" value="urls" style="width:16px;height:16px;margin-top:2px;">
+                                            <span>Apprise URLs entered here</span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="radio" name="alerting-apprise-mode" value="server" style="width:16px;height:16px;margin-top:2px;">
+                                            <span>The server's default URLs (<code>APPRISE_STATELESS_URLS</code>)</span>
+                                        </label>
+                                    </div>
+                                </fieldset>
+                                <div class="form-group alerting-apprise-mode-key" style="margin-bottom:12px;">
+                                    <label for="alerting-apprise-key">Configuration Key</label>
+                                    <input type="text" id="alerting-apprise-key" class="form-control" autocomplete="off"
+                                        placeholder="e.g. apprise" aria-describedby="alerting-apprise-key-help alerting-apprise-key-error">
+                                    <div id="alerting-apprise-key-error" class="alerting-field-error" role="alert" style="display:none; color:var(--danger); font-size:12px; margin-top:4px;"></div>
+                                    <small id="alerting-apprise-key-help" style="color:var(--text-muted);">The key you saved the configuration under (letters, digits, _ and -).</small>
+                                </div>
+                                <div class="form-group alerting-apprise-mode-key" style="margin-bottom:12px;">
+                                    <label for="alerting-apprise-tag">Tag <span style="color:var(--text-muted); font-weight:400;">(optional)</span></label>
+                                    <input type="text" id="alerting-apprise-tag" class="form-control"
+                                        placeholder="e.g. wolfstack" aria-describedby="alerting-apprise-tag-help">
+                                    <small id="alerting-apprise-tag-help" style="color:var(--text-muted);">Only notify entries with this tag. A comma means either tag, a space means both.</small>
+                                </div>
+                                <div class="form-group alerting-apprise-mode-urls" style="margin-bottom:12px; display:none;">
+                                    <label for="alerting-apprise-urls">Apprise URLs</label>
+                                    <textarea id="alerting-apprise-urls" class="form-control" rows="3" autocomplete="off" spellcheck="false"
+                                        placeholder="pover://user@token&#10;mailto://user:pass@example.com"
+                                        aria-describedby="alerting-apprise-urls-help alerting-apprise-urls-error"></textarea>
+                                    <div id="alerting-apprise-urls-error" class="alerting-field-error" role="alert" style="display:none; color:var(--danger); font-size:12px; margin-top:4px;"></div>
+                                    <small id="alerting-apprise-urls-help" style="color:var(--text-muted);">One or more, separated by spaces, commas or new lines. They contain your services' passwords, so they're never shown again after saving.</small>
+                                </div>
+                                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:16px;">
+                                    <div class="form-group" style="margin:0;">
+                                        <label for="alerting-apprise-user">Username <span style="color:var(--text-muted); font-weight:400;">(optional)</span></label>
+                                        <input type="text" id="alerting-apprise-user" class="form-control" autocomplete="off"
+                                            aria-describedby="alerting-apprise-auth-help alerting-apprise-user-error">
+                                        <div id="alerting-apprise-user-error" class="alerting-field-error" role="alert" style="display:none; color:var(--danger); font-size:12px; margin-top:4px;"></div>
+                                    </div>
+                                    <div class="form-group" style="margin:0;">
+                                        <label for="alerting-apprise-password">Password <span style="color:var(--text-muted); font-weight:400;">(optional)</span></label>
+                                        <input type="password" id="alerting-apprise-password" class="form-control" autocomplete="new-password"
+                                            aria-describedby="alerting-apprise-auth-help">
+                                    </div>
+                                    <small id="alerting-apprise-auth-help" style="color:var(--text-muted); grid-column:1/-1; margin-top:-6px;">Only if the server runs with <code>APPRISE_AUTH_REQUIRED=yes</code>.</small>
+                                </div>
+
                                 <div class="form-group" style="margin-bottom:16px; padding:12px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px;">
                                     <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0;">
                                         <input type="checkbox" id="alerting-telegram-receiver" style="width:16px;height:16px;">
@@ -6876,6 +6944,11 @@
                                             <input type="checkbox" class="alerting-delivery-channel" value="ntfy"
                                                 style="width:16px;height:16px;margin-top:2px;">
                                             <span>ntfy push <span class="alerting-delivery-hint" data-channel="ntfy" style="color:var(--text-muted);"></span></span>
+                                        </label>
+                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
+                                            <input type="checkbox" class="alerting-delivery-channel" value="apprise"
+                                                style="width:16px;height:16px;margin-top:2px;">
+                                            <span>Apprise <span class="alerting-delivery-hint" data-channel="apprise" style="color:var(--text-muted);"></span></span>
                                         </label>
                                         <label style="display:flex; align-items:flex-start; gap:8px; font-size:13px; cursor:pointer;">
                                             <input type="checkbox" class="alerting-delivery-channel" value="email"
