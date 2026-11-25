@@ -275,6 +275,40 @@ pub struct AlertConfig {
     #[serde(default)]
     pub ntfy_token: String,
 
+    /// Apprise API server root (`caronc/apprise-api`), e.g.
+    /// `http://apprise.lan:8000`. Empty = channel off. Apprise fans one
+    /// notification out to 100+ services, so this is the channel for every
+    /// destination WolfStack has no native sender for (JJ, 2026-11-24).
+    /// Plain config, like `ntfy_server`; [`apprise_server_problem`] keeps
+    /// credentials out of it so it can be shown back unmasked.
+    #[serde(default)]
+    pub apprise_url: String,
+    /// Stateless mode: Apprise URLs (`mailto://…`, `pover://…`, …) sent with
+    /// every notification to `POST /notify`. They carry the destination
+    /// services' own credentials, so they are write-only from the UI.
+    /// Mutually exclusive with `apprise_key`.
+    #[serde(default)]
+    pub apprise_urls: String,
+    /// Stateful mode: a configuration saved on the Apprise server, sent to
+    /// `POST /notify/{key}`. With the server's authentication off the key is
+    /// all it takes to send through that configuration, so it is masked
+    /// like the ntfy topic. Validated by [`apprise_key_problem`].
+    #[serde(default)]
+    pub apprise_key: String,
+    /// Stateful mode only: restrict delivery to entries carrying these
+    /// tags (Apprise syntax — comma = OR, space = AND). Empty = the
+    /// server's default for that configuration.
+    #[serde(default)]
+    pub apprise_tag: String,
+    /// HTTP Basic Auth for a server started with `APPRISE_AUTH_REQUIRED=yes`.
+    /// The username may be empty: Apprise accepts an administrator password
+    /// on its own.
+    #[serde(default)]
+    pub apprise_user: String,
+    /// Write-only, like `ntfy_token`.
+    #[serde(default)]
+    pub apprise_password: String,
+
     /// Which delivery paths alerts actually go out on.
     ///
     /// Configuring a channel used to BE the selection: every alert went to
@@ -600,6 +634,12 @@ impl Default for AlertConfig {
             ntfy_server: default_ntfy_server(),
             ntfy_topic: String::new(),
             ntfy_token: String::new(),
+            apprise_url: String::new(),
+            apprise_urls: String::new(),
+            apprise_key: String::new(),
+            apprise_tag: String::new(),
+            apprise_user: String::new(),
+            apprise_password: String::new(),
             channels: Vec::new(),
         }
     }
@@ -747,6 +787,7 @@ impl AlertConfig {
             Channel::Telegram =>
                 !self.telegram_bot_token.is_empty() && !self.telegram_chat_id.is_empty(),
             Channel::Ntfy => !self.ntfy_topic.is_empty(),
+            Channel::Apprise => !self.apprise_url.is_empty(),
             Channel::Email => false,
         }
     }
@@ -798,14 +839,14 @@ impl AlertConfig {
     /// setup delivering by email alone answers false here — the email branch
     /// in `send_node_alert` is gated separately and still fires.
     pub fn has_channels(&self) -> bool {
-        [Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy]
+        Channel::PUSH
             .iter()
             .any(|c| self.channel_configured(*c) && self.delivers_on(*c))
     }
 
     /// Return a JSON representation with secrets masked
     pub fn to_masked_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut j = serde_json::json!({
             "enabled": self.enabled,
             "discord_webhook": mask_secret(&self.discord_webhook),
             "slack_webhook": mask_secret(&self.slack_webhook),
@@ -855,7 +896,26 @@ impl AlertConfig {
             "twilio_account_sid": self.twilio_account_sid,
             "has_twilio_auth": !self.twilio_auth_token.is_empty(),
             "twilio_whatsapp_from": self.twilio_whatsapp_from,
-        })
+        });
+        // Added after the literal: one more key inside it exceeds
+        // serde_json's json! macro recursion limit.
+        j["apprise_url"] = self.apprise_url.clone().into();
+        // mask_secret slices bytes; only a key that passed validation (ASCII)
+        // goes through it, so a hand-edited alerts.json can't panic this.
+        j["apprise_key"] = if apprise_key_problem(&self.apprise_key).is_none() {
+            mask_secret(&self.apprise_key)
+        } else if self.apprise_key.is_empty() {
+            String::new()
+        } else {
+            "********".to_string()
+        }.into();
+        j["apprise_tag"] = self.apprise_tag.clone().into();
+        j["apprise_user"] = self.apprise_user.clone().into();
+        j["has_apprise"] = (!self.apprise_url.is_empty()).into();
+        j["has_apprise_urls"] = (!self.apprise_urls.is_empty()).into();
+        j["has_apprise_key"] = (!self.apprise_key.is_empty()).into();
+        j["has_apprise_password"] = (!self.apprise_password.is_empty()).into();
+        j
     }
 }
 
@@ -978,7 +1038,7 @@ pub async fn send_node_alert(
         cluster_name, hostname, when, body,
     );
 
-    // Push channels (Discord / Slack / Telegram / ntfy).
+    // Push channels (Discord / Slack / Telegram / ntfy / Apprise).
     if alert_cfg.enabled && alert_cfg.has_channels() {
         send_alert(&alert_cfg, category, &full_title, &full_body).await;
     }
@@ -1126,7 +1186,7 @@ pub async fn send_alert(config: &AlertConfig, category: AlertCategory, title: &s
 }
 
 /// Fan a title/body out to every configured push channel (Discord,
-/// Slack, Telegram, ntfy). Pure dispatch — no enabled/verbosity/
+/// Slack, Telegram, ntfy, Apprise). Pure dispatch — no enabled/verbosity/
 /// rate-limit gating; callers decide whether to send. `ntfy_priority`
 /// is the 1–5 ntfy scale.
 /// One delivery channel. Named so a notify rule can route to a subset —
@@ -1139,6 +1199,8 @@ pub enum Channel {
     Slack,
     Telegram,
     Ntfy,
+    /// An Apprise API server, which relays to whatever services it holds.
+    Apprise,
     /// Delivered via `ai::send_alert_email`, NOT through the webhook fan-out —
     /// email settings live on AiConfig (`email_enabled`, `email_to`), which is
     /// why this needs its own branch rather than another webhook field.
@@ -1146,8 +1208,15 @@ pub enum Channel {
 }
 
 impl Channel {
-    pub const ALL: [Channel; 5] =
-        [Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy, Channel::Email];
+    pub const ALL: [Channel; 6] = [
+        Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy, Channel::Apprise,
+        Channel::Email,
+    ];
+
+    /// Every channel except Email — the ones the push fan-out delivers to
+    /// itself (email has its own transport; see [`Channel::Email`]).
+    pub const PUSH: [Channel; 5] =
+        [Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy, Channel::Apprise];
 
     /// Wire name — matches the serde representation, so the frontend and the
     /// config file speak the same strings.
@@ -1157,6 +1226,7 @@ impl Channel {
             Channel::Slack => "slack",
             Channel::Telegram => "telegram",
             Channel::Ntfy => "ntfy",
+            Channel::Apprise => "apprise",
             Channel::Email => "email",
         }
     }
@@ -1226,6 +1296,12 @@ pub async fn dispatch_to_selected(
     {
         warn!("ntfy alert failed: {}", e);
     }
+    if channels.contains(&Channel::Apprise)
+        && !config.apprise_url.is_empty()
+        && let Err(e) = send_apprise(config, title, message, apprise_type(ntfy_priority)).await
+    {
+        warn!("Apprise alert failed: {}", e);
+    }
     // Email is a different transport entirely — SMTP via AiConfig — so it goes
     // through the one helper that owns that path (and its blocking-pool hop).
     if channels.contains(&Channel::Email) {
@@ -1238,11 +1314,7 @@ pub async fn dispatch_to_selected(
 /// transport — see `send_alert_email_if_selected`), so it is not requested
 /// here even when the operator has it selected.
 async fn dispatch_to_channels(config: &AlertConfig, title: &str, message: &str, ntfy_priority: u8) {
-    dispatch_to_selected(
-        config,
-        &[Channel::Discord, Channel::Slack, Channel::Telegram, Channel::Ntfy],
-        title, message, ntfy_priority,
-    ).await;
+    dispatch_to_selected(config, &Channel::PUSH, title, message, ntfy_priority).await;
 }
 
 /// Notify the configured channels that a status-page monitor changed
@@ -1307,6 +1379,7 @@ pub async fn send_test(config: &AlertConfig) -> Vec<TestResult> {
                 &config.telegram_bot_token, &config.telegram_chat_id, title, message).await,
             Channel::Ntfy => send_ntfy(
                 &config.ntfy_server, &config.ntfy_topic, &config.ntfy_token, title, message, 3).await,
+            Channel::Apprise => send_apprise(config, title, message, apprise_type(3)).await,
             Channel::Email => {
                 // SMTP is blocking — off the async worker, same as every other
                 // alert-email path.
@@ -1495,6 +1568,130 @@ async fn send_ntfy(server: &str, topic: &str, token: &str, title: &str, message:
     }
 }
 
+// ── Apprise API (caronc/apprise-api) ──
+// Source: apprise-api README "API Details" + apprise_api/api/views.py
+// (StatelessNotifyView / StatefulNotifyView, checked at 424792e):
+//  * `POST /notify` — stateless. JSON `{urls, title, body, type}`. Without
+//    `urls` the server falls back to its APPRISE_STATELESS_URLS.
+//  * `POST /notify/{KEY}` — a saved configuration. JSON `{title, body,
+//    type, tag}`. KEY is 1-128 of [A-Za-z0-9_-].
+//  * `type` is one of apprise.NotifyType: info / success / warning / failure.
+//  * Errors come back as `{"error": "…"}` when the request prefers JSON
+//    (utils.is_json_response: an `Accept: application/json` header). 424 =
+//    at least one destination failed; 401 = Basic Auth missing or wrong.
+// A send fans out to every destination before the server answers, so this
+// gets longer than the shared client's 10 s.
+const APPRISE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Apprise's message type for a 1–5 alert priority — the same scale the
+/// other channels use, so a compromise page (5) arrives as `failure` and
+/// routine traffic as `info`.
+fn apprise_type(priority: u8) -> &'static str {
+    match priority {
+        5..=u8::MAX => "failure",
+        4 => "warning",
+        _ => "info",
+    }
+}
+
+/// Why `key` can't be an Apprise configuration key, or `None` when it can.
+/// The rule is the server's own (README "API Notes"), and it also keeps the
+/// key safe to put in the request path.
+pub fn apprise_key_problem(key: &str) -> Option<&'static str> {
+    if key.is_empty() || key.len() > 128 {
+        return Some("The Apprise configuration key must be 1-128 characters.");
+    }
+    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return Some("The Apprise configuration key may only contain letters, digits, '_' and '-'.");
+    }
+    None
+}
+
+/// Why `url` can't be an Apprise server address, or `None` when it can.
+/// Credentials in the address are refused: the address is shown back on the
+/// settings page in plain text, and Basic Auth has its own write-only fields.
+pub fn apprise_server_problem(url: &str) -> Option<&'static str> {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return Some("The Apprise server address isn't a valid URL (e.g. http://apprise.lan:8000).");
+    };
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return Some("The Apprise server address must start with http:// or https://.");
+    }
+    if u.host_str().is_none_or(|h| h.is_empty()) {
+        return Some("The Apprise server address has no host name.");
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Some("Put the Apprise username and password in their own fields, not in the server address.");
+    }
+    if u.query().is_some() || u.fragment().is_some() {
+        return Some("The Apprise server address can't contain ? or # — give the server root only.");
+    }
+    None
+}
+
+/// The request an Apprise send makes: (URL, JSON body). Separate from the
+/// HTTP call so the three modes are testable.
+fn apprise_request(config: &AlertConfig, title: &str, message: &str, kind: &str) -> (String, serde_json::Value) {
+    let base = config.apprise_url.trim().trim_end_matches('/');
+    let mut body = serde_json::json!({ "title": title, "body": message, "type": kind });
+    if !config.apprise_urls.is_empty() {
+        body["urls"] = serde_json::Value::String(config.apprise_urls.clone());
+        (format!("{}/notify", base), body)
+    } else if !config.apprise_key.is_empty() {
+        if !config.apprise_tag.is_empty() {
+            body["tag"] = serde_json::Value::String(config.apprise_tag.clone());
+        }
+        (format!("{}/notify/{}", base, config.apprise_key), body)
+    } else {
+        // Neither: the server's own APPRISE_STATELESS_URLS.
+        (format!("{}/notify", base), body)
+    }
+}
+
+async fn send_apprise(config: &AlertConfig, title: &str, message: &str, kind: &str) -> Result<(), String> {
+    // The key goes into the path; re-check it here as well as at save time,
+    // since a hand-edited alerts.json never passed through the API.
+    if !config.apprise_key.is_empty() && config.apprise_urls.is_empty()
+        && let Some(p) = apprise_key_problem(&config.apprise_key) {
+        return Err(p.to_string());
+    }
+    if let Some(p) = apprise_server_problem(config.apprise_url.trim()) {
+        return Err(p.to_string());
+    }
+    let (url, body) = apprise_request(config, title, message, kind);
+    let mut req = ALERT_CLIENT.post(&url)
+        .timeout(APPRISE_TIMEOUT)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&body);
+    if !config.apprise_user.is_empty() || !config.apprise_password.is_empty() {
+        req = req.basic_auth(&config.apprise_user, Some(&config.apprise_password));
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    // Drain the body so the socket returns to the keep-alive pool.
+    let bytes = resp.bytes().await.unwrap_or_default();
+    if status.is_success() {
+        return Ok(());
+    }
+    let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+        .unwrap_or_default();
+    // The server's messages don't say what to change on our side for the
+    // two errors an operator can fix here.
+    let hint = match status.as_u16() {
+        401 => " — check the Apprise username and password",
+        404 if !config.apprise_key.is_empty() && config.apprise_urls.is_empty() =>
+            " — the server has no configuration saved under that key",
+        _ => "",
+    };
+    if detail.is_empty() {
+        Err(format!("Apprise HTTP {}{}", status, hint))
+    } else {
+        Err(format!("Apprise HTTP {}: {}{}", status, detail, hint))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1517,6 +1714,136 @@ mod tests {
         assert_eq!(j["ntfy_server"], "https://ntfy.sh");
         assert_ne!(j["ntfy_topic"], "wolfstack-secret-topic");
         assert!(j.get("ntfy_token").is_none(), "token must never reach the frontend");
+    }
+
+    // ── Apprise (JJ 2026-11-24) ──
+
+    fn apprise_cfg() -> AlertConfig {
+        AlertConfig { apprise_url: "http://apprise.lan:8000/".into(), ..Default::default() }
+    }
+
+    /// The three documented ways to send: explicit URLs (stateless), a
+    /// saved key (stateful, tag honoured), or neither (the server's own
+    /// APPRISE_STATELESS_URLS). A tag is never sent with explicit URLs —
+    /// they carry no tags, Apprise's `utils/logic.py is_exclusive_match`
+    /// needs every tag token to match a service's own tags, so nothing
+    /// would be sent and the API answers 424 ("no requested tag matched").
+    #[test]
+    fn apprise_request_modes() {
+        let mut c = apprise_cfg();
+        c.apprise_tag = "ops".into();
+        let (url, body) = apprise_request(&c, "T", "B", "info");
+        assert_eq!(url, "http://apprise.lan:8000/notify");
+        assert_eq!(body, serde_json::json!({ "title": "T", "body": "B", "type": "info" }));
+
+        c.apprise_urls = "mailto://u:p@example.com pover://k@t".into();
+        let (url, body) = apprise_request(&c, "T", "B", "failure");
+        assert_eq!(url, "http://apprise.lan:8000/notify");
+        assert_eq!(body["urls"], "mailto://u:p@example.com pover://k@t");
+        assert_eq!(body["type"], "failure");
+        assert!(body.get("tag").is_none());
+
+        c.apprise_urls.clear();
+        c.apprise_key = "wolfstack_alerts-1".into();
+        let (url, body) = apprise_request(&c, "T", "B", "warning");
+        assert_eq!(url, "http://apprise.lan:8000/notify/wolfstack_alerts-1");
+        assert_eq!(body["tag"], "ops");
+        assert!(body.get("urls").is_none());
+    }
+
+    /// The real HTTP path against a live Apprise API server — every mode
+    /// and the error paths an operator can hit. Ignored by default (needs a
+    /// server). Run with:
+    ///   APPRISE_TEST_SERVER=http://127.0.0.1:8000   (started with
+    ///     APPRISE_STATELESS_URLS set, so "server" mode has somewhere to go)
+    ///   APPRISE_TEST_URLS=json://127.0.0.1:9123/     (a listener you watch)
+    ///   APPRISE_TEST_KEY=<key saved with /add/{key}, tagged "wolfstack">
+    ///   cargo test --bin wolfstack apprise_live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a live Apprise API server"]
+    async fn apprise_live_round_trip() {
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let base = AlertConfig { apprise_url: env("APPRISE_TEST_SERVER"), ..Default::default() };
+
+        let urls = AlertConfig { apprise_urls: env("APPRISE_TEST_URLS"), ..base.clone() };
+        send_apprise(&urls, "WolfStack live test (urls)", "stateless body", "warning").await
+            .expect("stateless send");
+
+        let keyed = AlertConfig { apprise_key: env("APPRISE_TEST_KEY"), apprise_tag: "wolfstack".into(), ..base.clone() };
+        send_apprise(&keyed, "WolfStack live test (key)", "stateful body", "failure").await
+            .expect("stateful send with tag");
+
+        send_apprise(&base, "WolfStack live test (server)", "server default body", "info").await
+            .expect("server default URLs");
+
+        let no_tag = AlertConfig { apprise_tag: "no-such-tag".into(), ..keyed.clone() };
+        let e = send_apprise(&no_tag, "t", "b", "info").await.expect_err("unmatched tag must fail");
+        assert!(e.contains("424"), "{e}");
+
+        let missing = AlertConfig { apprise_key: "wolfstack-no-such-key".into(), apprise_tag: String::new(), ..base.clone() };
+        let e = send_apprise(&missing, "t", "b", "info").await.expect_err("unknown key must fail");
+        assert!(e.contains("no configuration saved under that key"), "{e}");
+    }
+
+    #[test]
+    fn apprise_type_follows_priority() {
+        assert_eq!(apprise_type(5), "failure");
+        assert_eq!(apprise_type(4), "warning");
+        assert_eq!(apprise_type(3), "info");
+        assert_eq!(apprise_type(1), "info");
+    }
+
+    #[test]
+    fn apprise_key_rules_match_the_server() {
+        assert!(apprise_key_problem("apprise").is_none());
+        assert!(apprise_key_problem("A-b_9").is_none());
+        assert!(apprise_key_problem(&"k".repeat(128)).is_none());
+        assert!(apprise_key_problem("").is_some());
+        assert!(apprise_key_problem(&"k".repeat(129)).is_some());
+        // Anything that could change the request path is refused.
+        for bad in ["../admin", "a/b", "a b", "a?x=1", "a%2F", "ключ"] {
+            assert!(apprise_key_problem(bad).is_some(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn apprise_server_address_rules() {
+        assert!(apprise_server_problem("http://apprise.lan:8000").is_none());
+        assert!(apprise_server_problem("https://example.com/apprise").is_none());
+        assert!(apprise_server_problem("apprise.lan:8000").is_some());
+        assert!(apprise_server_problem("ftp://apprise.lan").is_some());
+        assert!(apprise_server_problem("http://admin:secret@apprise.lan").is_some(),
+            "credentials would be shown back in plain text");
+        assert!(apprise_server_problem("http://apprise.lan/?x=1").is_some());
+    }
+
+    /// Server address on = channel on. URLs, key and password never reach
+    /// the frontend in the clear.
+    #[test]
+    fn apprise_channel_counts_and_masks() {
+        let mut c = AlertConfig::default();
+        c.apprise_key = "wolfstack-secret-key".into();
+        assert!(!c.has_channels(), "no server address = channel off");
+        c.apprise_url = "http://apprise.lan:8000".into();
+        c.apprise_urls = "pover://user@token".into();
+        c.apprise_password = "hunter2".into();
+        assert!(c.has_channels());
+        assert!(c.channel_configured(Channel::Apprise));
+
+        let j = c.to_masked_json();
+        assert_eq!(j["has_apprise"], true);
+        assert_eq!(j["has_apprise_urls"], true);
+        assert_eq!(j["has_apprise_password"], true);
+        assert_eq!(j["apprise_url"], "http://apprise.lan:8000");
+        assert_ne!(j["apprise_key"], "wolfstack-secret-key");
+        let text = j.to_string();
+        assert!(!text.contains("pover://"), "Apprise URLs must never reach the frontend");
+        assert!(!text.contains("hunter2"), "password must never reach the frontend");
+
+        // Selecting other channels switches Apprise off like any other.
+        c.channels = vec![Channel::Ntfy];
+        assert!(!c.delivers_on(Channel::Apprise));
+        assert!(!c.has_channels());
     }
 
     // ── Delivery-path selection (klas 2026-09-09: ntfy AND email) ──
@@ -1639,7 +1966,7 @@ mod tests {
         assert_eq!(open["channels"], serde_json::json!([]));
         assert_eq!(
             open["channels_effective"],
-            serde_json::json!(["discord", "slack", "telegram", "ntfy", "email"]),
+            serde_json::json!(["discord", "slack", "telegram", "ntfy", "apprise", "email"]),
         );
     }
 

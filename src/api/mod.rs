@@ -36465,6 +36465,84 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
         config.ntfy_topic = String::new();
         config.ntfy_token = String::new();
     }
+    // Apprise. The server address, tag and username are plain config; the
+    // stateless URLs (they hold the destinations' own credentials), the
+    // config key and the password are write-only, kept when sent blank.
+    // `apprise_mode` is the form's radio — "key", "urls" or "server" (the
+    // server's own APPRISE_STATELESS_URLS) — and decides which of the two
+    // stored values survives, so switching modes never leaves both set.
+    // Errors name their field so the form can mark it.
+    let apprise_err = |field: &str, msg: &str| HttpResponse::BadRequest()
+        .json(serde_json::json!({ "error": msg, "field": field }));
+    if let Some(s) = v.get("apprise_url").and_then(|v| v.as_str()) {
+        let trimmed = s.trim().trim_end_matches('/');
+        if !trimmed.is_empty()
+            && let Some(problem) = crate::alerting::apprise_server_problem(trimmed) {
+            return apprise_err("apprise_url", problem);
+        }
+        config.apprise_url = trimmed.to_string();
+    }
+    let new_urls = v.get("apprise_urls").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let new_key = v.get("apprise_key").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    if new_urls.is_some() && new_key.is_some() {
+        return apprise_err("apprise_key", "Give Apprise either URLs or a configuration key, not both.");
+    }
+    if let Some(urls) = new_urls {
+        config.apprise_urls = urls.to_string();
+        config.apprise_key = String::new();
+    }
+    if let Some(key) = new_key {
+        if let Some(problem) = crate::alerting::apprise_key_problem(key) {
+            return apprise_err("apprise_key", problem);
+        }
+        config.apprise_key = key.to_string();
+        config.apprise_urls = String::new();
+    }
+    match v.get("apprise_mode").and_then(|v| v.as_str()) {
+        Some("server") => {
+            config.apprise_key = String::new();
+            config.apprise_urls = String::new();
+        }
+        Some("key") => {
+            config.apprise_urls = String::new();
+            if !config.apprise_url.is_empty() && config.apprise_key.is_empty() {
+                return apprise_err("apprise_key", "Enter the Apprise configuration key, or pick another way to send.");
+            }
+        }
+        Some("urls") => {
+            config.apprise_key = String::new();
+            if !config.apprise_url.is_empty() && config.apprise_urls.is_empty() {
+                return apprise_err("apprise_urls", "Enter at least one Apprise URL, or pick another way to send.");
+            }
+        }
+        _ => {}
+    }
+    if let Some(s) = v.get("apprise_tag").and_then(|v| v.as_str()) {
+        config.apprise_tag = s.trim().to_string();
+    }
+    if let Some(s) = v.get("apprise_user").and_then(|v| v.as_str()) {
+        let user = s.trim();
+        // Apprise refuses a username containing ':' (APPRISE_USER), and
+        // Basic Auth could not carry one unambiguously anyway.
+        if user.contains(':') {
+            return apprise_err("apprise_user", "The Apprise username can't contain ':'.");
+        }
+        config.apprise_user = user.to_string();
+    }
+    if let Some(t) = v.get("apprise_password").and_then(|v| v.as_str())
+        && !t.is_empty() {
+        // Not trimmed: a password may legitimately end in a space.
+        config.apprise_password = t.to_string();
+    }
+    // Explicit disconnect — the "Disable Apprise" button.
+    if v.get("apprise_clear").and_then(|v| v.as_bool()) == Some(true) {
+        config.apprise_url = String::new();
+        config.apprise_urls = String::new();
+        config.apprise_key = String::new();
+        config.apprise_tag = String::new();
+        config.apprise_user = String::new();
+        config.apprise_password = String::new();
+    }
     // Delivery-path selection: an array of channel names ("ntfy", "email", …).
     // An empty array means "every configured channel" — the pre-selection
     // behaviour — so the UI can offer "all of them" without a magic value.

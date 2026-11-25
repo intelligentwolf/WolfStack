@@ -56894,6 +56894,7 @@ async function loadAlertingConfig() {
         if (ntfyServerEl) ntfyServerEl.value = c.ntfy_server || 'https://ntfy.sh';
         if (ntfyTokenEl && c.has_ntfy_token) ntfyTokenEl.placeholder = 'Token set \u2014 leave blank to keep, or paste a new one';
         if (ntfyClearBtn) ntfyClearBtn.style.display = c.has_ntfy ? '' : 'none';
+        loadAppriseFields(c);
         const cpuEl = document.getElementById('alerting-cpu');
         const memEl = document.getElementById('alerting-memory');
         const diskEl = document.getElementById('alerting-disk');
@@ -56948,6 +56949,7 @@ async function loadAlertingConfig() {
         if (c.has_slack) channels.push('\u2705 Slack');
         if (c.has_telegram) channels.push('\u2705 Telegram');
         if (c.has_ntfy) channels.push('\u2705 ntfy');
+        if (c.has_apprise) channels.push('\u2705 Apprise');
         if (c.has_email) channels.push('\u2705 Email');
         const statusEl = document.getElementById('alerting-channel-status');
         statusEl.innerHTML = channels.length
@@ -56970,6 +56972,7 @@ function alertingChannelState(c) {
         slack:    { label: 'Slack',    configured: !!c.has_slack,    where: 'Slack Webhook URL above' },
         telegram: { label: 'Telegram', configured: !!c.has_telegram, where: 'Telegram bot token + chat ID above' },
         ntfy:     { label: 'ntfy',     configured: !!c.has_ntfy,     where: 'ntfy topic above' },
+        apprise:  { label: 'Apprise',  configured: !!c.has_apprise,  where: 'Apprise API server above' },
         email:    { label: 'Email',    configured: !!c.has_email,    where: 'Settings \u2192 AI \u2192 Email alerts' },
     };
 }
@@ -56987,7 +56990,7 @@ function renderAlertingDelivery(c) {
     const state = alertingChannelState(c);
     const effective = Array.isArray(c.channels_effective) && c.channels_effective.length
         ? c.channels_effective
-        : ['discord', 'slack', 'telegram', 'ntfy', 'email'];
+        : ['discord', 'slack', 'telegram', 'ntfy', 'apprise', 'email'];
     boxes.forEach(box => {
         box.checked = effective.indexOf(box.value) !== -1;
         box.onchange = updateAlertingDeliverySummary;
@@ -57077,6 +57080,18 @@ async function saveAlertingConfig(skipBtnState) {
     if (ntfyTopic) payload.ntfy_topic = ntfyTopic;
     if (ntfyToken) payload.ntfy_token = ntfyToken;
     payload.ntfy_server = ntfyServer;
+    // Apprise: server, tag and username always go (blank clears them); the
+    // key, URLs and password are write-only, so only typed values are sent.
+    // The mode radio tells the server which of key/URLs to keep.
+    const apprVal = id => (document.getElementById(id) || { value: '' }).value;
+    payload.apprise_url = apprVal('alerting-apprise-url').trim();
+    payload.apprise_mode = appriseMode();
+    payload.apprise_tag = apprVal('alerting-apprise-tag').trim();
+    payload.apprise_user = apprVal('alerting-apprise-user').trim();
+    if (payload.apprise_mode === 'key' && apprVal('alerting-apprise-key').trim()) payload.apprise_key = apprVal('alerting-apprise-key').trim();
+    if (payload.apprise_mode === 'urls' && apprVal('alerting-apprise-urls').trim()) payload.apprise_urls = apprVal('alerting-apprise-urls').trim();
+    if (apprVal('alerting-apprise-password')) payload.apprise_password = apprVal('alerting-apprise-password');
+    clearAlertingFieldErrors();
     // Delivery paths. All five ticked is sent as [] — "every configured
     // channel" — so the stored config keeps meaning the same thing if a
     // channel is added later, instead of pinning today's list.
@@ -57116,6 +57131,9 @@ async function saveAlertingConfig(skipBtnState) {
             return true;
         } else {
             const data = await resp.json().catch(() => ({}));
+            // A field-specific error is marked at the field itself; the toast
+            // still says it, since the field may be scrolled out of view.
+            if (data.field) showAlertingFieldError(data.field, data.error);
             showToast(data.error || 'Failed to save', 'error');
             if (btn) { btn.innerHTML = origBtnHtml; btn.disabled = false; }
             return false;
@@ -57156,7 +57174,7 @@ async function testAlerting() {
             // Everything configured is deselected in "Deliver alerts to".
             showToast(`Nothing sent \u2014 every configured path is unticked in "Deliver alerts to" (${details})`, 'error');
         } else {
-            showToast('No channels configured \u2014 add a Discord, Slack, Telegram, ntfy or email channel first', 'error');
+            showToast('No channels configured \u2014 add a Discord, Slack, Telegram, ntfy, Apprise or email channel first', 'error');
         }
     } catch (e) {
         showToast('Test failed: ' + e.message, 'error');
@@ -57260,6 +57278,115 @@ function generateNtfyTopic() {
     showToast('Random topic generated — subscribe to it in the ntfy app, then click Save', 'info');
 }
 window.generateNtfyTopic = generateNtfyTopic;
+
+// ── Apprise ──
+
+function appriseMode() {
+    const r = document.querySelector('input[name="alerting-apprise-mode"]:checked');
+    return r ? r.value : 'key';
+}
+
+// Show only the fields the chosen mode uses.
+function applyAppriseMode() {
+    const mode = appriseMode();
+    document.querySelectorAll('.alerting-apprise-mode-key').forEach(el => { el.style.display = mode === 'key' ? '' : 'none'; });
+    document.querySelectorAll('.alerting-apprise-mode-urls').forEach(el => { el.style.display = mode === 'urls' ? '' : 'none'; });
+}
+
+// Paint the Apprise section. Key, URLs and password are write-only: the
+// placeholders say whether one is stored, the inputs stay empty.
+function loadAppriseFields(c) {
+    const el = id => document.getElementById(id);
+    if (!el('alerting-apprise-url')) return;
+    el('alerting-apprise-url').value = c.apprise_url || '';
+    el('alerting-apprise-tag').value = c.apprise_tag || '';
+    el('alerting-apprise-user').value = c.apprise_user || '';
+    el('alerting-apprise-key').value = '';
+    el('alerting-apprise-urls').value = '';
+    el('alerting-apprise-password').value = '';
+    el('alerting-apprise-key').placeholder = c.has_apprise_key
+        ? `\u2705 Saved (${c.apprise_key}) \u2014 leave blank to keep`
+        : 'e.g. apprise';
+    el('alerting-apprise-urls').placeholder = c.has_apprise_urls
+        ? '\u2705 Saved (hidden) \u2014 leave blank to keep, or paste new URLs to replace them'
+        : 'pover://user@token\nmailto://user:pass@example.com';
+    el('alerting-apprise-password').placeholder = c.has_apprise_password
+        ? 'Password set \u2014 leave blank to keep'
+        : '';
+    const mode = c.has_apprise_urls ? 'urls' : (c.has_apprise_key ? 'key' : (c.has_apprise ? 'server' : 'key'));
+    document.querySelectorAll('input[name="alerting-apprise-mode"]').forEach(r => {
+        r.checked = r.value === mode;
+        r.onchange = applyAppriseMode;
+    });
+    applyAppriseMode();
+    const clearBtn = el('alerting-apprise-clear');
+    if (clearBtn) clearBtn.style.display = c.has_apprise ? '' : 'none';
+}
+
+// Inline field errors from the save endpoint (`field` in the error body).
+const ALERTING_FIELD_INPUTS = {
+    apprise_url: 'alerting-apprise-url',
+    apprise_key: 'alerting-apprise-key',
+    apprise_urls: 'alerting-apprise-urls',
+    apprise_user: 'alerting-apprise-user',
+};
+
+function showAlertingFieldError(field, message) {
+    const inputId = ALERTING_FIELD_INPUTS[field];
+    if (!inputId) return;
+    const input = document.getElementById(inputId);
+    const msg = document.getElementById(inputId + '-error');
+    if (!input || !msg) return;
+    msg.textContent = message || 'Invalid value';
+    msg.style.display = '';
+    input.setAttribute('aria-invalid', 'true');
+    // The error may belong to a mode's field that is hidden right now.
+    if (field === 'apprise_key' || field === 'apprise_urls') {
+        const want = field === 'apprise_key' ? 'key' : 'urls';
+        const radio = document.querySelector(`input[name="alerting-apprise-mode"][value="${want}"]`);
+        if (radio && !radio.checked) { radio.checked = true; applyAppriseMode(); }
+    }
+    input.focus();
+}
+
+function clearAlertingFieldErrors() {
+    Object.values(ALERTING_FIELD_INPUTS).forEach(id => {
+        const input = document.getElementById(id);
+        const msg = document.getElementById(id + '-error');
+        if (input) input.removeAttribute('aria-invalid');
+        if (msg) { msg.textContent = ''; msg.style.display = 'none'; }
+    });
+}
+
+// Disconnect Apprise: key, URLs and password are write-only, so emptying
+// the inputs can't mean "remove" — this sends the explicit flag.
+async function clearAppriseChannel() {
+    if (!(await showDangerConfirm({
+        title: 'Disable Apprise notifications?',
+        danger: 'The saved server address, configuration key, Apprise URLs and login will be removed. Alerts stop going through Apprise until you set it up again.',
+        detail: 'The other channels (Discord / Slack / Telegram / ntfy / email) are not affected. Nothing on the Apprise server itself is changed.',
+        countdown: 3,
+        confirmLabel: 'Disable Apprise',
+    }))) return;
+    try {
+        const resp = await fetch('/api/alerts/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ apprise_clear: true })
+        });
+        if (resp.ok) {
+            showToast('Apprise channel disabled', 'success');
+            clearAlertingFieldErrors();
+            loadAlertingConfig();
+        } else {
+            const data = await resp.json().catch(() => ({}));
+            showToast(data.error || 'Failed to disable Apprise', 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+window.clearAppriseChannel = clearAppriseChannel;
 
 // ═══ WolfRun Orchestration ═══
 
@@ -82327,7 +82454,7 @@ window.predTermClose = predTermClose;
 const APP_DRAWER_TILES = [
     {
         id: 'probes', icon: '', name: 'Probe Bay',
-        desc: 'Launch probes that watch your containers and VMs — Docker, LXC, libvirt, Proxmox — and signal you on Discord, Slack, Telegram, ntfy or email when something goes down.',
+        desc: 'Launch probes that watch your containers and VMs — Docker, LXC, libvirt, Proxmox — and signal you on Discord, Slack, Telegram, ntfy, Apprise or email when something goes down.',
     },
     {
         id: 'mail', icon: '', name: 'Mail',
@@ -87024,6 +87151,7 @@ const PROBE_CHANNELS = [
     ['slack', 'Slack'],
     ['telegram', 'Telegram'],
     ['ntfy', 'ntfy'],
+    ['apprise', 'Apprise'],
     ['email', 'Email'],
 ];
 
