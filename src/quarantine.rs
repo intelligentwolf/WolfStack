@@ -461,10 +461,11 @@ pub fn reconcile() {
 // ─── Process capture + kill ────────────────────────────────────────
 
 fn pids_for(t: &targets::Target, spec: KillSpec) -> Vec<u32> {
+    let mut memfds = procs::MemfdVerifier::default();
     t.pids.iter().copied().filter(|&p| p != t.init_pid && !targets::is_zombie(p)).filter(|&p| {
         let exe = std::fs::read_link(format!("/proc/{}/exe", p)).ok()
             .map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
-        let staging = || procs::staging_exe(&exe).is_some();
+        let mut staging = || procs::staged_process(p, &exe, &mut memfds).is_some();
         let miner = || {
             let comm = std::fs::read_to_string(format!("/proc/{}/comm", p)).unwrap_or_default();
             crate::security::MINER_PROCS.contains(&comm.trim())

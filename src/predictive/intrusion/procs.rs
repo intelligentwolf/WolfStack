@@ -33,12 +33,73 @@ use std::collections::BTreeMap;
 /// `RUNC_MEMFD_COMMENT` in libcontainer/nsenter/cloned_binary.c.
 const BENIGN_MEMFD: &[&str] = &["runc_cloned:/proc/self/exe"];
 
-/// Where a process executes from, if that place is a staging area.
+/// memfds that are cleared only after their CONTENT is checked. A memfd
+/// name is whatever its creator passed to memfd_create(2), so a name alone
+/// would let malware hide by borrowing one. Each entry is the memfd name
+/// and the HOST path of the binary it must be a byte-for-byte copy of;
+/// that file must also be owned by a host package.
+///
+/// LXC's tools re-execute themselves from a sealed memfd (same defence as
+/// runc's): `lxc_rexec("lxc-attach")` in src/lxc/tools/lxc_attach.c,
+/// `memfd_create(memfd_name, ...)` in src/lxc/rexec.c. Proxmox's
+/// `pct exec` / `pct enter` run lxc-attach, shipped as /usr/bin/lxc-attach
+/// (lxc-pve; Debian/Fedora/Arch lxc packages install it there too).
+const VERIFIED_MEMFD: &[(&str, &str)] = &[("lxc-attach", "/usr/bin/lxc-attach")];
+
+/// The memfd name of an exe link (`/memfd:<name> (deleted)`), if it is one.
+fn memfd_name(exe: &str) -> Option<&str> {
+    exe.strip_prefix("/memfd:").map(|r| r.trim_end_matches(" (deleted)"))
+}
+
+/// Checks verifiable memfds ([`VERIFIED_MEMFD`]) against the host's
+/// package-owned originals. The expected hash of each original is worked
+/// out once per verifier (the ownership query streams the whole package
+/// database), and only when such a memfd is actually seen.
+#[derive(Default)]
+pub struct MemfdVerifier {
+    /// host path → SHA-256 of that file when a host package owns it.
+    expected: std::collections::HashMap<&'static str, Option<String>>,
+}
+
+impl MemfdVerifier {
+    fn expected_hash(&mut self, path: &'static str) -> Option<String> {
+        self.expected.entry(path).or_insert_with(|| {
+            // Through /proc/1/root, like every other host read here.
+            let host = RootFs::for_pid(1)?;
+            let (_, owned) = super::pkgdb::owned(&host, "/", &[path.to_string()])?;
+            if !owned.contains(path) { return None; }
+            let body = host.read(path, EXE_HASH_CAP as usize)?;
+            Some(super::sysfiles::sha256_hex(&body))
+        }).clone()
+    }
+
+    /// Is `pid`, running from memfd `exe`, a verified copy of a packaged
+    /// host binary? Anything that cannot be checked is "no".
+    pub fn is_verified(&mut self, pid: u32, exe: &str) -> bool {
+        let Some(name) = memfd_name(exe) else { return false };
+        let Some(&(_, path)) = VERIFIED_MEMFD.iter().find(|(n, _)| *n == name) else { return false };
+        let Some(want) = self.expected_hash(path) else { return false };
+        exe_sha256(pid).is_some_and(|got| got == want)
+    }
+}
+
+/// [`staging_exe`] for a live process: a memfd listed in
+/// [`VERIFIED_MEMFD`] whose content matches its packaged original is not
+/// staging. Used by both the scan and quarantine's kill selection, so the
+/// two cannot disagree about which processes are suspect.
+pub fn staged_process(pid: u32, exe: &str, v: &mut MemfdVerifier) -> Option<&'static str> {
+    let place = staging_exe(exe)?;
+    if v.is_verified(pid, exe) { return None; }
+    Some(place)
+}
+
+/// Where a process executes from, if that place is a staging area, by
+/// path alone. Memfds in [`VERIFIED_MEMFD`] are still reported here —
+/// clearing them takes [`staged_process`], which checks their content.
 pub fn staging_exe(exe: &str) -> Option<&'static str> {
     if exe.starts_with("/tmp/") { return Some("/tmp"); }
     if exe.starts_with("/dev/shm/") { return Some("/dev/shm"); }
-    if let Some(rest) = exe.strip_prefix("/memfd:") {
-        let name = rest.trim_end_matches(" (deleted)");
+    if let Some(name) = memfd_name(exe) {
         if BENIGN_MEMFD.contains(&name) { return None; }
         return Some("memory (memfd)");
     }
@@ -117,17 +178,20 @@ pub fn exe_fs_safe(pid: u32) -> bool {
         .is_some_and(|t| !super::rootfs::fstype_can_block(&t))
 }
 
+/// Largest executable hashed: a miner is ~8 MB, nothing staged in /tmp
+/// legitimately approaches this.
+const EXE_HASH_CAP: u64 = 256 << 20;
+
 /// Hash an executable through /proc/<pid>/exe, which works even when the
-/// file was deleted or the path is in another mount namespace. Capped:
-/// a miner is ~8 MB, nothing staged in /tmp legitimately approaches this.
+/// file was deleted or the path is in another mount namespace (or is a
+/// memfd). Capped at [`EXE_HASH_CAP`].
 fn exe_sha256(pid: u32) -> Option<String> {
     use std::io::Read;
     if !exe_fs_safe(pid) { return None; }
-    const CAP: u64 = 256 << 20;
     let f = std::fs::File::open(format!("/proc/{}/exe", pid)).ok()?;
-    if f.metadata().ok()?.len() > CAP { return None; }
+    if f.metadata().ok()?.len() > EXE_HASH_CAP { return None; }
     let mut buf = Vec::new();
-    f.take(CAP).read_to_end(&mut buf).ok()?;
+    f.take(EXE_HASH_CAP).read_to_end(&mut buf).ok()?;
     Some(super::sysfiles::sha256_hex(&buf))
 }
 
@@ -203,12 +267,13 @@ pub fn scan(target: &Target, root: &RootFs, now: i64) -> ProcFindings {
     let mut f = ProcFindings::default();
     let passwd = root.read_string("etc/passwd", 4 << 20).unwrap_or_default();
     let socks = net::tcp_sockets(target.init_pid);
+    let mut memfds = MemfdVerifier::default();
     for &pid in &target.pids {
         if super::targets::is_zombie(pid) { continue; }
         let exe = std::fs::read_link(format!("/proc/{}/exe", pid)).ok()
             .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default().trim().to_string();
-        let staged = staging_exe(&exe);
+        let staged = staged_process(pid, &exe, &mut memfds);
         let miner = crate::security::MINER_PROCS.contains(&comm.as_str());
         let env = std::fs::read(format!("/proc/{}/environ", pid)).ok()
             .map(|b| hooks::hooks_in_environ(&b[..b.len().min(256 << 10)]))
@@ -278,10 +343,81 @@ mod tests {
         assert_eq!(staging_exe("/dev/shm/.x/k"), Some("/dev/shm"));
         assert_eq!(staging_exe("/memfd:payload (deleted)"), Some("memory (memfd)"));
         assert_eq!(staging_exe("/memfd:runc_cloned:/proc/self/exe (deleted)"), None);
+        // lxc-attach is cleared only by a content check, never by name.
+        assert_eq!(staging_exe("/memfd:lxc-attach (deleted)"), Some("memory (memfd)"));
         assert_eq!(staging_exe("/usr/bin/node"), None);
         assert_eq!(staging_exe("/usr/bin/node (deleted)"), None);
         // /var/tmp is deliberately out of scope (too many legitimate layouts).
         assert_eq!(staging_exe("/var/tmp/x"), None);
+    }
+
+    #[test]
+    fn memfd_named_like_lxc_attach_is_not_trusted_by_name() {
+        // This test process is not a memfd copy of /usr/bin/lxc-attach, so
+        // borrowing the name must not clear it — whatever the host has.
+        let me = std::process::id();
+        let mut v = MemfdVerifier::default();
+        assert!(!v.is_verified(me, "/memfd:lxc-attach (deleted)"));
+        assert_eq!(staged_process(me, "/memfd:lxc-attach (deleted)", &mut v), Some("memory (memfd)"));
+        // Names not in the verified list are never cleared by content.
+        assert!(!v.is_verified(me, "/memfd:payload (deleted)"));
+        assert!(!v.is_verified(me, "/usr/bin/lxc-attach"));
+    }
+
+    #[test]
+    fn memfd_copy_of_the_expected_binary_is_verified() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // A real process executing from a memfd named "lxc-attach", the way
+        // LXC's rexec.c builds it: copy the binary in, then exec the memfd.
+        // /usr/bin/sleep stands in for lxc-attach so this runs on any host.
+        let src = std::fs::read("/usr/bin/sleep").expect("sleep binary");
+        let name = std::ffi::CString::new("lxc-attach").unwrap();
+        // SAFETY: valid C string; result checked. No MFD_CLOEXEC, so the
+        // child inherits it and can exec it by /proc/self/fd path.
+        let raw = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        assert!(raw >= 0, "memfd_create");
+        // SAFETY: freshly returned descriptor, owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        std::io::Write::write_all(&mut std::fs::File::from(fd.try_clone().unwrap()), &src).unwrap();
+        let mut child = std::process::Command::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .arg("30").spawn().expect("exec memfd");
+        let pid = child.id();
+        let exe = (0..200).find_map(|_| {
+            let e = std::fs::read_link(format!("/proc/{}/exe", pid)).ok()?.to_string_lossy().into_owned();
+            if e.starts_with("/memfd:") { Some(e) } else { std::thread::sleep(std::time::Duration::from_millis(10)); None }
+        }).expect("child running from the memfd");
+        assert_eq!(memfd_name(&exe), Some("lxc-attach"));
+
+        let mut good = MemfdVerifier::default();
+        good.expected.insert("/usr/bin/lxc-attach", Some(crate::predictive::intrusion::sysfiles::sha256_hex(&src)));
+        let mut bad = MemfdVerifier::default();
+        bad.expected.insert("/usr/bin/lxc-attach", Some("0".repeat(64)));
+        let mut unowned = MemfdVerifier::default();
+        unowned.expected.insert("/usr/bin/lxc-attach", None);
+        let results = (good.is_verified(pid, &exe), staged_process(pid, &exe, &mut good),
+            bad.is_verified(pid, &exe), unowned.is_verified(pid, &exe));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(results, (true, None, false, false));
+    }
+
+    #[test]
+    fn expected_hash_is_the_packaged_original_when_readable() {
+        // Live host check: when this host has a packaged lxc-attach and the
+        // host root is readable (/proc/1/root needs root), the expected hash
+        // must be that file's. Otherwise it must be None, never a guess.
+        let got = MemfdVerifier::default().expected_hash("/usr/bin/lxc-attach");
+        if let Some(h) = got {
+            let disk = std::fs::read("/usr/bin/lxc-attach").expect("lxc-attach readable");
+            assert_eq!(h, crate::predictive::intrusion::sysfiles::sha256_hex(&disk));
+        }
+    }
+
+    #[test]
+    fn memfd_names_parse() {
+        assert_eq!(memfd_name("/memfd:lxc-attach (deleted)"), Some("lxc-attach"));
+        assert_eq!(memfd_name("/memfd:runc_cloned:/proc/self/exe (deleted)"), Some("runc_cloned:/proc/self/exe"));
+        assert_eq!(memfd_name("/usr/bin/lxc-attach"), None);
     }
 
     #[test]
