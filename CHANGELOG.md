@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.50.0: alerts can go through an Apprise server to 100+ services** _(2026-11-25 — [`218e330c`](https://github.com/intelligentwolf/WolfStack/commit/218e330c2db57b1b118edd251742f0b7cb0ae2f5))_
 - **v25.49.2: a release swap no longer looks like a tampered npm package** _(2026-11-25 — [`9a39b75d`](https://github.com/intelligentwolf/WolfStack/commit/9a39b75dad2269f747045008da28a5c45bd83da8))_
 - **v25.49.1: the disk banner only shouts about disks that have actually failed** _(2026-11-23 — [`57cde688`](https://github.com/intelligentwolf/WolfStack/commit/57cde688f09b17d8f483abf0773f06bdf9c78eed))_
 - **v25.49.0: choose the drive for each WolfHA copy and never start one that won't fit; failing disks alert and show a banner** _(2026-11-23 — [`60deb98a`](https://github.com/intelligentwolf/WolfStack/commit/60deb98af0217f482357c29d2e31ad98dc864c43))_
