@@ -293,6 +293,12 @@ impl RootFs {
     /// enterable mount on its canonical path (see the module docs).
     /// Err carries the errno (ENOENT/ENOTDIR = missing).
     fn open(&self, path: &str, flags: i32) -> Result<OwnedFd, i32> {
+        self.open_resolve(path, flags, 0)
+    }
+
+    /// [`open`](Self::open) with extra `RESOLVE_*` flags for the walk
+    /// inside the final mount.
+    fn open_resolve(&self, path: &str, flags: i32, extra_resolve: u64) -> Result<OwnedFd, i32> {
         if self.is_blocking(path) { return Err(libc::EXDEV); }
         let p = rel(path);
         let mount = self.safe_mounts.iter()
@@ -300,7 +306,7 @@ impl RootFs {
             .cloned()
             .unwrap_or_default();
         let err = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
-        let in_mount = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV | libc::RESOLVE_NO_MAGICLINKS;
+        let in_mount = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV | libc::RESOLVE_NO_MAGICLINKS | extra_resolve;
         let to_mount = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
         if mount.is_empty() {
             let c = CString::new(p).map_err(|_| libc::EINVAL)?;
@@ -357,6 +363,22 @@ impl RootFs {
         if self.is_blocking(p) { return None; }
         let cname = CString::new(name).ok()?;
         fstatat_nofollow(dir.as_raw_fd(), &cname)
+    }
+
+    /// True only when `path` provably does not exist in the target: walked
+    /// WITHOUT following any symlink, some component is absent (ENOENT) or
+    /// a parent is not a directory (ENOTDIR). Every other failure —
+    /// permission, a blocking mount, any symlink on the way (ELOOP) — is
+    /// "not known to be missing", so a caller that treats "missing" as
+    /// "nothing to report" can never be talked into silence by an error.
+    ///
+    /// Symlinks are refused rather than followed because [`open`](Self::open)
+    /// resolves an absolute link relative to the mount it sits in, not
+    /// the target's `/`: a package dir swapped for an absolute symlink on
+    /// a sub-mount would otherwise look absent while node runs through it.
+    pub fn is_missing(&self, path: &str) -> bool {
+        matches!(self.open_resolve(path, libc::O_PATH, libc::RESOLVE_NO_SYMLINKS),
+            Err(e) if e == libc::ENOENT || e == libc::ENOTDIR)
     }
 
     /// List a directory. Entries carry their own lstat metadata;
@@ -432,6 +454,34 @@ mod tests {
         // Too large is an error, not a truncated prefix.
         assert_eq!(root.read_checked(plain.to_str().unwrap(), 1), Err(ReadErr::TooLarge));
         assert_eq!(root.read_checked(dir.join("absent").to_str().unwrap(), 10), Err(ReadErr::Missing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_missing_only_for_paths_that_do_not_exist() {
+        let dir = std::env::temp_dir().join(format!("ws-rootfs-missing-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(dir.join("file"), b"x").unwrap();
+        let _ = std::fs::remove_file(dir.join("escape"));
+        std::os::unix::fs::symlink("/proc/version", dir.join("escape")).unwrap();
+        let root = RootFs::for_pid(std::process::id()).expect("open own root");
+        let p = |s: &str| dir.join(s).to_str().unwrap().to_string();
+        assert!(!root.is_missing(&p("pkg")));
+        assert!(!root.is_missing(&p("file")));
+        // Symlinks are never followed (ELOOP): unknown, not missing —
+        // whether they point into another mount, at an absolute path that
+        // would resolve inside this mount, or nowhere at all.
+        assert!(!root.is_missing(&p("escape")));
+        let _ = std::fs::remove_file(dir.join("dangling"));
+        std::os::unix::fs::symlink("no-such-dir", dir.join("dangling")).unwrap();
+        assert!(!root.is_missing(&p("dangling")));
+        assert!(!root.is_missing(&p("dangling/bin/vite.js")));
+        assert!(root.is_missing(&p("absent")));
+        // ENOTDIR: a parent component is a file.
+        assert!(root.is_missing(&p("file/inside")));
+        std::fs::remove_dir(dir.join("pkg")).unwrap();
+        assert!(root.is_missing(&p("pkg")));
+        assert!(root.is_missing(&p("pkg/bin/vite.js")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

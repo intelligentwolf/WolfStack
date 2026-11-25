@@ -382,10 +382,21 @@ pub enum Outcome {
     Unpublished(String),
     /// Could not check this time (offline, budget spent) — never a finding.
     Unverified(String),
+    /// The install directory no longer exists — a release swap, `rm -rf
+    /// node_modules`, a reinstall. Nothing left to run, so nothing to
+    /// report; any earlier card for it resolves.
+    Gone,
 }
 
 /// (newest ctime, number of files present): a rewrite moves the first, a
 /// deletion moves the second.
+///
+/// Installs disappear between passes all the time: discovery is cached for
+/// [`DISCOVERY_SECS`], and deploy pipelines swap whole release trees. A
+/// vanished install directory is [`Outcome::Gone`], never "every file
+/// missing". Files missing from a directory that still exists are reported
+/// only when two passes agree, so a scan that lands in the middle of an
+/// `rm -rf` (files going, the directory not gone yet) raises nothing.
 type Stamp = (i64, usize);
 
 #[derive(Debug, Clone)]
@@ -466,6 +477,37 @@ pub fn compare(root: &RootFs, inst: &Installed, p: &Pristine, rewrites: &HashMap
     (outcome, stamp)
 }
 
+#[derive(Debug, PartialEq)]
+enum Settled {
+    /// The install directory is gone — it was deleted while (or before)
+    /// being compared, not tampered with.
+    Gone,
+    /// Files are missing but none changed, seen for the first time: cache
+    /// it and report only if the next pass agrees.
+    Hold,
+    Report,
+}
+
+/// What to do with a fresh comparison. `dir_gone` is asked only when
+/// files are missing. `previous` is the cached outcome for the same
+/// version, if any.
+fn settle(outcome: &Outcome, dir_gone: impl FnOnce() -> bool, previous: Option<&Outcome>) -> Settled {
+    let Outcome::Tampered { changed, missing } = outcome else { return Settled::Report };
+    if missing.is_empty() { return Settled::Report; }
+    if dir_gone() { return Settled::Gone; }
+    if changed.is_empty() && previous != Some(outcome) { return Settled::Hold; }
+    Settled::Report
+}
+
+/// Drop what is cached about an install that no longer exists, and the
+/// target's discovery list with it so the next pass finds what replaced it
+/// (a new release directory) instead of waiting out [`DISCOVERY_SECS`].
+fn forget_install(target_key: &str, ckey: &(String, String)) {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.verified.remove(ckey);
+    st.discovered.remove(target_key);
+}
+
 fn stamp_of(root: &RootFs, inst: &Installed, p: &Pristine) -> Stamp {
     p.files.keys().filter_map(|r| root.lstat(&format!("{}/{}", inst.dir, r)).map(|m| m.ctime))
         .fold((0, 0), |(t, n), c| (t.max(c), n + 1))
@@ -497,6 +539,11 @@ pub fn check_target(
     let mut out = Vec::new();
     for inst in installs {
         let ckey = (target_key.to_string(), inst.dir.clone());
+        if root.is_missing(&inst.dir) {
+            forget_install(target_key, &ckey);
+            out.push((inst, Outcome::Gone));
+            continue;
+        }
         if !valid_version(&inst.version) {
             let why = format!("its package.json version {:?} is not a release version", inst.version);
             out.push((inst, Outcome::Unpublished(why)));
@@ -555,10 +602,17 @@ pub fn check_target(
             continue;
         }
         let (outcome, stamp) = compare(root, &inst, &p, &install_rewrites(&inst, platform.as_ref()));
+        let previous = cached.as_ref().filter(|c| c.version == inst.version).map(|c| &c.outcome);
+        let settled = settle(&outcome, || root.is_missing(&inst.dir), previous);
+        if settled == Settled::Gone {
+            forget_install(target_key, &ckey);
+            out.push((inst, Outcome::Gone));
+            continue;
+        }
         STATE.lock().unwrap_or_else(|e| e.into_inner()).verified.insert(ckey, CacheEntry {
             version: inst.version.clone(), stamp, checked_at: now, outcome: outcome.clone(),
         });
-        out.push((inst, outcome));
+        if settled == Settled::Report { out.push((inst, outcome)); }
     }
     out
 }
@@ -658,6 +712,50 @@ mod tests {
         // Other packages never get an exemption.
         let vite = Installed { name: "vite", ..inst.clone() };
         assert!(install_rewrites(&vite, Some(&platform)).is_empty());
+    }
+
+    #[test]
+    fn settle_never_reports_a_deleted_install() {
+        let missing = Outcome::Tampered { changed: vec![], missing: vec!["bin/vite.js".into()] };
+        let rewritten = Outcome::Tampered { changed: vec!["bin/vite.js".into()], missing: vec![] };
+        let both = Outcome::Tampered { changed: vec!["bin/vite.js".into()], missing: vec!["x.js".into()] };
+        // The release-swap false positive: every file missing because the
+        // directory went away.
+        assert_eq!(settle(&missing, || true, None), Settled::Gone);
+        assert_eq!(settle(&both, || true, Some(&both)), Settled::Gone);
+        // Files missing from a directory that still exists: held once,
+        // reported when the next pass sees the same thing.
+        assert_eq!(settle(&missing, || false, None), Settled::Hold);
+        assert_eq!(settle(&missing, || false, Some(&Outcome::Clean)), Settled::Hold);
+        assert_eq!(settle(&missing, || false, Some(&missing)), Settled::Report);
+        // A rewritten file is reported at once — the kit's signature must
+        // never wait a pass — and the directory is not even consulted.
+        assert_eq!(settle(&rewritten, || panic!("not needed"), None), Settled::Report);
+        assert_eq!(settle(&both, || false, None), Settled::Report);
+        assert_eq!(settle(&Outcome::Clean, || panic!("not needed"), None), Settled::Report);
+    }
+
+    #[test]
+    fn vanished_install_is_gone_and_rediscovered() {
+        let base = std::env::temp_dir().join(format!("ws-npm-gone-{}", std::process::id()));
+        let dir = base.join("release-a/node_modules/vite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = RootFs::for_pid(std::process::id()).expect("open own root");
+        // "latest" is not a release version, so the check never reaches
+        // the network: a present install is Unpublished, a deleted one Gone.
+        let key = format!("test:gone-{}", std::process::id());
+        let inst = Installed { dir: dir.to_str().unwrap().to_string(), name: "vite", version: "latest".into() };
+        STATE.lock().unwrap().discovered.insert(key.clone(), (0, vec![inst]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut fetches = FETCHES_PER_TICK; // no registry budget
+        let r = check_target(&key, &root, 1, deadline, &mut fetches);
+        assert!(matches!(r[0].1, Outcome::Unpublished(_)));
+        std::fs::remove_dir_all(base.join("release-a")).unwrap();
+        let r = check_target(&key, &root, 2, deadline, &mut fetches);
+        assert_eq!(r[0].1, Outcome::Gone);
+        // The stale discovery list is dropped so the next pass walks again.
+        assert!(!STATE.lock().unwrap().discovered.contains_key(&key));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -346,6 +346,8 @@ pub async fn tick(
     // SSH key baseline needs the store: a dismissed "new key" card is
     // the operator trusting that key.
     let intrusion_facts = intrusion::finalize_ssh(intrusion_facts, &proposals_snap).await;
+    // npm cards for install trees deleted since they were raised.
+    let intrusion_facts = intrusion::finalize_npm(intrusion_facts, &proposals_snap).await;
 
     // 5. Run every analyzer against the snapshots. No locks held.
     //    Each analyzer is independent — extending the list adds a

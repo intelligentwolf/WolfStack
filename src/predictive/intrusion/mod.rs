@@ -719,7 +719,7 @@ fn scan_target(
     for (inst, outcome) in npm::check_target(&t.key, root, now, npm_deadline, npm_fetches) {
         let rid_item = format!("npm|{}", inst.dir);
         match outcome {
-            npm::Outcome::Clean => facts.covered_exact.push((FT_NPM, resource_id(&t.key, &rid_item))),
+            npm::Outcome::Clean | npm::Outcome::Gone => facts.covered_exact.push((FT_NPM, resource_id(&t.key, &rid_item))),
             npm::Outcome::Unverified(_) => {}
             npm::Outcome::Unpublished(why) => {
                 facts.covered_exact.push((FT_NPM, resource_id(&t.key, &rid_item)));
@@ -818,6 +818,49 @@ pub async fn finalize_ssh(mut facts: IntrusionFacts, proposals: &ProposalStore) 
     if let Ok((items, covered)) = built {
         facts.items.extend(items);
         facts.covered_targets.extend(covered);
+    }
+    facts
+}
+
+/// Resolve open npm-integrity cards whose install directory no longer
+/// exists. The scan itself only re-evaluates installs it discovers, so a
+/// card raised before a WolfStack restart — or before a deploy swapped the
+/// release tree away — would otherwise stay open forever with nothing on
+/// disk left to clear it.
+///
+/// Targets are re-enumerated here rather than taken from the scan, so a
+/// container restarted since then is checked through its CURRENT init
+/// process, never a PID that may have been reused. Only a directory that
+/// provably does not exist ([`RootFs::is_missing`]) resolves a card; a
+/// stopped container, an unreadable path or a blocking mount leaves it be.
+pub async fn finalize_npm(mut facts: IntrusionFacts, proposals: &ProposalStore) -> IntrusionFacts {
+    if !facts.scanned { return facts; }
+    let evaluated: HashSet<String> = facts.covered_exact.iter().filter(|(f, _)| *f == FT_NPM).map(|(_, r)| r.clone())
+        .chain(facts.items.iter().filter(|i| i.ft == FT_NPM).map(|i| resource_id(&i.target_key, &i.item)))
+        .collect();
+    let open: Vec<(String, String)> = proposals.proposals.iter()
+        .filter(|p| p.finding_type == FT_NPM
+            && matches!(p.status, ProposalStatus::Pending | ProposalStatus::Snoozed { .. }))
+        .filter_map(|p| {
+            let rid = p.scope.resource_id.as_deref()?;
+            if evaluated.contains(rid) { return None; }
+            let (tk, item) = parse_resource(rid)?;
+            Some((tk.to_string(), item.strip_prefix("npm|")?.to_string()))
+        })
+        .collect();
+    if open.is_empty() { return facts; }
+    let gone = tokio::task::spawn_blocking(move || {
+        let Some(targets) = targets::enumerate_checked() else { return Vec::new() };
+        let mut roots: std::collections::HashMap<String, Option<RootFs>> = std::collections::HashMap::new();
+        open.into_iter().filter(|(tk, dir)| {
+            let root = roots.entry(tk.clone()).or_insert_with(|| {
+                targets.iter().find(|t| t.key == *tk).and_then(|t| RootFs::for_pid(t.init_pid))
+            });
+            root.as_ref().is_some_and(|r| r.is_missing(dir))
+        }).map(|(tk, dir)| resource_id(&tk, &format!("npm|{}", dir))).collect::<Vec<_>>()
+    }).await;
+    if let Ok(gone) = gone {
+        facts.covered_exact.extend(gone.into_iter().map(|r| (FT_NPM, r)));
     }
     facts
 }
